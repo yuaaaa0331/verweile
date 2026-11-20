@@ -1,0 +1,5 @@
+# Netlify 部署配置（仓库里的配置优先于后台面板的设置）。
+# 强制每次部署都从源码重新构建并发布 dist，避免发布到旧的 verweile.zip 解压内容。
+[build]
+  command = "npm run build"
+  publish = "dist"
