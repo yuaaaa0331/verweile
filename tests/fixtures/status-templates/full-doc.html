@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>心情卡片</title>
+<style>
+  :root { --mood: #ff8fa3; --ink: #3a2a2e; }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; }
+  .card {
+    --pad: 14px;
+    background: linear-gradient(135deg, #fff5f7, #fdeef5);
+    border: 1px solid #ffd3de;
+    border-radius: 18px;
+    padding: var(--pad);
+    color: var(--ink);
+  }
+  .card::before {
+    content: "♥ 今日心情";
+    display: block;
+    font-size: 12px;
+    letter-spacing: 2px;
+    color: var(--mood);
+    margin-bottom: 6px;
+  }
+  .card::after {
+    content: "";
+    display: block;
+    height: 3px;
+    border-radius: 3px;
+    margin-top: 10px;
+    background: linear-gradient(90deg, var(--mood), #ffc2d1);
+  }
+  .mood-text { font-size: 15px; line-height: 1.6; animation: breathe 3s ease-in-out infinite; }
+  @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .72; } }
+  .meta { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; color: #8a6d75; }
+  .meta img { width: 34px; height: 34px; border-radius: 10px; }
+  .bg-chip {
+    width: 100%; height: 44px; border-radius: 10px; margin-top: 10px;
+    background-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImciIHgxPSIwIiB5MT0iMCIgeDI9IjEiIHkyPSIxIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZmQ5ZTgiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNjZmU4ZmYiLz48L2xpbmVhckdyYWRpZW50PjwvZGVmcz48cmVjdCB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgcng9IjI0IiBmaWxsPSJ1cmwoI2cpIi8+PGNpcmNsZSBjeD0iNjAiIGN5PSI2MCIgcj0iMjYiIGZpbGw9IiNmZmZmZmYiIG9wYWNpdHk9IjAuNjUiLz48L3N2Zz4=");
+    background-size: cover;
+  }
+  .tabs { display: flex; gap: 6px; margin-top: 10px; }
+  .tabs button { flex: 1; border: 1px solid #ffd3de; background: #fff; border-radius: 999px; padding: 6px 0; font-size: 12px; color: var(--ink); }
+  .tabs button.on { background: var(--mood); color: #fff; border-color: var(--mood); }
+  .tabpane { font-size: 13px; color: #6d5560; margin-top: 8px; }
+  details { margin-top: 10px; font-size: 12px; color: #8a6d75; }
+  details summary { cursor: pointer; }
+  @media (max-width: 400px) {
+    .card { border-radius: 14px; }
+    .mood-text { font-size: 14px; }
+  }
+</style>
+</head>
+<body class="status-body" id="status-root" style="background: transparent;">
+  <div class="card" id="mood-card">
+    <div class="mood-text">今天心情超好，阳光正好，适合出门散步。</div>
+    <div class="meta">
+      <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImciIHgxPSIwIiB5MT0iMCIgeDI9IjEiIHkyPSIxIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZmQ5ZTgiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNjZmU4ZmYiLz48L2xpbmVhckdyYWRpZW50PjwvZGVmcz48cmVjdCB3aWR0aD0iMTIwIiBoZWlnaHQ9IjEyMCIgcng9IjI0IiBmaWxsPSJ1cmwoI2cpIi8+PGNpcmNsZSBjeD0iNjAiIGN5PSI2MCIgcj0iMjYiIGZpbGw9IiNmZmZmZmYiIG9wYWNpdHk9IjAuNjUiLz48L3N2Zz4=" alt="头像">
+      <span>诺亚 · 客厅沙发</span>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ff8fa3" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+    </div>
+    <div class="bg-chip"></div>
+    <div class="tabs">
+      <button type="button" class="on" data-tab="a">今天</button>
+      <button type="button" data-tab="b">明天</button>
+    </div>
+    <div class="tabpane" id="pane-a">今天：晒太阳、喝热可可、看一集剧。</div>
+    <div class="tabpane" id="pane-b" style="display:none">明天：早起去公园，带年糕一起跑步，晚上再看一场电影。<br>顺便把阳台的花浇一浇，再把书架整理一下。</div>
+    <details>
+      <summary>更多碎碎念</summary>
+      <p>其实也没什么大事，就是觉得今天的风很温柔，适合把窗户打开，让阳光照进来。午饭想吃番茄鸡蛋面，晚饭再说。</p>
+    </details>
+    <label style="display:block;margin-top:10px;font-size:12px;color:#8a6d75">
+      心情打分
+      <select id="mood-score">
+        <option>5 分 · 超好</option>
+        <option>4 分 · 不错</option>
+        <option>3 分 · 一般</option>
+      </select>
+    </label>
+  </div>
+<script>
+  document.querySelectorAll('[data-tab]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('[data-tab]').forEach(function (b) { b.classList.remove('on'); });
+      btn.classList.add('on');
+      document.getElementById('pane-a').style.display = btn.dataset.tab === 'a' ? '' : 'none';
+      document.getElementById('pane-b').style.display = btn.dataset.tab === 'b' ? '' : 'none';
+    });
+  });
+</script>
+</body>
+</html>

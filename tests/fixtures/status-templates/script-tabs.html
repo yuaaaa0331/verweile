@@ -1,0 +1,20 @@
+<div class="tab-card" style="background:#f6f6f6;border:1px solid #ddd;border-radius:16px;padding:12px;color:#333">
+  <div style="display:flex;gap:6px">
+    <button type="button" data-tab="x" style="flex:1;border:1px solid #bbb;background:#fff;border-radius:999px;padding:6px 0;font-size:12px">短内容</button>
+    <button type="button" data-tab="y" style="flex:1;border:1px solid #bbb;background:#fff;border-radius:999px;padding:6px 0;font-size:12px">长内容</button>
+  </div>
+  <div id="pane-x" style="font-size:13px;line-height:1.6;margin-top:8px">短短的一句。</div>
+  <div id="pane-y" style="display:none;font-size:13px;line-height:1.7;margin-top:8px">
+    <p>第一段：切到长标签之后，高度应该跟着变高。</p>
+    <p>第二段：再多写几行，确认 iframe 高度会重新上报，面板不会留白也不会裁掉内容。</p>
+    <p>第三段：这是最后一行，高度应该正好包住它。</p>
+  </div>
+</div>
+<script>
+  document.querySelectorAll('[data-tab]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.getElementById('pane-x').style.display = btn.dataset.tab === 'x' ? '' : 'none';
+      document.getElementById('pane-y').style.display = btn.dataset.tab === 'y' ? '' : 'none';
+    });
+  });
+</script>

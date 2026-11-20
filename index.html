@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="verweile">
+<meta name="theme-color" content="#ececed">
+<title>verweile</title>
+<link rel="manifest" href='data:application/manifest+json,{"name":"verweile","short_name":"verweile","display":"standalone","background_color":"%23ececed","theme_color":"%23ececed","start_url":"."}'>
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d1d1f'/%3E%3Ctext x='32' y='42' font-size='28' text-anchor='middle' fill='white' font-family='sans-serif'%3Ev%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!-- 单色描边图标（currentColor，线宽 1.8）：不使用彩色图标 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-chev-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+    <symbol id="i-chev-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+    <symbol id="i-chev-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></symbol>
+    <symbol id="i-dots" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+    <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><polyline points="18 15 12 9 6 15"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+    <symbol id="i-gift" viewBox="0 0 24 24"><polyline points="20 12 20 22 4 22 4 12"/><rect x="2" y="7" width="20" height="5"/><line x1="12" y1="22" x2="12" y2="7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></symbol>
+    <symbol id="i-swap" viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-reply" viewBox="0 0 24 24"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></symbol>
+    <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  </defs>
+</svg>
+
+<div id="app">
+  <div class="bg-layer" id="bg-layer"></div>
+  <canvas id="gl-canvas"></canvas>
+
+  <div class="brand-bar"><div class="wordmark">verweile<span>®</span></div><span class="brand-caption">잠시, 머물러요<br><span>stay a little longer</span></span></div>
+  <div class="views" id="views">
+    <!-- 聊天 -->
+    <section role="tabpanel" class="view view-chat active" id="view-chat">
+      <header class="chat-head glass">
+        <img id="char-avatar" class="top-avatar" src="" alt="头像">
+        <div class="top-info">
+          <div id="char-name" class="top-name">加载中…</div>
+          <div id="char-status" class="top-status">在线</div>
+        </div>
+        <span id="mock-badge" class="badge mock hidden">模拟</span>
+        <button id="status-btn" class="icon-btn" title="状态" aria-label="状态"><svg class="icon"><use href="#i-heart"/></svg></button>
+        <button id="chat-menu-btn" class="icon-btn" title="更多" aria-label="更多"><svg class="icon"><use href="#i-dots"/></svg></button>
+      </header>
+
+      <div class="status-strip glass" id="status-strip">
+        <div class="chips" id="status-chips"></div>
+        <button class="chev" id="status-strip-toggle" aria-label="展开状态"><svg class="icon sm"><use href="#i-chev-d"/></svg></button>
+      </div>
+
+      <div id="status-panel" class="status-panel glass hidden">
+        <div class="status-panel-head"><span>状态栏</span><button id="status-panel-close" class="mini-btn">收起</button></div>
+        <div id="status-custom" class="status-custom"></div>
+        <div id="status-raw" class="status-raw"></div>
+        <div id="status-history" class="status-history"></div>
+      </div>
+
+      <main id="message-area" aria-live="polite"></main>
+
+      <div id="typing-indicator" class="typing hidden"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span id="typing-text">正在输入中…</span></div>
+
+      <div id="quote-bar" class="quote-bar glass hidden">
+        <span id="quote-text"></span>
+        <button id="quote-cancel" class="mini-btn">取消</button>
+      </div>
+
+      <footer id="composer">
+        <div class="input-row">
+          <button id="plus-btn" class="icon-btn round" title="更多" aria-label="更多"><svg class="icon"><use href="#i-plus"/></svg></button>
+          <div class="input-shell glass">
+            <textarea id="input" rows="1" placeholder="Write something…" aria-label="输入消息" enterkeyhint="send"></textarea>
+            <button id="sticker-btn" class="icon-btn" title="表情包" aria-label="表情包"><svg class="icon"><use href="#i-smile"/></svg></button>
+          </div>
+          <button id="send-btn" class="send-btn" aria-label="发送"><svg class="icon"><use href="#i-up"/></svg></button>
+          <button id="get-reply-btn" class="reply-btn">get reply</button>
+        </div>
+      </footer>
+      <div id="auto-row" class="auto-row">
+        <label><input type="checkbox" id="auto-reply-toggle"> 自动回复</label>
+        <span id="save-state" class="save-state"></span>
+      </div>
+    </section>
+
+    <!-- 动态（视觉原型，虚拟数据） -->
+    <section role="tabpanel" class="view view-moments" id="view-moments">
+      <div class="page-head">
+        <div><span class="page-eyebrow">우리의 일상 · OUR DAYS</span><h1>Moments<span class="title-dot">.</span></h1></div>
+        <button id="moments-compose" class="icon-btn" title="发动态" aria-label="发动态"><svg class="icon"><use href="#i-plus"/></svg></button>
+      </div>
+      <div class="moments-scroll" id="moments-scroll"></div>
+    </section>
+
+    <!-- 管理 -->
+    <section role="tabpanel" class="view view-manage" id="view-manage">
+      <div class="page-head"><div><span class="page-eyebrow">나의 공간 · YOUR SPACE</span><h1>Atelier<span class="title-dot">.</span></h1></div><span class="page-head-note">随心设置</span></div>
+      <div class="manage-scroll" id="manage-scroll">
+        <div class="char-card glass" id="manage-char-card">
+          <img class="char-card-avatar" src="" alt="头像">
+          <div class="char-card-info">
+            <div class="char-card-name">加载中…</div>
+            <div class="char-card-sub"></div>
+          </div>
+          <span class="tag-now">当前角色</span>
+          <span class="char-card-chev"><svg class="icon"><use href="#i-chev-r"/></svg></span>
+        </div>
+        <div id="manage-groups"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 底部悬浮胶囊 Tab 栏（iOS 26 式） -->
+  <nav class="tabbar glass" id="tabbar" aria-label="主导航" role="tablist">
+    <div class="pill" id="tab-pill"></div>
+    <button role="tab" aria-selected="true" class="tab active" data-view="chat"><svg class="icon"><use href="#i-chat"/></svg><span>对话</span></button>
+    <button role="tab" aria-selected="false" class="tab" data-view="moments"><svg class="icon"><use href="#i-sun"/></svg><span>动态</span><span class="tab-badge" id="moments-badge">2</span></button>
+    <button role="tab" aria-selected="false" class="tab" data-view="manage"><svg class="icon"><use href="#i-grid"/></svg><span>我的</span></button>
+  </nav>
+
+  <!-- 管理二级页 -->
+  <div class="subpage" id="sub-persona">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>人设</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-worldbook">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>世界书</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-prompt">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>提示词</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-stickers">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>贴纸</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-memory">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>记忆</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-context">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>上下文预览</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-api">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>API 设置</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-mcp">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>MCP</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-data">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>数据管理</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-appearance">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>外观与背景</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-tokens">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>设计变量</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+
+  <!-- 动作面板 -->
+  <div id="action-sheet" class="sheet hidden">
+    <div class="sheet-card glass">
+      <div class="sheet-title">更多</div>
+      <div class="action-grid">
+        <button data-act="image">图片</button>
+        <button data-act="sticker">表情包</button>
+        <button data-act="voice">语音文字</button>
+        <button data-act="photo-desc">照片/视频描述</button>
+        <button data-act="transfer">转账</button>
+        <button data-act="gift">礼物</button>
+      </div>
+      <button class="sheet-cancel" data-close>取消</button>
+    </div>
+  </div>
+
+  <!-- 表情包选择 -->
+  <div id="sticker-sheet" class="sheet hidden">
+    <div class="sheet-card glass">
+      <div class="sheet-title">表情包 <span id="sticker-count" class="muted"></span></div>
+      <div id="sticker-grid" class="sticker-grid"></div>
+      <button class="sheet-cancel" data-close>取消</button>
+    </div>
+  </div>
+
+  <!-- 长按菜单 -->
+  <div id="msg-menu" class="sheet hidden">
+    <div class="sheet-card glass">
+      <div class="sheet-title">消息</div>
+      <div id="msg-menu-actions" class="menu-list"></div>
+      <button class="sheet-cancel" data-close>取消</button>
+    </div>
+  </div>
+
+  <!-- 通用弹窗 -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card glass">
+      <div id="modal-title" class="modal-title"></div>
+      <div id="modal-body" class="modal-body"></div>
+      <div id="modal-actions" class="modal-actions"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <input type="file" id="file-input" class="file-input-hidden" accept="image/*">
+</div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
