@@ -1,0 +1,26 @@
+<!-- tests/fixtures/status-templates/thx-home-real.html
+  根据 Dolores 2026-11-20 18:48 截图里的真实模板样式重建（.thx-home，CSS 变量 + data:image/svg+xml;base64
+  dust 背景 + max-width:500px）。截图只拍到了 <style> 的前半段，卡片内部结构按同类模板的常规写法补全，
+  只为验证渲染链路：style 必须生效而不是当成正文显示；变量/dust 背景/圆角/限宽必须正常工作。 -->
+<style>
+.thx-home{--thx-dust-0:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgMTIwIDEyMCI+PGNpcmNsZSBjeD0iMjQiIGN5PSIzMCIgcj0iOSIgZmlsbD0iI2M5YzljOSIgZmlsbC1vcGFjaXR5PSIwLjU1Ii8+PGNpcmNsZSBjeD0iOTYiIGN5PSI5MCIgcj0iNS40IiBmaWxsPSIjYzljOWM5IiBmaWxsLW9wYWNpdHk9IjAuMzkiLz48L3N2Zz4=");--thx-dust-1:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgMTIwIDEyMCI+PGNpcmNsZSBjeD0iNzAiIGN5PSI2MCIgcj0iMTIiIGZpbGw9IiNiZGJkYmQiIGZpbGwtb3BhY2l0eT0iMC40NSIvPjxjaXJjbGUgY3g9IjUwIiBjeT0iNjAiIHI9IjcuMiIgZmlsbD0iI2JkYmRiZCIgZmlsbC1vcGFjaXR5PSIwLjMyIi8+PC9zdmc+");--thx-dust-2:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMjAiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgMTIwIDEyMCI+PGNpcmNsZSBjeD0iNDAiIGN5PSI5MCIgcj0iNyIgZmlsbD0iI2Q0ZDRkNCIgZmlsbC1vcGFjaXR5PSIwLjYiLz48Y2lyY2xlIGN4PSI4MCIgY3k9IjMwIiByPSI0LjIiIGZpbGw9IiNkNGQ0ZDQiIGZpbGwtb3BhY2l0eT0iMC40MiIvPjwvc3ZnPg==");--thx-bg:#fff;--thx-fg:#101010;--thx-muted:#999;--thx-line:#e7e7e7;--thx-ink:#747474;--thx-avatar:#c7c7c7;--thx-soft:#f3f3f3;--thx-glass:rgba(255,255,255,.86);--thx-tab:rgba(0,0,0,.065);--thx-link:#999;--thx-blue:#0095f6;color-scheme:light;box-sizing:border-box;width:100%;max-width:500px;margin:10px auto;background:var(--thx-bg);color:var(--thx-fg);border:1px solid var(--thx-line);border-radius:20px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;font-weight:400;line-height:1.5;text-align:left;isolation:isolate}
+.thx-home .thx-hero{position:relative;height:120px;background-image:var(--thx-dust-0),var(--thx-dust-1);background-size:120px 120px,120px 120px;background-position:0 0,60px 40px}
+.thx-home .thx-row{display:flex;gap:12px;padding:14px 16px;align-items:center}
+.thx-home .thx-ava{width:52px;height:52px;border-radius:50%;background:var(--thx-avatar);object-fit:cover;flex:none}
+.thx-home .thx-name{font-weight:700;font-size:17px}
+.thx-home .thx-sub{color:var(--thx-muted);font-size:13px}
+.thx-home .thx-body{padding:0 16px 16px;color:var(--thx-ink)}
+.thx-home .thx-body b{color:var(--thx-fg)}
+.thx-home .thx-tabs{display:flex;gap:8px;padding:0 16px 16px}
+.thx-home .thx-tabs button{border:0;background:var(--thx-tab);border-radius:999px;padding:6px 12px;font-size:13px;color:var(--thx-fg)}
+.thx-home .thx-tabs button.on{background:var(--thx-blue);color:#fff}
+</style>
+<div class="thx-home">
+  <div class="thx-hero"></div>
+  <div class="thx-row">
+    <char-avatar class="thx-ava"></char-avatar>
+    <div><div class="thx-name">{{char_name}}</div><div class="thx-sub">current household status</div></div>
+  </div>
+  <div class="thx-body"><b>$1</b> — $2</div>
+  <div class="thx-tabs"><button class="on" data-tab="home">主页</button><button data-tab="moments">动态</button></div>
+</div>

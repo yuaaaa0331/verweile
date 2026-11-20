@@ -141,15 +141,59 @@ function parseStatusPattern(patternText) {
   return { pattern, flags };
 }
 
-/** 用模板对原始状态文本做一次匹配 + $n 替换。无匹配返回 null；正则非法时抛错（调用方捕获）。 */
-function applyStatusTemplate(raw, panel) {
+/** 用模板对原始状态文本做一次匹配 + $n 替换。无匹配返回 null；正则非法时抛错（调用方捕获）。
+ *  opts.ctx 可带角色信息时，还会按原始 UWU 的 processTemplate 做变量替换：
+ *  {{user_avatar}}/{{char_avatar}}/{{user_name}}/{{char_name}}/{{char_remark}}/{{user_remark}}
+ *  以及 <user-avatar>/<char-avatar> 标签。 */
+function applyStatusTemplate(raw, panel, ctx) {
   if (!panel?.regexPattern) return null;
   const { pattern, flags } = parseStatusPattern(panel.regexPattern);
   const re = new RegExp(pattern, flags);
   const m = re.exec(String(raw ?? ''));
   if (!m) return null;
-  const html = String(panel.replacePattern || '').replace(/\$(\d+)/g, (_, gi) => (m[Number(gi)] !== undefined ? m[Number(gi)] : `$${gi}`));
+  let html = String(panel.replacePattern || '').replace(/\$(\d+)/g, (_, gi) => (m[Number(gi)] !== undefined ? m[Number(gi)] : `$${gi}`));
+  if (ctx) html = substituteTemplateVars(html, ctx);
   return { raw: m[0], html };
+}
+
+/** 原始 UWU processTemplate 的变量替换：头像与名字进模板。
+ *  缺名字时用原始 UWU 的默认值（User/Character）；缺头像时把 <…-avatar> 标签
+ *  换成空 span（不留破图、不留字面量占位符）。 */
+function substituteTemplateVars(html, ctx = {}) {
+  const userAvatar = ctx.userAvatar || '';
+  const charAvatar = ctx.charAvatar || '';
+  const userName = ctx.userName || 'User';
+  const userRemark = ctx.userRemark || userName;
+  const charName = ctx.charName || 'Character';
+  const charRemark = ctx.charRemark || charName;
+  let out = String(html ?? '');
+  out = out.replace(/{{user_avatar}}/g, userAvatar);
+  out = out.replace(/{{char_avatar}}/g, charAvatar);
+  out = out.replace(/{{user_name}}/g, userName);
+  out = out.replace(/{{char_name}}/g, charName);
+  out = out.replace(/{{char_remark}}/g, charRemark);
+  out = out.replace(/{{user_remark}}/g, userRemark);
+  out = out.replace(/<user-avatar([^>]*)>\s*(?:<\/user-avatar>)?/gi, (_, attrs) =>
+    (userAvatar ? `<img src="${userAvatar}" class="uwu-user-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+  out = out.replace(/<char-avatar([^>]*)>\s*(?:<\/char-avatar>)?/gi, (_, attrs) =>
+    (charAvatar ? `<img src="${charAvatar}" class="uwu-char-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+  return out;
+}
+
+/** 弹窗里可翻看的状态条目：history（最新在前）优先；没有 history 时退回当前一条。 */
+function statusViewEntries(sp = {}) {
+  const hist = Array.isArray(sp.history) ? sp.history.filter((h) => h && (h.html || h.raw)) : [];
+  if (hist.length) return hist.slice(0, 20);
+  if (sp.currentStatusHtml || sp.currentStatusRaw) {
+    return [{ raw: sp.currentStatusRaw || '', html: sp.currentStatusHtml || '', timestamp: Date.now() }];
+  }
+  return [];
+}
+
+/** 把浏览下标夹在 [0, total-1] 内；没有条目时固定 0。 */
+function clampStatusIndex(i, total) {
+  if (!total || total <= 0) return 0;
+  return Math.max(0, Math.min(total - 1, Math.floor(i) || 0));
 }
 
 /** 从原始状态派生一句简短纯文本摘要，供顶栏简略状态条使用。
@@ -3711,6 +3755,13 @@ async function createMessageElement(msg, isContinuous = false) {
   if (msg.isContextDisabled) wrap.classList.add('context-disabled');
   if (isContinuous) wrap.classList.add('continuous');
   if (msg.isWithdrawn) wrap.classList.add('withdrawn');
+  // 状态更新消息：只留一句居中的系统提示，原始协议文本不进气泡——
+  // 原始 UWU 也是把状态码从气泡里剔掉的，完整卡片在状态栏弹窗里看。
+  if (msg.isStatusUpdate && msg.statusText) {
+    wrap.classList.add('system-note');
+    wrap.appendChild(el('div', 'bubble', escapeHtml(`状态已更新为：${summarizeStatus(msg.statusText, 40)}`)));
+    return wrap;
+  }
 
   const avatarSrc = msg.role === 'user'
     ? await resolveAvatar(char.myAvatar)
@@ -4255,7 +4306,7 @@ async function applySegment(seg, roundId, opts) {
   // 用户自定义状态栏：regex/replace 模板去重保存，消息只存引用与原文
   if (char.statusPanel?.enabled && char.statusPanel.regexPattern) {
     try {
-      const out = applyStatusTemplate(seg.content, char.statusPanel);
+      const out = applyStatusTemplate(seg.content, char.statusPanel, statusTemplateCtx(char));
       if (out) {
         const tpl = await saveStatusTemplate(backend, char.statusPanel);
         msg.isStatusUpdate = true;
@@ -4268,7 +4319,7 @@ async function applySegment(seg, roundId, opts) {
         char.statusPanel.history.unshift({ raw: out.raw, html: out.html, timestamp: Date.now() });
         char.statusPanel.history = char.statusPanel.history.slice(0, 20);
         updateHeader(); // 及时刷新简略状态条
-        if (!$('#status-panel').classList.contains('hidden')) renderStatusPanel();
+        if (isStatusPopupOpen()) { statusViewIndex = 0; renderStatusPopup(); }
       }
     } catch (e) { console.warn('状态栏正则解析错误', e); }
   }
@@ -4449,24 +4500,11 @@ $('#quote-cancel').addEventListener('click', clearQuote);
 $('#auto-reply-toggle').addEventListener('change', (e) => {
   localStorage.setItem('uwu-chat.autoReply', e.target.checked ? '1' : '0');
 });
-$('#char-status').addEventListener('click', () => {
-  const panel = $('#status-panel');
-  panel.classList.toggle('hidden');
-  renderStatusPanel();
-});
-$('#status-panel-close').addEventListener('click', () => $('#status-panel').classList.add('hidden'));
-$('#status-btn').addEventListener('click', () => {
-  const panel = $('#status-panel');
-  panel.classList.toggle('hidden');
-  renderStatusPanel();
-});
+// 状态栏弹窗的三个入口：顶栏昵称标题、心形、状态条——都打开同一个弹窗
+$('#top-info-btn').addEventListener('click', openStatusPopup);
+$('#status-btn').addEventListener('click', openStatusPopup);
+$('#status-strip').addEventListener('click', openStatusPopup);
 $('#chat-menu-btn').addEventListener('click', () => { openSettings('persona'); });
-$('#status-strip').addEventListener('click', () => {
-  const panel = $('#status-panel');
-  panel.classList.toggle('hidden');
-  $('#status-strip').classList.toggle('open', !panel.classList.contains('hidden'));
-  renderStatusPanel();
-});
 
 /* ---------------- 自定义状态栏：沙箱 iframe 隔离渲染 ----------------
  *  模板 HTML 绝不直接 innerHTML 进主页面。它只活在 sandbox="allow-scripts"
@@ -4507,39 +4545,91 @@ async function regenerateStatusPreview() {
   const sp = char.statusPanel || {};
   if (!sp.currentStatusRaw || !sp.regexPattern) return false;
   try {
-    const out = applyStatusTemplate(sp.currentStatusRaw, sp);
+    const out = applyStatusTemplate(sp.currentStatusRaw, sp, statusTemplateCtx(char));
     if (!out) return false;
     await saveStatusTemplate(backend, sp);
     sp.currentStatusHtml = out.html;
     await saveCharacter();
     updateHeader();
-    if (!$('#status-panel').classList.contains('hidden')) renderStatusPanel();
+    if (isStatusPopupOpen()) { statusViewIndex = 0; renderStatusPopup(); }
     return true;
   } catch (e) { console.warn('状态栏预览重生成失败', e); return false; }
 }
 
-function renderStatusPanel() {
+/* ---------------- 状态栏弹窗 ----------------
+ *  点顶栏昵称标题 / 心形 / 状态条弹出；底部是透明的上一个 / 下一个 / 关闭。
+ *  上一个/下一个在状态历史里翻（最新在前），新状态进来时回到最新一条。
+ *  渲染仍走沙箱 iframe（见下方的隔离说明），与之前一致。 */
+let statusViewIndex = 0;
+
+function statusTemplateCtx(c) {
+  const userName = c.myName || 'User';
+  const charName = c.realName || 'Character';
+  return {
+    userAvatar: c.myAvatar || '',
+    charAvatar: c.avatar || '',
+    userName,
+    userRemark: (c.myRemarkName || '').trim() || userName,
+    charName,
+    charRemark: c.remarkName || charName,
+  };
+}
+
+function isStatusPopupOpen() {
+  return !$('#status-popup').classList.contains('hidden');
+}
+
+function openStatusPopup() {
+  statusViewIndex = 0;
+  renderStatusPopup();
+  $('#status-popup').classList.remove('hidden');
+}
+
+function closeStatusPopup() {
+  $('#status-popup').classList.add('hidden');
+}
+
+$('#status-scrim').addEventListener('click', closeStatusPopup);
+$('#status-close').addEventListener('click', closeStatusPopup);
+$('#status-prev').addEventListener('click', () => {
+  const total = statusViewEntries(char.statusPanel || {}).length;
+  statusViewIndex = clampStatusIndex(statusViewIndex + 1, total);
+  renderStatusPopup();
+});
+$('#status-next').addEventListener('click', () => {
+  const total = statusViewEntries(char.statusPanel || {}).length;
+  statusViewIndex = clampStatusIndex(statusViewIndex - 1, total);
+  renderStatusPopup();
+});
+
+function renderStatusPopup() {
   const sp = char.statusPanel || {};
+  const entries = statusViewEntries(sp);
+  statusViewIndex = clampStatusIndex(statusViewIndex, entries.length);
+  const entry = entries[statusViewIndex] || null;
   const host = $('#status-custom');
   host.innerHTML = '';
   statusFrame = null;
   statusFrameHeightOk = false;
   clearTimeout(statusFrameTimer);
-  // 旧数据补救：有原始状态但没有渲染产物时，用当前模板就地重算一次
-  if (sp.currentStatusRaw && !sp.currentStatusHtml && sp.regexPattern) {
+  // 旧数据补救：当前条目有原始状态但没有渲染产物时，用当前模板就地重算一次
+  if (entry && entry.raw && !entry.html && sp.regexPattern) {
     try {
-      const out = applyStatusTemplate(sp.currentStatusRaw, sp);
-      if (out) { sp.currentStatusHtml = out.html; saveCharacter(); }
+      const out = applyStatusTemplate(entry.raw, sp, statusTemplateCtx(char));
+      if (out) {
+        entry.html = out.html;
+        if (statusViewIndex === 0) { sp.currentStatusHtml = out.html; saveCharacter(); }
+      }
     } catch (e) { /* 保持空态，下面显示提示 */ }
   }
-  if (sp.currentStatusHtml) {
+  if (entry?.html) {
     const frame = document.createElement('iframe');
     frame.className = 'status-frame';
     frame.title = '自定义状态栏';
     frame.setAttribute('sandbox', 'allow-scripts allow-popups');
     frame.setAttribute('scrolling', 'no');
     frame.style.height = '120px'; // 首条高度消息到达前的占位
-    frame.srcdoc = buildStatusDocument(sp.currentStatusHtml, { marker: `regen ${Date.now()}` });
+    frame.srcdoc = buildStatusDocument(entry.html, { marker: `regen ${Date.now()}` });
     host.appendChild(frame);
     statusFrame = frame;
     statusFrameTimer = setTimeout(() => {
@@ -4550,12 +4640,16 @@ function renderStatusPanel() {
   } else {
     const empty = document.createElement('span');
     empty.className = 'muted';
-    empty.textContent = sp.currentStatusRaw
+    empty.textContent = entry?.raw
       ? '原始状态与当前模板不匹配，无法渲染'
       : '暂无自定义状态栏内容';
     host.appendChild(empty);
   }
-  renderStatusDetails(sp);
+  // 位置提示与前后按钮状态（最新在前：上一个=更早，下一个=更新）
+  $('#status-pos').textContent = entries.length ? `第 ${statusViewIndex + 1} / ${entries.length} 条` : '';
+  $('#status-prev').disabled = statusViewIndex >= entries.length - 1;
+  $('#status-next').disabled = statusViewIndex <= 0;
+  renderStatusDetails(sp, entry);
 }
 
 function makeStatusDetails(title, text) {
@@ -4572,13 +4666,14 @@ function makeStatusDetails(title, text) {
 }
 
 // 原始文本、HTML 源码、状态历史默认折叠在查看入口里，不与渲染卡片重复铺开。
-function renderStatusDetails(sp) {
+// 原始文本与 HTML 源码显示当前正在看的那一条（翻页时跟着换），历史列出全部。
+function renderStatusDetails(sp, entry) {
   const rawBox = $('#status-raw');
   const histBox = $('#status-history');
   rawBox.innerHTML = '';
   histBox.innerHTML = '';
-  if (sp.currentStatusRaw) rawBox.appendChild(makeStatusDetails('原始文本', sp.currentStatusRaw));
-  if (sp.currentStatusHtml) rawBox.appendChild(makeStatusDetails('HTML 源码', sp.currentStatusHtml));
+  if (entry?.raw) rawBox.appendChild(makeStatusDetails('原始文本', entry.raw));
+  if (entry?.html) rawBox.appendChild(makeStatusDetails('HTML 源码', entry.html));
   const hist = (sp.history || []).slice(0, 5);
   if (hist.length) {
     const det = document.createElement('details');

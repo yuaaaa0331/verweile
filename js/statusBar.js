@@ -22,15 +22,59 @@ export function parseStatusPattern(patternText) {
   return { pattern, flags };
 }
 
-/** 用模板对原始状态文本做一次匹配 + $n 替换。无匹配返回 null；正则非法时抛错（调用方捕获）。 */
-export function applyStatusTemplate(raw, panel) {
+/** 用模板对原始状态文本做一次匹配 + $n 替换。无匹配返回 null；正则非法时抛错（调用方捕获）。
+ *  opts.ctx 可带角色信息时，还会按原始 UWU 的 processTemplate 做变量替换：
+ *  {{user_avatar}}/{{char_avatar}}/{{user_name}}/{{char_name}}/{{char_remark}}/{{user_remark}}
+ *  以及 <user-avatar>/<char-avatar> 标签。 */
+export function applyStatusTemplate(raw, panel, ctx) {
   if (!panel?.regexPattern) return null;
   const { pattern, flags } = parseStatusPattern(panel.regexPattern);
   const re = new RegExp(pattern, flags);
   const m = re.exec(String(raw ?? ''));
   if (!m) return null;
-  const html = String(panel.replacePattern || '').replace(/\$(\d+)/g, (_, gi) => (m[Number(gi)] !== undefined ? m[Number(gi)] : `$${gi}`));
+  let html = String(panel.replacePattern || '').replace(/\$(\d+)/g, (_, gi) => (m[Number(gi)] !== undefined ? m[Number(gi)] : `$${gi}`));
+  if (ctx) html = substituteTemplateVars(html, ctx);
   return { raw: m[0], html };
+}
+
+/** 原始 UWU processTemplate 的变量替换：头像与名字进模板。
+ *  缺名字时用原始 UWU 的默认值（User/Character）；缺头像时把 <…-avatar> 标签
+ *  换成空 span（不留破图、不留字面量占位符）。 */
+export function substituteTemplateVars(html, ctx = {}) {
+  const userAvatar = ctx.userAvatar || '';
+  const charAvatar = ctx.charAvatar || '';
+  const userName = ctx.userName || 'User';
+  const userRemark = ctx.userRemark || userName;
+  const charName = ctx.charName || 'Character';
+  const charRemark = ctx.charRemark || charName;
+  let out = String(html ?? '');
+  out = out.replace(/{{user_avatar}}/g, userAvatar);
+  out = out.replace(/{{char_avatar}}/g, charAvatar);
+  out = out.replace(/{{user_name}}/g, userName);
+  out = out.replace(/{{char_name}}/g, charName);
+  out = out.replace(/{{char_remark}}/g, charRemark);
+  out = out.replace(/{{user_remark}}/g, userRemark);
+  out = out.replace(/<user-avatar([^>]*)>\s*(?:<\/user-avatar>)?/gi, (_, attrs) =>
+    (userAvatar ? `<img src="${userAvatar}" class="uwu-user-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+  out = out.replace(/<char-avatar([^>]*)>\s*(?:<\/char-avatar>)?/gi, (_, attrs) =>
+    (charAvatar ? `<img src="${charAvatar}" class="uwu-char-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+  return out;
+}
+
+/** 弹窗里可翻看的状态条目：history（最新在前）优先；没有 history 时退回当前一条。 */
+export function statusViewEntries(sp = {}) {
+  const hist = Array.isArray(sp.history) ? sp.history.filter((h) => h && (h.html || h.raw)) : [];
+  if (hist.length) return hist.slice(0, 20);
+  if (sp.currentStatusHtml || sp.currentStatusRaw) {
+    return [{ raw: sp.currentStatusRaw || '', html: sp.currentStatusHtml || '', timestamp: Date.now() }];
+  }
+  return [];
+}
+
+/** 把浏览下标夹在 [0, total-1] 内；没有条目时固定 0。 */
+export function clampStatusIndex(i, total) {
+  if (!total || total <= 0) return 0;
+  return Math.max(0, Math.min(total - 1, Math.floor(i) || 0));
 }
 
 /** 从原始状态派生一句简短纯文本摘要，供顶栏简略状态条使用。

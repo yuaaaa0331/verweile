@@ -70,10 +70,10 @@
     <section role="tabpanel" class="view view-chat active" id="view-chat">
       <header class="chat-head glass">
         <img id="char-avatar" class="top-avatar" src="" alt="头像">
-        <div class="top-info">
+        <button class="top-info" id="top-info-btn" title="查看状态栏" aria-label="查看状态栏">
           <div id="char-name" class="top-name">加载中…</div>
           <div id="char-status" class="top-status">在线</div>
-        </div>
+        </button>
         <span id="mock-badge" class="badge mock hidden">模拟</span>
         <button id="status-btn" class="icon-btn" title="状态" aria-label="状态"><svg class="icon"><use href="#i-heart"/></svg></button>
         <button id="chat-menu-btn" class="icon-btn" title="更多" aria-label="更多"><svg class="icon"><use href="#i-dots"/></svg></button>
@@ -81,14 +81,23 @@
 
       <div class="status-strip glass" id="status-strip">
         <div class="chips" id="status-chips"></div>
-        <button class="chev" id="status-strip-toggle" aria-label="展开状态"><svg class="icon sm"><use href="#i-chev-d"/></svg></button>
+        <button class="chev" id="status-strip-toggle" aria-label="查看状态栏"><svg class="icon sm"><use href="#i-chev-d"/></svg></button>
       </div>
 
-      <div id="status-panel" class="status-panel glass hidden">
-        <div class="status-panel-head"><span>状态栏</span><button id="status-panel-close" class="mini-btn">收起</button></div>
-        <div id="status-custom" class="status-custom"></div>
-        <div id="status-raw" class="status-raw"></div>
-        <div id="status-history" class="status-history"></div>
+      <!-- 状态栏弹窗：点顶栏昵称标题 / 心形 / 状态条打开；底部是透明的上一个 / 下一个 / 关闭 -->
+      <div id="status-popup" class="status-popup hidden" role="dialog" aria-modal="true" aria-label="状态栏">
+        <div class="status-scrim" id="status-scrim"></div>
+        <div class="status-sheet glass">
+          <div class="status-sheet-head"><span>状态栏</span><span id="status-pos" class="muted"></span></div>
+          <div id="status-custom" class="status-custom"></div>
+          <div id="status-raw" class="status-raw"></div>
+          <div id="status-history" class="status-history"></div>
+          <div class="status-sheet-foot">
+            <button id="status-prev" class="ghost-btn">‹ 上一个</button>
+            <button id="status-next" class="ghost-btn">下一个 ›</button>
+            <button id="status-close" class="ghost-btn">关闭</button>
+          </div>
+        </div>
       </div>
 
       <main id="message-area" aria-live="polite"></main>

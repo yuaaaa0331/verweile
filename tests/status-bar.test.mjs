@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   parseStatusPattern, applyStatusTemplate, summarizeStatus, buildStatusDocument,
+  substituteTemplateVars, statusViewEntries, clampStatusIndex,
   STATUS_FRAME_CSS, STATUS_FRAME_SCRIPT, STATUS_HEIGHT_MSG,
 } from '../js/statusBar.js';
 
@@ -72,6 +73,69 @@ test('buildStatusDocument：片段包成完整文档，含视口/CSP/隔离样�
   assert.ok(doc.includes(STATUS_HEIGHT_MSG));
   assert.ok(doc.includes('<div class="c">你好</div>'));
   assert.ok(!doc.includes('allow-same-origin'), '文档内不应出现 allow-same-origin（那是 iframe 元素的属性）');
+});
+
+test('applyStatusTemplate：真实 .thx-home 模板（截图重建）+ {{变量}} 替换', () => {
+  const tpl = fixture('thx-home-real.html');
+  const panel = {
+    regexPattern: '/【public_post】\\s*current household status:\\s*(.+?)\\s*—\\s*(.+)/s',
+    replacePattern: tpl,
+  };
+  const raw = '[【public_post】 current household status: pascal — eating takeout, watching a movie]';
+  const out = applyStatusTemplate(raw, panel, {
+    charAvatar: 'data:image/png;base64,AAA', charName: 'das große Tier', userName: 'Dolores',
+  });
+  assert.ok(out, '应匹配');
+  // $1/$2 进正文
+  assert.ok(out.html.includes('<b>pascal</b>'), '捕获组 $1 应进正文');
+  assert.ok(out.html.includes('eating takeout, watching a movie'), '捕获组 $2 应进正文');
+  // {{变量}} 与 <char-avatar> 按原始 UWU processTemplate 替换，不留字面量
+  assert.ok(!out.html.includes('{{char_name}}'), '不应残留 {{char_name}}');
+  assert.ok(out.html.includes('das große Tier'), '角色名应替换进去');
+  assert.ok(!out.html.includes('<char-avatar'), '不应残留 <char-avatar> 标签');
+  assert.ok(out.html.includes('<img src="data:image/png;base64,AAA" class="uwu-char-avatar"'), '头像应换成 img');
+  // 打包后：style 必须保留（旧代码删 style 留 CSS 当正文就是截图里的外泄），隔离样式随后
+  const doc = buildStatusDocument(out.html);
+  assert.ok(doc.includes('.thx-home{--thx-dust-0:url("data:image/svg+xml;base64,'), '模板 <style> 与 dust 背景必须保留');
+  assert.ok(doc.includes('--thx-bg:#fff'), 'CSS 变量必须保留');
+  assert.ok(doc.includes('max-width:500px'), '模板限宽原文保留');
+  assert.ok(doc.includes('body>*{max-width:100%!important'), '隔离样式负责夹住宽度');
+  assert.ok(doc.includes('border-radius:20px'), '圆角保留');
+});
+
+test('substituteTemplateVars：缺头像换空 span、缺名字用默认值', () => {
+  const html = '<p>{{char_name}} / {{user_name}} / {{user_remark}}</p><char-avatar class="a"></char-avatar><user-avatar></user-avatar>';
+  const out = substituteTemplateVars(html, {});
+  assert.ok(out.includes('<p>Character / User / User</p>'), '名字缺省用原始 UWU 默认值');
+  assert.ok(!out.includes('<char-avatar') && !out.includes('<user-avatar'), '标签不应残留');
+  assert.ok(out.includes('<span class="uwu-avatar-empty" class="a"></span>'), '缺头像时换空 span，保留原属性');
+  assert.ok(!out.includes('src=""'), '不应出现空 src 破图');
+  const withAvatar = substituteTemplateVars('<char-avatar style="width:40px"></char-avatar>', { charAvatar: 'data:x' });
+  assert.ok(withAvatar.includes('<img src="data:x" class="uwu-char-avatar" style="width:40px">'), '有头像时换 img 并保留属性');
+});
+
+test('statusViewEntries / clampStatusIndex：弹窗翻看历史的条目与下标', () => {
+  const sp = {
+    currentStatusRaw: '最新', currentStatusHtml: '<div>最新</div>',
+    history: [
+      { raw: '最新', html: '<div>最新</div>', timestamp: 3 },
+      { raw: '上一条', html: '<div>上一条</div>', timestamp: 2 },
+      { raw: '更早', html: '<div>更早</div>', timestamp: 1 },
+    ],
+  };
+  const entries = statusViewEntries(sp);
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0].raw, '最新', '最新在前');
+  assert.equal(entries[2].raw, '更早');
+  // 没有 history 时退回当前一条
+  assert.equal(statusViewEntries({ currentStatusRaw: '只一条', currentStatusHtml: '<div>x</div>' }).length, 1);
+  assert.equal(statusViewEntries({}).length, 0);
+  // 下标夹住
+  assert.equal(clampStatusIndex(0, 3), 0);
+  assert.equal(clampStatusIndex(2, 3), 2);
+  assert.equal(clampStatusIndex(5, 3), 2);
+  assert.equal(clampStatusIndex(-1, 3), 0);
+  assert.equal(clampStatusIndex(0, 0), 0);
 });
 
 test('buildStatusDocument：完整文档保留 style/class/id/变量/伪元素/动画/媒体查询', () => {
