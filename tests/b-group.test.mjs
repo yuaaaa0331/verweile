@@ -220,7 +220,7 @@ test('图标设置区渲染：含诚实说明、上传、应用名称、恢复�
   const c = fakeContainer();
   const html = renderIconSettings(c, { settings: { appName: 'verweile', dataUrl: null } });
   assert.match(html, /主屏幕图标/);
-  assert.match(html, /纯前端改不了已安装的 PWA 图标/);
+  assert.match(html, /换图不用重新部署/);
   assert.match(html, /icon-file/);
   assert.match(html, /icon-appname/);
   assert.match(html, /icon-restore/);
@@ -265,7 +265,7 @@ test('sw.js：版本化缓存 + index.html 网络优先 + 绝不碰 IndexedDB', 
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const sw = readFileSync(resolve(root, 'sw.js'), 'utf8');
   assert.match(sw, /verweile-v\$\{VERSION\}/);
-  assert.match(sw, /VERSION = '2'/);
+  assert.match(sw, /VERSION = '3'/);
   assert.match(sw, /caches\.delete/); // 只清旧版本缓存
   assert.doesNotMatch(sw, /indexedDB|deleteDatabase/);
   assert.match(sw, /notificationclick/);

@@ -59,7 +59,7 @@ import { normalizeQuoteReference, followQuoteReference } from './quoteNavigation
 import { InAppNotifier, saveUnread, loadUnread, renderNotifySettingsSection, NOTIFY_SETTINGS_KEY, DEFAULT_NOTIFY_SETTINGS } from './inAppNotify.js';
 import { getAudioKeepAlive, renderKeepAliveSettingsSection, KEEPALIVE_SETTINGS_KEY, DEFAULT_KEEPALIVE_SETTINGS } from './audioKeepAlive.js';
 import { registerServiceWorker, requestPermission, subscribePush, renderPushSettingsSection, PUSH_SETTINGS_KEY, DEFAULT_PUSH_SETTINGS } from './pushNotify.js';
-import { renderIconSettingsSection, CUSTOM_ICON_SETTINGS_KEY, DEFAULT_APP_NAME, validateIconFile, computeCropRect, previewSpecs, exportIconPack } from './customIcon.js';
+import { renderIconSettingsSection, CUSTOM_ICON_SETTINGS_KEY, CUSTOM_ICON_VERSION_KEY, DEFAULT_APP_NAME, validateIconFile, computeCropRect, previewSpecs, exportIconPack, buildCustomIconVersionedUrl, uploadCustomIcon, fetchCustomIconMeta, applyCustomIconUrl, deleteCustomIcon } from './customIcon.js';
 import { WakeEngine, renderWakeSettingsSection, WAKE_SETTINGS_KEY, DEFAULT_WAKE_SETTINGS, parseWakeToolCall } from './wakeEngine.js';
 
 const $ = (s) => document.querySelector(s);
@@ -258,6 +258,29 @@ async function loadAll() {
   if (pushSet?.value) pushSettings = { ...DEFAULT_PUSH_SETTINGS, ...pushSet.value };
   const iconSet = await backend.get('settings', CUSTOM_ICON_SETTINGS_KEY);
   if (iconSet?.value) customIconSettings = { appName: iconSet.value.appName || DEFAULT_APP_NAME, dataUrl: iconSet.value.dataUrl || null };
+  // B 组：自定义图标启动对账。标题从设置恢复；再问服务端当前版本，
+  // 以服务端为准同步 localStorage 与页面 link（为下次加载准备）。
+  // 全程 try/catch：函数未上线（404）或离线时静默失败，降级为
+  // /api/custom-icon 的 302 兜底，不阻塞页面。
+  try {
+    if (customIconSettings.appName && customIconSettings.appName !== DEFAULT_APP_NAME) {
+      document.title = customIconSettings.appName;
+    }
+    const meta = await fetchCustomIconMeta();
+    const serverVersion = meta?.version || null;
+    let localVersion = null;
+    try { localVersion = localStorage.getItem(CUSTOM_ICON_VERSION_KEY); } catch { /* 忽略 */ }
+    if (serverVersion) {
+      if (localVersion !== serverVersion) {
+        try { localStorage.setItem(CUSTOM_ICON_VERSION_KEY, serverVersion); } catch { /* 忽略 */ }
+        applyCustomIconUrl(buildCustomIconVersionedUrl(serverVersion));
+      }
+    } else if (localVersion) {
+      // 服务端已没有自定义图标：本地版本已过期，清掉，走 302 兜底。
+      try { localStorage.removeItem(CUSTOM_ICON_VERSION_KEY); } catch { /* 忽略 */ }
+      applyCustomIconUrl('/api/custom-icon');
+    }
+  } catch { /* 服务端未上线/离线：走兜底 URL，不阻塞页面 */ }
   const wakeSet = await backend.get('settings', WAKE_SETTINGS_KEY);
   if (wakeSet?.value) wakeSettings = { ...DEFAULT_WAKE_SETTINGS, ...wakeSet.value };
   const vecProg = await backend.get('settings', 'vectorIndexProgress');
@@ -4185,8 +4208,62 @@ function renderSettingsBody() {
       onSave: async (record) => {
         // renderIconSettingsSection 渲染时快照的 dataUrl 可能已过期（文件选择后
         // 才读入新图）：以当前 customIconSettings.dataUrl 为准补齐。
-        customIconSettings = { appName: record.appName, dataUrl: record.dataUrl || customIconSettings.dataUrl };
+        const nextSettings = { appName: record.appName, dataUrl: record.dataUrl || customIconSettings.dataUrl };
+        // 取源图：内存里的当前源图优先，否则解码已存的小图。
+        let src = customIconSourceImage;
+        if (!src && customIconSettings.dataUrl) {
+          src = await loadIconImage(customIconSettings.dataUrl).catch(() => null);
+        }
+        if (!src) {
+          // 只改了应用名、没传图：本地保存 + 改标题即可，不上传、不刷新。
+          customIconSettings = nextSettings;
+          await saveCustomIconSettings();
+          document.title = nextSettings.appName || DEFAULT_APP_NAME;
+          toast('应用名称已保存（图标未变）');
+          return;
+        }
+        // 512×512 master：先填白底再画裁切图（iOS 会把透明按黑色合成，
+        // 先烤白底是确定的），再转 PNG Blob 上传服务端。
+        const master = document.createElement('canvas');
+        master.width = 512; master.height = 512;
+        const mctx = master.getContext('2d');
+        mctx.fillStyle = '#ffffff';
+        mctx.fillRect(0, 0, 512, 512);
+        const crop = computeCropRect(src.width, src.height);
+        mctx.drawImage(src, crop.x, crop.y, crop.size, crop.size, 0, 0, 512, 512);
+        const blob = await new Promise((resolve, reject) => {
+          master.toBlob((b) => (b ? resolve(b) : reject(new Error('生成图标图片失败'))), 'image/png');
+        });
+        let uploaded;
+        try {
+          uploaded = await uploadCustomIcon(blob);
+        } catch (err) {
+          // 上传失败：明确报错，不改本地版本、不保存设置、不 reload。
+          toast(`图标上传失败：${err?.message || '服务端不可用'}（本地设置未改动）`);
+          throw err;
+        }
+        customIconSettings = nextSettings;
+        try { localStorage.setItem(CUSTOM_ICON_VERSION_KEY, uploaded.version); } catch { /* 忽略 */ }
+        applyCustomIconUrl(uploaded.url || buildCustomIconVersionedUrl(uploaded.version));
         await saveCustomIconSettings();
+        document.title = nextSettings.appName || DEFAULT_APP_NAME;
+        toast('已应用，刷新后重新添加到主屏幕就能看到新图标');
+        // 刷新让 Safari 在加载时抓新图标；刷新是站内行为，不算重新部署。
+        location.reload();
+      },
+      onRestoreDefault: async () => {
+        // 删服务端图标：失败也继续本地清理，但 toast 要说明服务端可能没清掉。
+        let serverCleared = true;
+        try { await deleteCustomIcon(); } catch { serverCleared = false; }
+        try { localStorage.removeItem(CUSTOM_ICON_VERSION_KEY); } catch { /* 忽略 */ }
+        applyCustomIconUrl('/apple-touch-icon.png');
+        customIconSettings = { appName: DEFAULT_APP_NAME, dataUrl: null };
+        await saveCustomIconSettings();
+        document.title = 'verweile';
+        toast(serverCleared
+          ? '已恢复默认图标，刷新后重新添加到主屏幕即可看到默认图标'
+          : '已恢复本地默认图标，但服务端可能没清掉旧图标（可稍后重试恢复默认）');
+        location.reload();
       },
       onExportPack: async () => {
         // 真实导出：用当前源图调 exportIconPack 逐档生成 PNG 并触发下载。

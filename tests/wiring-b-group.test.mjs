@@ -93,7 +93,7 @@ assert.ok(pkg.scripts.build.indexOf('build-icons')!== -1 && pkg.scripts.build.in
 
 test('index.html：manifest 与 apple-touch-icon 改为部署文件，不再是 data: 内联', () => {
 assert.ok(indexSrc.includes('<link rel="manifest" href="/manifest.json">'), 'manifest 须指 /manifest.json');
-assert.ok(indexSrc.includes('<link rel="apple-touch-icon" href="/apple-touch-icon.png">'), 'apple-touch-icon 须指 /apple-touch-icon.png');
+assert.ok(indexSrc.includes('<link id="apple-touch-icon-link" rel="apple-touch-icon" href="/api/custom-icon">'), 'apple-touch-icon 须指 /api/custom-icon 且带 id="apple-touch-icon-link"');
 assert.ok(indexSrc.includes('id="sub-notify"'), 'index.html 缺 notify 二级页节点 sub-notify（openSubpage 按 sub-<id> 查找）');
 assert.ok(indexSrc.includes('<h2>通知与唤醒</h2>'), 'sub-notify 标题须为“通知与唤醒”');
 const manageSrc = readFileSync(new URL('../js/manage.js', import.meta.url), 'utf8');

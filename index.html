@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <script>/* Muse 内嵌预览（iframe）时宿主已预留导航与安全区：首绘前挂 .embedded 关掉应用自己的安全区阀门（styles.css --sat/--sab）。独立打开时不挂，正常走 env()。 */if (window.self !== window.top) document.documentElement.classList.add('embedded');</script>
+<script>/* 自定义主屏幕图标：首绘前同步应用已保存的版本化图标 URL。localStorage['verweile.customIcon.version'] 有值时，把 apple-touch-icon 的 href 改成 /api/custom-icon/<version>；读不到时不改，走 /api/custom-icon 的 302 兜底（服务端重定向到最新图标）。注意：此脚本在 <link> 解析之前执行，直接查会查不到，所以先立即试一次，查不到就用 MutationObserver 等 <link> 解析出来再改——观察回调是微任务，在首绘与图标抓取之前跑。任何异常都不阻塞解析。 */try{var __ciVer=null;try{__ciVer=localStorage.getItem('verweile.customIcon.version');}catch(__ciE){__ciVer=null;}if(__ciVer){var __ciApply=function(){var l=document.getElementById('apple-touch-icon-link');if(l){l.href='/api/custom-icon/'+__ciVer;return true;}return false;};if(!__ciApply()&&typeof MutationObserver!=='undefined'){var __ciObs=new MutationObserver(function(){if(__ciApply())__ciObs.disconnect();});__ciObs.observe(document.documentElement,{childList:true,subtree:true});}}}catch(__ciE2){}</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -11,7 +12,7 @@
 <meta name="theme-color" content="#ececed">
 <title>verweile</title>
 <link rel="manifest" href="/manifest.json">
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link id="apple-touch-icon-link" rel="apple-touch-icon" href="/api/custom-icon">
 <link rel="stylesheet" href="styles.css">
 <link rel="stylesheet" href="chat.css">
 </head>

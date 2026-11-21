@@ -74,7 +74,9 @@ test('保存与恢复默认：记录形状与诚实说明', () => {
   const def = restoreDefaultIcon();
   assert.equal(def.appName, DEFAULT_APP_NAME);
   assert.equal(def.dataUrl, null);
-  assert.match(CUSTOM_ICON_HONESTY, /纯前端改不了已安装的 PWA 图标/);
-  assert.match(CUSTOM_ICON_HONESTY, /需要重新部署，并从主屏幕删除旧图标、重新“添加到主屏幕”/);
+  assert.match(CUSTOM_ICON_HONESTY, /保存后刷新页面，再从主屏幕删除旧图标、重新“添加到主屏幕”，就能看到新图标/);
+  assert.match(CUSTOM_ICON_HONESTY, /换图不用重新部署/);
   assert.match(CUSTOM_ICON_HONESTY, /Safari 与主屏幕 Web App 的存储是分开的/);
+  assert.match(CUSTOM_ICON_HONESTY, /透明底图片会先烤成白底再上传/);
+  assert.doesNotMatch(CUSTOM_ICON_HONESTY, /需要重新部署/);
 });

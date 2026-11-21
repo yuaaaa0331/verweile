@@ -7082,17 +7082,23 @@ function renderPushSettingsSection(container, deps = {}) {
 /* ===== js/customIcon.js ===== */
 // customIcon.js — 自定义主屏幕图标。
 // 上传 → canvas 正方形裁切 → 180/192/512 三档预览 → 应用名称 →
-// “下载图标包”导出 PNG（180 apple-touch-icon、192、512、512 maskable）。
+// 服务端保存：512×512 白底 master 图 POST 到 /api/custom-icon，服务端存图
+// 并返回版本化 URL（/api/custom-icon/icon-<时间戳>.png）；页面内
+// apple-touch-icon 链接同步更新，版本存 localStorage，下次首绘前恢复。
+// data URL / Blob URL 进不了 iOS 安装流程（系统层按 URL 从网络抓图标），
+// 所以图标一定走服务端 URL；iOS 主杠杆是 apple-touch-icon 的版本化 link。
+// “下载图标包”仍保留本地导出 PNG（180 apple-touch-icon、192、512、512 maskable）。
 // 源图与名称存 IndexedDB settings（键见 CUSTOM_ICON_SETTINGS_KEY，
 // 图为 data URL 小图）；大图不进 settings，避免撑爆存储。
 // 诚实说明（见 CUSTOM_ICON_HONESTY，界面必须原样展示）：
-// 纯前端改不了已安装 PWA 图标；安装图标必须走部署文件；
-// 设置后需重新部署并重新添加到主屏幕，已安装图标不会自动替换；
-// Safari 与主屏幕 Web App 存储分开（图标文件走部署文件两边共用，
-// 偏好设置存在各自存储里）。
+// 保存后刷新页面、删除主屏幕旧图标并重新添加到主屏幕即可看到新图标；
+// 已安装的旧图标不会自动变；换图不用重新部署；
+// Safari 与主屏幕 Web App 存储分开（偏好设置存在各自存储里，不互通）。
 
 const CUSTOM_ICON_SETTINGS_KEY = 'customIcon';
 const DEFAULT_APP_NAME = 'verweile';
+const CUSTOM_ICON_API_URL = '/api/custom-icon';
+const CUSTOM_ICON_VERSION_KEY = 'verweile.customIcon.version';
 const MAX_ICON_FILE_BYTES = 5 * 1024 * 1024;
 const ACCEPTED_ICON_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 const ICON_SIZES = [
@@ -7103,14 +7109,81 @@ const ICON_SIZES = [
 ];
 
 const CUSTOM_ICON_HONESTY = [
-  '纯前端改不了已安装的 PWA 图标：主屏幕图标来自部署时的 manifest 与 apple-touch-icon 文件。',
-  '设置新图标后，需要重新部署，并从主屏幕删除旧图标、重新“添加到主屏幕”，已安装的图标不会自动替换。',
-  'Safari 与主屏幕 Web App 的存储是分开的：图标文件走部署文件两边共用，但偏好设置存在各自的存储里，',
+  '保存后刷新页面，再从主屏幕删除旧图标、重新“添加到主屏幕”，就能看到新图标；',
+  '已安装的旧图标不会自动变，要删掉重加。换图不用重新部署。',
+  '透明底图片会先烤成白底再上传（iOS 会把透明按黑色合成）。',
+  'Safari 与主屏幕 Web App 的存储是分开的：偏好设置存在各自的存储里，',
   '在 Safari 里改的设置不会自动同步到主屏幕版，反之亦然。',
 ].join('');
 
 const ICON_REDEPLOY_TEXT =
-  '图标已保存到设置。要让它成为主屏幕图标：1）重新部署；2）删除主屏幕旧图标；3）重新添加到主屏幕。';
+  '图标已保存。刷新页面后，删除主屏幕旧图标并重新“添加到主屏幕”，就能看到新图标；换图不用重新部署。';
+
+/** 版本化图标 URL：version 形如 `icon-<时间戳>.png`。 */
+function buildCustomIconVersionedUrl(version) {
+  return `${CUSTOM_ICON_API_URL}/${version}`;
+}
+
+async function readIconErrorReason(res) {
+  try {
+    const data = await res.json();
+    if (data && (data.reason || data.message || data.error)) return String(data.reason || data.message || data.error);
+  } catch { /* 不是 JSON，走 text */ }
+  try {
+    const text = await res.text();
+    if (text) return text.slice(0, 200);
+  } catch { /* 忽略 */ }
+  return `服务端返回 ${res.status}`;
+}
+
+/**
+ * 上传 512×512 白底 master PNG 到服务端。成功返回 { version, url }
+ *（version 形如 `icon-<时间戳>.png`，url 为版本化 URL）。
+ * 失败抛错（带服务端 reason）。fetchImpl 可注入（Node 测试用 stub fetch）。
+ * 注意：函数上线前服务端未部署时站内保存会 404——调用方必须 try/catch。
+ */
+async function uploadCustomIcon(pngBlob, fetchImpl = globalThis.fetch) {
+  const res = await fetchImpl(CUSTOM_ICON_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/png' },
+    body: pngBlob,
+  });
+  if (!res.ok) throw new Error(`图标上传失败：${await readIconErrorReason(res)}`);
+  const data = await res.json();
+  if (!data?.version) throw new Error('图标上传失败：服务端没有返回版本号。');
+  return { version: data.version, url: data.url || buildCustomIconVersionedUrl(data.version) };
+}
+
+/** 取服务端图标元信息（GET /api/custom-icon/meta）。失败抛错，调用方 try/catch。 */
+async function fetchCustomIconMeta(fetchImpl = globalThis.fetch) {
+  const res = await fetchImpl(`${CUSTOM_ICON_API_URL}/meta`);
+  if (!res.ok) throw new Error(`读取图标信息失败：${await readIconErrorReason(res)}`);
+  return res.json();
+}
+
+/**
+ * 更新页面内全部 apple-touch-icon 链接的 href：优先按
+ * id="apple-touch-icon-link"，再补 querySelectorAll('link[rel="apple-touch-icon"]')。
+ * doc 可选，默认 globalThis.document（Node 测试可注入 stub document）；
+ * 页面里没有相关 link 时不抛错。
+ */
+function applyCustomIconUrl(url, doc = globalThis.document) {
+  if (!doc) return;
+  const seen = new Set();
+  const applyTo = (link) => { if (link && !seen.has(link)) { seen.add(link); link.href = url; } };
+  try { applyTo(doc.getElementById?.('apple-touch-icon-link')); } catch { /* 忽略 */ }
+  try {
+    const links = doc.querySelectorAll?.('link[rel="apple-touch-icon"]') || [];
+    for (const link of links) applyTo(link);
+  } catch { /* 忽略 */ }
+}
+
+/** 删除服务端自定义图标（DELETE /api/custom-icon），返回 JSON。失败抛错。 */
+async function deleteCustomIcon(fetchImpl = globalThis.fetch) {
+  const res = await fetchImpl(CUSTOM_ICON_API_URL, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`删除服务端图标失败：${await readIconErrorReason(res)}`);
+  try { return await res.json(); } catch { return {}; }
+}
 
 /** 校验上传文件：类型 + 大小。返回 { ok } 或 { ok:false, reason }。 */
 function validateIconFile(file) {
@@ -7223,8 +7296,10 @@ function restoreDefaultIcon() {
 /**
  * 设置区渲染（由总协调员接进 app.js 设置页）。
  * deps：{ settings（{ appName, dataUrl }）, onSave(record), onExportPack(),
- *         onRestore(), toast? }。文件选择与 canvas 裁切由集成方按
+ *         onRestoreDefault(), toast? }。文件选择与 canvas 裁切由集成方按
  * exportIconPack / previewSpecs 实现，本函数只渲染界面与按钮。
+ * onSave 负责上传服务端、提示与刷新，本函数只在 onSave 抛错时吞掉异常
+ * （不补成功文案）；onRestoreDefault 未传时恢复按钮回退到 onSave(restoreDefaultIcon())。
  */
 function renderIconSettingsSection(container, deps = {}) {
   const s = deps.settings || {};
@@ -7232,7 +7307,7 @@ function renderIconSettingsSection(container, deps = {}) {
   const html = `
       <h3>主屏幕图标</h3>
       <p class="muted b-honesty">${CUSTOM_ICON_HONESTY}</p>
-      <div class="field"><label>上传图标图片</label><input type="file" id="icon-file" accept="image/png,image/jpeg,image/webp"><div class="hint">支持 PNG / JPEG / WebP，5MB 以内；自动居中正方形裁切，不拉伸。</div></div>
+      <div class="field"><label>上传图标图片</label><input type="file" id="icon-file" accept="image/png,image/jpeg,image/webp"><div class="hint">支持 PNG / JPEG / WebP，5MB 以内；自动居中正方形裁切，不拉伸。透明底图片会先烤成白底再上传（iOS 会把透明按黑色合成）。</div></div>
       <div id="icon-preview" class="icon-preview-row">${s.dataUrl ? `<img src="${s.dataUrl}" alt="当前图标预览" width="72" height="72">` : '<p class="muted">未上传自定义图标，当前使用默认图标。</p>'}</div>
       <div class="field"><label>应用名称（主屏幕下显示的名字）</label><input type="text" id="icon-appname" value="${String(appName).replace(/"/g, '&quot;')}" maxlength="30"><div class="hint">1–30 字。</div></div>
       <div class="actions-row">
@@ -7246,16 +7321,25 @@ function renderIconSettingsSection(container, deps = {}) {
   q('icon-save')?.addEventListener?.('click', async () => {
     const nameCheck = validateAppName(q('icon-appname')?.value ?? appName);
     if (!nameCheck.ok) { deps.toast?.(nameCheck.reason); return; }
-    await deps.onSave?.(buildCustomIconRecord({ dataUrl: s.dataUrl || null, appName: nameCheck.name }));
-    deps.toast?.(ICON_REDEPLOY_TEXT);
+    // 提示与刷新由 onSave 自己决定（上传成功才 toast 成功文案并刷新；
+    // onSave 抛错时这里不补成功文案，只吞掉异常避免未处理 rejection）。
+    try {
+      await deps.onSave?.(buildCustomIconRecord({ dataUrl: s.dataUrl || null, appName: nameCheck.name }));
+    } catch { /* onSave 已自己 toast 报错 */ }
   });
   q('icon-export')?.addEventListener?.('click', async () => {
     const r = await deps.onExportPack?.();
     if (r && !r.ok) deps.toast?.(r.reason || '导出失败');
   });
   q('icon-restore')?.addEventListener?.('click', async () => {
+    // 优先走调用方的新恢复流程（删服务端图标 + 清本地版本 + 刷新）；
+    // 没传 onRestoreDefault 时回退到旧行为：只重置本地设置记录。
+    if (typeof deps.onRestoreDefault === 'function') {
+      try { await deps.onRestoreDefault(); } catch { /* onRestoreDefault 已自己 toast 报错 */ }
+      return;
+    }
     await deps.onSave?.(restoreDefaultIcon());
-    deps.toast?.('已恢复默认图标（已安装的图标仍需重新部署并重新添加才会变）');
+    deps.toast?.('已恢复默认图标（已安装的旧图标不会自动变，需要删除并重新添加到主屏幕）');
   });
   return html;
 }
@@ -11480,6 +11564,29 @@ async function loadAll() {
   if (pushSet?.value) pushSettings = { ...DEFAULT_PUSH_SETTINGS, ...pushSet.value };
   const iconSet = await backend.get('settings', CUSTOM_ICON_SETTINGS_KEY);
   if (iconSet?.value) customIconSettings = { appName: iconSet.value.appName || DEFAULT_APP_NAME, dataUrl: iconSet.value.dataUrl || null };
+  // B 组：自定义图标启动对账。标题从设置恢复；再问服务端当前版本，
+  // 以服务端为准同步 localStorage 与页面 link（为下次加载准备）。
+  // 全程 try/catch：函数未上线（404）或离线时静默失败，降级为
+  // /api/custom-icon 的 302 兜底，不阻塞页面。
+  try {
+    if (customIconSettings.appName && customIconSettings.appName !== DEFAULT_APP_NAME) {
+      document.title = customIconSettings.appName;
+    }
+    const meta = await fetchCustomIconMeta();
+    const serverVersion = meta?.version || null;
+    let localVersion = null;
+    try { localVersion = localStorage.getItem(CUSTOM_ICON_VERSION_KEY); } catch { /* 忽略 */ }
+    if (serverVersion) {
+      if (localVersion !== serverVersion) {
+        try { localStorage.setItem(CUSTOM_ICON_VERSION_KEY, serverVersion); } catch { /* 忽略 */ }
+        applyCustomIconUrl(buildCustomIconVersionedUrl(serverVersion));
+      }
+    } else if (localVersion) {
+      // 服务端已没有自定义图标：本地版本已过期，清掉，走 302 兜底。
+      try { localStorage.removeItem(CUSTOM_ICON_VERSION_KEY); } catch { /* 忽略 */ }
+      applyCustomIconUrl('/api/custom-icon');
+    }
+  } catch { /* 服务端未上线/离线：走兜底 URL，不阻塞页面 */ }
   const wakeSet = await backend.get('settings', WAKE_SETTINGS_KEY);
   if (wakeSet?.value) wakeSettings = { ...DEFAULT_WAKE_SETTINGS, ...wakeSet.value };
   const vecProg = await backend.get('settings', 'vectorIndexProgress');
@@ -15407,8 +15514,62 @@ function renderSettingsBody() {
       onSave: async (record) => {
         // renderIconSettingsSection 渲染时快照的 dataUrl 可能已过期（文件选择后
         // 才读入新图）：以当前 customIconSettings.dataUrl 为准补齐。
-        customIconSettings = { appName: record.appName, dataUrl: record.dataUrl || customIconSettings.dataUrl };
+        const nextSettings = { appName: record.appName, dataUrl: record.dataUrl || customIconSettings.dataUrl };
+        // 取源图：内存里的当前源图优先，否则解码已存的小图。
+        let src = customIconSourceImage;
+        if (!src && customIconSettings.dataUrl) {
+          src = await loadIconImage(customIconSettings.dataUrl).catch(() => null);
+        }
+        if (!src) {
+          // 只改了应用名、没传图：本地保存 + 改标题即可，不上传、不刷新。
+          customIconSettings = nextSettings;
+          await saveCustomIconSettings();
+          document.title = nextSettings.appName || DEFAULT_APP_NAME;
+          toast('应用名称已保存（图标未变）');
+          return;
+        }
+        // 512×512 master：先填白底再画裁切图（iOS 会把透明按黑色合成，
+        // 先烤白底是确定的），再转 PNG Blob 上传服务端。
+        const master = document.createElement('canvas');
+        master.width = 512; master.height = 512;
+        const mctx = master.getContext('2d');
+        mctx.fillStyle = '#ffffff';
+        mctx.fillRect(0, 0, 512, 512);
+        const crop = computeCropRect(src.width, src.height);
+        mctx.drawImage(src, crop.x, crop.y, crop.size, crop.size, 0, 0, 512, 512);
+        const blob = await new Promise((resolve, reject) => {
+          master.toBlob((b) => (b ? resolve(b) : reject(new Error('生成图标图片失败'))), 'image/png');
+        });
+        let uploaded;
+        try {
+          uploaded = await uploadCustomIcon(blob);
+        } catch (err) {
+          // 上传失败：明确报错，不改本地版本、不保存设置、不 reload。
+          toast(`图标上传失败：${err?.message || '服务端不可用'}（本地设置未改动）`);
+          throw err;
+        }
+        customIconSettings = nextSettings;
+        try { localStorage.setItem(CUSTOM_ICON_VERSION_KEY, uploaded.version); } catch { /* 忽略 */ }
+        applyCustomIconUrl(uploaded.url || buildCustomIconVersionedUrl(uploaded.version));
         await saveCustomIconSettings();
+        document.title = nextSettings.appName || DEFAULT_APP_NAME;
+        toast('已应用，刷新后重新添加到主屏幕就能看到新图标');
+        // 刷新让 Safari 在加载时抓新图标；刷新是站内行为，不算重新部署。
+        location.reload();
+      },
+      onRestoreDefault: async () => {
+        // 删服务端图标：失败也继续本地清理，但 toast 要说明服务端可能没清掉。
+        let serverCleared = true;
+        try { await deleteCustomIcon(); } catch { serverCleared = false; }
+        try { localStorage.removeItem(CUSTOM_ICON_VERSION_KEY); } catch { /* 忽略 */ }
+        applyCustomIconUrl('/apple-touch-icon.png');
+        customIconSettings = { appName: DEFAULT_APP_NAME, dataUrl: null };
+        await saveCustomIconSettings();
+        document.title = 'verweile';
+        toast(serverCleared
+          ? '已恢复默认图标，刷新后重新添加到主屏幕即可看到默认图标'
+          : '已恢复本地默认图标，但服务端可能没清掉旧图标（可稍后重试恢复默认）');
+        location.reload();
       },
       onExportPack: async () => {
         // 真实导出：用当前源图调 exportIconPack 逐档生成 PNG 并触发下载。

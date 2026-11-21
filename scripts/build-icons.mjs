@@ -64,24 +64,37 @@ if (present.includes('apple-touch-icon.png')) {
   console.log('已同步 dist/apple-touch-icon.png');
 }
 
-let manifest = {};
-if (existsSync(manifestPath)) {
-  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { manifest = {}; }
-}
-manifest.name = appName;
-manifest.short_name = manifest.short_name || appName;
-manifest.display = 'standalone';
-manifest.background_color = manifest.background_color || '#ececed';
-manifest.theme_color = manifest.theme_color || '#ececed';
-manifest.start_url = manifest.start_url || '.';
-manifest.icons = EXPECTED
-  .filter((e) => present.includes(e.file))
-  .map((e) => ({ src: `/icons/${e.file}`, sizes: e.sizes, type: e.type, purpose: e.purpose }));
-writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-console.log(`dist/manifest.json 已生成/更新：name=${appName}，icons=${manifest.icons.length} 个`);
+// 保险：根 manifest.json 存在时，绝不能覆盖 dist/manifest.json 的 icons。
+// 原因：根 manifest.json 的 icons 指向 /api/custom-icon（Netlify 函数，
+// 由 B 组维护），且构建顺序是 build-icons.mjs 先跑、build-preview.mjs
+// 后跑——后者第 110 行会把根 manifest.json 复制到 dist/（覆盖这里写的
+// 那份）。若这里仍按 /icons/* 重写 dist/manifest.json，一旦将来有人放了
+// assets/icons/，就会把函数 URL 冲掉（build-icons 也可能被单独跑）。
+// 因此检测到根 manifest.json 时跳过整个 dist/manifest.json 写入，只保留
+// 上面的图标文件复制与 apple-touch-icon 同步。
+const rootManifestPath = resolve(root, 'manifest.json');
+if (existsSync(rootManifestPath)) {
+  console.log('检测到根 manifest.json：跳过 dist/manifest.json 写入（根 manifest 的 icons 指向 /api/custom-icon，构建时由 build-preview.mjs 复制到 dist/，避免被本地 /icons/* 覆盖）。');
+} else {
+  let manifest = {};
+  if (existsSync(manifestPath)) {
+    try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { manifest = {}; }
+  }
+  manifest.name = appName;
+  manifest.short_name = manifest.short_name || appName;
+  manifest.display = 'standalone';
+  manifest.background_color = manifest.background_color || '#ececed';
+  manifest.theme_color = manifest.theme_color || '#ececed';
+  manifest.start_url = manifest.start_url || '.';
+  manifest.icons = EXPECTED
+    .filter((e) => present.includes(e.file))
+    .map((e) => ({ src: `/icons/${e.file}`, sizes: e.sizes, type: e.type, purpose: e.purpose }));
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  console.log(`dist/manifest.json 已生成/更新：name=${appName}，icons=${manifest.icons.length} 个`);
 
-const missing = EXPECTED.filter((e) => !present.includes(e.file)).map((e) => e.file);
-if (missing.length) console.log(`提示：缺少 ${missing.join(', ')}，manifest 里暂不含它们；补齐后重跑本脚本。`);
+  const missing = EXPECTED.filter((e) => !present.includes(e.file)).map((e) => e.file);
+  if (missing.length) console.log(`提示：缺少 ${missing.join(', ')}，manifest 里暂不含它们；补齐后重跑本脚本。`);
+}
 
 console.log('\n需手动确认并加入 index.html <head> 的 link（本脚本不改 index.html）：');
 console.log('  <link rel="manifest" href="/manifest.json">');
