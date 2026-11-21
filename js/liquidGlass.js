@@ -1,12 +1,11 @@
 // liquidGlass.js — 可复用的液态玻璃引擎（WebGL）。
 // 按原型 uwu-liao-tian-ui-yuan-xing 与《液态玻璃技术方案 v3》移植：
 // 单个 WebGL 上下文绘制全部玻璃元素，同一张背景纹理按元素位置采样，
-// 全表面折射 + 内部低频波动 + 轻微色散，边缘高光左上 0.66 / 右下 0.48。
-// 亮度修正后的默认值：光强 55%、白色染色 2%、边缘高光上限 0.45，
-// Shader 末尾有硬性钳制——玻璃输出相对身后壁纸最多 +0.10 / -0.16，
-// 不可能再爆成近白色。WebGL 不可用或上下文丢失时返回 false，
-// 调用方保留 CSS 玻璃（.glass），布局与交互不变。
-// 本模块不碰 DOM 之外的任何应用状态；不依赖 app.js。
+// 折射集中在边缘窄带、中心安静，色散与染色默认均为 0。
+// Clear 材质默认值（2026-11-20 精修）：光强 55%、边缘高光上限 0.18、
+// 输出 alpha 即 mask（不透明，无画布重影）、亮度钳制 +0.06 / -0.16。
+// WebGL 不可用或上下文丢失时返回 false，调用方保留 CSS 玻璃（.glass），
+// 布局与交互不变。本模块不碰 DOM 之外的任何应用状态；不依赖 app.js。
 
 export const LiquidGlass = (() => {
   const VERT_SRC = `
@@ -78,9 +77,9 @@ void main() {
   vec2 hn = p / (size * 0.5);
   float radial = length(hn);
   vec2 dir = radial > 0.0001 ? hn / radial : vec2(0.0);
-  float field = 0.16 + 0.84 * max(rim, smoothstep(0.2, 1.05, radial) * 0.55);
+  float field = 0.03 + 0.97 * max(rim, smoothstep(0.2, 1.05, radial) * 0.55);
   vec2 refr = dir * u_refract * field;
-  vec2 wave = vec2(sin(p.y * 0.020 + u_time * 1.25), cos(p.x * 0.016 - u_time * 1.05)) * u_wobble * (0.30 + 0.70 * rim);
+  vec2 wave = vec2(sin(p.y * 0.020 + u_time * 1.25), cos(p.x * 0.016 - u_time * 1.05)) * u_wobble * (0.05 + 0.95 * rim);
   vec2 sp = v_px + refr + wave;
   vec4 col;
   if (u_blur > 0.05) {
@@ -89,34 +88,82 @@ void main() {
     float ca = (dot(refr, dir) * 0.055 + length(wave) * 0.12) * min(u_dispersion, 1.0);
     col = vec4(tap(sp + dir * ca).r, tap(sp).g, tap(sp - dir * ca).b, 1.0);
   }
-  float luma = dot(col.rgb, vec3(0.299, 0.587, 0.114));
-  col.rgb = mix(vec3(luma), col.rgb, 1.03);
   col.rgb = mix(col.rgb, vec3(1.0), u_tintAmt);
   vec2 dsp = dir * u_dispersion * (0.35 + 0.65 * field);
   col.r = mix(col.r, tap(sp + dsp).r, 0.55);
   col.b = mix(col.b, tap(sp - dsp).b, 0.55);
-  float grad = 1.0 - clamp(q.x * 0.55 + q.y * 0.45, 0.0, 1.0);
-  col.rgb += u_shine * u_light * pow(grad, 1.6) * 0.08;
   float hairline = exp(-pow((edgeDist + 0.55) / 0.62, 2.0));
   float ang = atan(p.y, p.x);
   float dA1 = wrapAngle(ang - u_lightAngle);
   float dA2 = wrapAngle(ang - (u_lightAngle + 3.14159265));
   float upperLeft = exp(-pow(dA1 / 0.60, 2.0));
   float lowerRight = exp(-pow(dA2 / 0.62, 2.0));
+  // 薄高光：只在左上边缘窄带内快速渐隐（rim²），不再铺满整个表面。
+  float wash = upperLeft * rim * rim;
+  col.rgb += u_shine * u_light * wash * 0.02;
   float edgeGlint = hairline * (upperLeft * 0.66 + lowerRight * 0.48) * u_light;
-  col.rgb = mix(col.rgb, vec3(1.0), clamp(edgeGlint, 0.0, 0.45) * u_edge);
+  col.rgb = mix(col.rgb, vec3(1.0), clamp(edgeGlint, 0.0, 0.18) * u_edge);
   float botShade = smoothstep(0.55, 1.0, q.y) * exp(-edgeDist / 7.0);
   col.rgb *= 1.0 - botShade * 0.05;
   vec3 baseCol = tap(v_px).rgb;
-  col.rgb = baseCol + clamp(col.rgb - baseCol, vec3(-0.16), vec3(0.10));
-  gl_FragColor = vec4(col.rgb, mask * 0.52);
+  col.rgb = baseCol + clamp(col.rgb - baseCol, vec3(-0.16), vec3(0.06));
+  gl_FragColor = vec4(col.rgb, mask);
 }`;
 
-  // 原型核实后的默认值（亮度修正版，不是 v3 的 26/0/25/13/15 旧基线）。
+  // Clear 材质默认值（与 theme.js glassParamsFor(THEME_DEFAULTS) 一致）。
   const DEFAULT_PARAMS = {
-    refract: 20, blur: 0, edge: 15, shine: 6, wobble: 8, tint: 2,
-    lightAngle: -2.38, light: 0.55, dispersion: 5, depth: 0.32,
+    refract: 32, blur: 0, edge: 8, shine: 2, wobble: 3, tint: 0,
+    lightAngle: -2.38, light: 0.55, dispersion: 0, depth: 0.42,
   };
+
+  // 按组件分的玻璃强度（与 styles.css 的 class 分类一致）：单行气泡最轻，
+  // 多行气泡次之，顶栏 / 底栏 / 弹窗 / 大卡片各有强度，不再一套固定值走天下。
+  // 数值是相对主题参数的乘子（0–1）。
+  const GLASS_INTENSITY = {
+    'bubble-single': { refract: 0.35, blur: 0.5, edge: 0.5, shine: 0.3, wobble: 0.3, depth: 0.6 },
+    'bubble-multi': { refract: 0.6, blur: 0.7, edge: 0.7, shine: 0.5, wobble: 0.5, depth: 0.8 },
+    chip: { refract: 0.4, blur: 0.5, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.6 },
+    pill: { refract: 0.5, blur: 0.6, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.7 },
+    tabbar: { refract: 0.7, blur: 0.8, edge: 0.8, shine: 0.6, wobble: 0.3, depth: 0.9 },
+    topbar: { refract: 0.8, blur: 0.9, edge: 0.9, shine: 0.7, wobble: 0.4, depth: 1.0 },
+    input: { refract: 0.5, blur: 0.6, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.7 },
+    strip: { refract: 0.5, blur: 0.6, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.7 },
+    sheet: { refract: 0.9, blur: 1.0, edge: 1.0, shine: 0.8, wobble: 0.4, depth: 1.0 },
+    card: { refract: 0.7, blur: 0.8, edge: 0.8, shine: 0.6, wobble: 0.3, depth: 0.9 },
+    'sub-head': { refract: 0.7, blur: 0.8, edge: 0.8, shine: 0.6, wobble: 0.3, depth: 0.9 },
+    small: { refract: 0.35, blur: 0.5, edge: 0.5, shine: 0.3, wobble: 0.2, depth: 0.6 },
+    default: { refract: 1, blur: 1, edge: 1, shine: 1, wobble: 1, depth: 1 },
+  };
+
+  /** 按元素 class + 气泡高度定强度分类（纯函数，可单测）。heightPx 为 CSS 像素高度。 */
+  function classifyGlassElement(el, heightPx) {
+    const c = el.classList;
+    const has = (...names) => names.some((n) => c.contains(n));
+    if (has('bubble')) return heightPx < 60 ? 'bubble-single' : 'bubble-multi';
+    if (has('chip')) return 'chip';
+    if (has('pill')) return 'pill';
+    if (has('tabbar')) return 'tabbar';
+    if (has('chat-head')) return 'topbar';
+    if (has('input-shell')) return 'input';
+    if (has('status-strip')) return 'strip';
+    if (has('sheet-card', 'status-sheet', 'modal-card')) return 'sheet';
+    if (has('char-card', 'group', 'post', 'card')) return 'card';
+    if (has('sub-head')) return 'sub-head';
+    if (has('m-ico', 'post-action')) return 'small';
+    return 'default';
+  }
+
+  /** 整画布清除（幽灵块根因修复）：必须先关 scissor（并复位到整块画布），
+   * 再 clear，否则 clear 只清上一帧最后一个元素的 scissor 矩形，
+   * 元素移动 / 尺寸变化 / 被移除 / 切页后旧位置残留永不清掉。 */
+  function clearGlassCanvas(gl, width, height) {
+    gl.disable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.SCISSOR_TEST);
+    if (width && height) gl.scissor(0, 0, width, height);
+    return true;
+  }
 
   const state = {
     canvas: null, gl: null, prog: null, uniforms: {}, texture: null,
@@ -167,24 +214,17 @@ void main() {
     const ch = canvas.height;
     if (!cw || !ch) return;
     gl.viewport(0, 0, cw, ch);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    clearGlassCanvas(gl, cw, ch);
     gl.useProgram(state.prog);
     const u = state.uniforms;
     gl.uniform2f(u.u_view, cw, ch);
     gl.uniform2f(u.u_img, state.imgSize[0], state.imgSize[1]);
     gl.uniform1f(u.u_time, state.animTime);
     const p = state.params;
-    gl.uniform1f(u.u_refract, p.refract * dpr * 0.55);
-    gl.uniform1f(u.u_blur, p.blur * dpr * 0.55);
-    gl.uniform1f(u.u_edge, p.edge / 100);
-    gl.uniform1f(u.u_shine, p.shine / 100);
-    gl.uniform1f(u.u_wobble, state.animEnabled ? p.wobble * dpr * 0.10 : 0);
     gl.uniform1f(u.u_tintAmt, p.tint / 100);
     gl.uniform1f(u.u_light, p.light);
     gl.uniform1f(u.u_lightAngle, p.lightAngle);
     gl.uniform1f(u.u_dispersion, p.dispersion * dpr * 0.22);
-    gl.uniform1f(u.u_depth, p.depth);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, state.texture);
     gl.uniform1i(u.u_bg, 0);
@@ -200,6 +240,14 @@ void main() {
       const w = r.width * dpr;
       const h = r.height * dpr;
       const radius = Math.min(readRadius(el), Math.min(r.width, r.height) / 2) * dpr;
+      // 按组件强度覆盖：同一帧里不同元素用不同的折射 / 模糊 / 边缘 / 波动。
+      const k = GLASS_INTENSITY[classifyGlassElement(el, r.height)] || GLASS_INTENSITY.default;
+      gl.uniform1f(u.u_refract, p.refract * dpr * 0.55 * k.refract);
+      gl.uniform1f(u.u_blur, p.blur * dpr * 0.55 * k.blur);
+      gl.uniform1f(u.u_edge, (p.edge / 100) * k.edge);
+      gl.uniform1f(u.u_shine, (p.shine / 100) * k.shine);
+      gl.uniform1f(u.u_wobble, (state.animEnabled ? p.wobble * dpr * 0.10 : 0) * k.wobble);
+      gl.uniform1f(u.u_depth, Math.min(1, p.depth * k.depth));
       gl.uniform4f(u.u_rect, x, yTop, w, h);
       gl.uniform1f(u.u_radius, radius);
       // scissor：元素矩形外扩 2px（覆盖抗锯齿边缘），y 轴翻转。
@@ -275,6 +323,9 @@ void main() {
     VERT_SRC,
     FRAG_SRC,
     DEFAULT_PARAMS,
+    GLASS_INTENSITY,
+    classifyGlassElement,
+    clearGlassCanvas,
     get supported() { return state.ok; },
 
     /** 初始化。canvas：页面里的 <canvas id="gl-canvas">。失败返回 false（调用方保留 CSS 玻璃）。 */
@@ -367,9 +418,13 @@ void main() {
     },
 
     prune() {
+      let removed = false;
       for (const el of state.elements) if (!el.isConnected) {
         state.elements.delete(el); state.io?.unobserve(el); state.ro?.unobserve(el);
+        removed = true;
       }
+      // 集合变化后下一帧整画布重清（clearGlassCanvas 已保证 scissor 安全），旧位置不残留。
+      if (removed) state.needsRender = true;
     },
     attach(el) { attachOne(el); },
     attachAll(root) {

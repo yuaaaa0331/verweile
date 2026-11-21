@@ -1,6 +1,6 @@
 // theme.js — 外观主题（背景 / 文字与气泡配色 / 玻璃材质参数）。
-// 按原型 uwu-liao-tian-ui-yuan-xing 移植，亮度修正后的默认值：
-// 光源强度 55%、雾化 8px、遮罩 32%、折射 20、深度 32、色散 5、波动 8。
+// 按原型 uwu-liao-tian-ui-yuan-xing 移植，Clear 材质默认值：
+// 光源强度 55%、雾化 6px、遮罩 12%、折射 32、深度 42、色散 0、波动 3。
 // 主题只存在 IndexedDB 的 settings 表（key 'appearance'），是本机偏好，
 // 不进备份导出、不随备份导入；不改动任何聊天数据结构。
 // 预设背景是 Canvas 渐变纹理（原型照片资产不在源码里），上传自己的图走 dataURL。
@@ -26,6 +26,52 @@ export function hexA(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
+/** hex 颜色的相对亮度（0–1），用于 tone 推导与 ink 翻转判断。 */
+export function hexLuminance(hex) {
+  let h = String(hex || '').replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const r = parseInt(h.slice(0, 2), 16) || 0;
+  const g = parseInt(h.slice(2, 4), 16) || 0;
+  const b = parseInt(h.slice(4, 6), 16) || 0;
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+/** data-tone 明暗分界：平均亮度低于 0.5 判暗。实测：深色壁纸 0.094、黑白漫画线稿 0.285、
+ * 浅色壁纸 0.949、预设 none #e9e9e9 约 0.91、night #181818 约 0.09——0.5 能干净分开。 */
+export const TONE_LUMA_THRESHOLD = 0.5;
+
+/** 按壁纸实际平均亮度（不要只看调色板）决定 tone；深色配色本身也判暗。 */
+export function deriveTone(luma, paletteDark) {
+  return paletteDark || (typeof luma === 'number' && luma < TONE_LUMA_THRESHOLD) ? 'dark' : 'light';
+}
+
+/** RGBA 像素数组的平均亮度（0–1），与 deriveTone / 蒙层烘焙共用同一公式。 */
+export function averageLuminanceFromData(data) {
+  if (!data || !data.length) return 0.5;
+  let sum = 0;
+  const n = data.length / 4;
+  for (let i = 0; i < data.length; i += 4) {
+    sum += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+  }
+  return sum / n / 255;
+}
+
+/** 蒙层烘焙后的采样亮度：与可见层 .bg-layer::after 同一条 overlay 公式
+ *（浅 tone 盖 rgba(245,245,245,veil)，深 tone 盖 rgba(0,0,0,veil)）。 */
+export function veilBakedLuminance(luma, veil, tone) {
+  const v = Math.min(1, Math.max(0, veil));
+  return tone === 'dark' ? luma * (1 - v) : luma * (1 - v) + (245 / 255) * v;
+}
+
+/** cover 数学（与 liquidGlass.js shader tap() 一致）：背景以 cover 铺满视图时
+ * 的缩放与偏移，用于烘焙画布的绘制与单测。 */
+export function coverTransform(viewW, viewH, imgW, imgH) {
+  const scale = Math.max(viewW / imgW, viewH / imgH);
+  const drawW = imgW * scale;
+  const drawH = imgH * scale;
+  return { scale, drawW, drawH, offsetX: (viewW - drawW) / 2, offsetY: (viewH - drawH) / 2 };
+}
+
 export const PALETTES = {
   pearl: { name: '冷白', note: 'PEARL', ink: '#292929', me: '#dddddd', ai: '#ffffff', bg: 'none', dark: false },
   mist: { name: '雾灰', note: 'MIST', ink: '#303030', me: '#c6c6c6', ai: '#eeeeee', bg: 'mist', dark: false },
@@ -33,7 +79,7 @@ export const PALETTES = {
   night: { name: '深黑', note: 'NOIR', ink: '#f0f0f0', me: '#383838', ai: '#242424', bg: 'night', dark: true },
 };
 export const THEME_DEFAULTS = {
-  palette: 'pearl', bubbleStyle: 'liquid', bg: 'none', bgCustom: null, veil: 12, glass: 12,
+  palette: 'pearl', bubbleStyle: 'liquid', bubbleGlass: false, bg: 'none', bgCustom: null, veil: 12, glass: 6,
   refract: 32, wobble: 3, depth: 42, dispersion: 0,
   lightAngle: 224, light: 55,
   ink: '#292929', me: '#dddddd', ai: '#ffffff',
@@ -42,12 +88,12 @@ export const INK_SWATCHES = ['#292929', '#505050', '#777777', '#d6d6d6', '#f2f2f
 export const ME_SWATCHES = ['#ffffff', '#e8e8e8', '#cccccc', '#9c9c9c', '#575757', '#292929'];
 export const AI_SWATCHES = ['#ffffff', '#f1f1f1', '#e1e1e1', '#a6a6a6', '#555555', '#242424'];
 
-/** 主题 → 引擎参数的映射（原型 applyGlassParams；edge/shine/tint 固定）。 */
+/** 主题 → 引擎参数的映射（原型 applyGlassParams；edge/shine/tint 固定为薄清值）。 */
 export function glassParamsFor(t) {
   return {
     refract: t.refract,
     blur: Math.max(0, t.glass - 6) * 0.32,
-    edge: 15, shine: 6, tint: 2,
+    edge: 8, shine: 2, tint: 0,
     lightAngle: ((t.lightAngle + 180) % 360 - 180) * Math.PI / 180,
     light: t.light / 100,
     dispersion: t.dispersion,
@@ -70,7 +116,7 @@ const BG_PRESETS = {
 
 const SLIDERS = [
   { key: 'veil', label: '背景柔和', min: 0, max: 85, step: 1, unit: '%' },
-  { key: 'glass', label: '雾化 Frost', min: 6, max: 34, step: 1, unit: 'px' },
+  { key: 'glass', label: '雾化 Frost', min: 0, max: 34, step: 1, unit: 'px' },
   { key: 'refract', label: '折射', min: 0, max: 60, step: 1, unit: '' },
   { key: 'depth', label: '深度 Depth', min: 0, max: 100, step: 1, unit: '' },
   { key: 'dispersion', label: '色散 Dispersion', min: 0, max: 30, step: 1, unit: '' },
@@ -79,12 +125,40 @@ const SLIDERS = [
   { key: 'wobble', label: '内部波动', min: 0, max: 40, step: 1, unit: '' },
 ];
 
+/** 旧偏好迁移 + 越界夹取（纯函数，可单测）。
+ * 已存值（glass 12 / veil 12 / refract 32 / depth 42 / wobble 3 等）都在新范围
+ *（Frost 最小值现为 0）内，直接保留、不重置为默认——老用户升级后不回厚白；
+ * 只把越界旧值夹进新范围，并打 themeVersion: 2 标记已迁移。 */
+export function clampTheme(t) {
+  const out = { ...THEME_DEFAULTS, ...(t || {}) };
+  if (!PALETTES[out.palette]) out.palette = 'pearl';
+  if (!['liquid', 'soft', 'ink'].includes(out.bubbleStyle)) out.bubbleStyle = 'liquid';
+  // 液态玻璃气泡开关（接线轮新增）：默认关闭 = iMessage 式清晰材质；
+  // 开启时 #app 加 .bubble-glass，气泡改走轻薄玻璃样式（见 styles.css）。
+  out.bubbleGlass = out.bubbleGlass === true;
+  for (const s of SLIDERS) {
+    const v = Number(out[s.key]);
+    out[s.key] = Number.isFinite(v) ? Math.min(s.max, Math.max(s.min, v)) : THEME_DEFAULTS[s.key];
+  }
+  if (!BG_PRESETS[out.bg] && out.bg !== 'custom') out.bg = 'none';
+  if (out.bg === 'custom' && !out.bgCustom) out.bg = 'none';
+  for (const k of ['ink', 'me', 'ai']) {
+    if (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(out[k])) out[k] = THEME_DEFAULTS[k];
+  }
+  out.themeVersion = 2;
+  return out;
+}
+
 export const ThemeStore = (() => {
   let theme = { ...THEME_DEFAULTS };
   let backend = null;
   let saveTimer = null;
   const textureCache = new Map();
   let customImage = null;
+  // 已烘焙蒙层的采样纹理缓存（key 含背景 / 自定义图版本 / 蒙层 / tone）；tone 由 applyVars 推导后存这里。
+  const bakedCache = new Map();
+  let customRev = 0;
+  let derivedTone = 'light';
 
   function makeGradientTexture(palette) {
     const canvas = document.createElement('canvas');
@@ -126,6 +200,59 @@ export const ThemeStore = (() => {
     return textureCache.get(key);
   }
 
+  /** 背景源（预设渐变画布或自定义图）采样到 ≤64px 的平均亮度；读不到返回 null。 */
+  function luminanceOfSource(source) {
+    try {
+      const w = source.naturalWidth || source.width;
+      const h = source.naturalHeight || source.height;
+      if (!w || !h) return null;
+      const tw = 64;
+      const th = Math.max(1, Math.round(64 * h / w));
+      const c = document.createElement('canvas');
+      c.width = tw; c.height = th;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(source, 0, 0, tw, th);
+      return averageLuminanceFromData(ctx.getImageData(0, 0, tw, th).data);
+    } catch {
+      return null;
+    }
+  }
+
+  function currentBackgroundLuminance() {
+    return luminanceOfSource(textureForBackground());
+  }
+
+  /** 把当前蒙层烘进一张 880×1860 画布（cover 绘制 + overlay），供引擎采样；
+   * 可见层仍用未烘焙的原图 + CSS ::after 蒙层，两边亮度一致。 */
+  function bakeVeilCanvas(source, veil, tone) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 880;
+    canvas.height = 1860;
+    const ctx = canvas.getContext('2d');
+    const sw = source.naturalWidth || source.width;
+    const sh = source.naturalHeight || source.height;
+    if (sw && sh) {
+      const t = coverTransform(880, 1860, sw, sh);
+      ctx.drawImage(source, t.offsetX, t.offsetY, t.drawW, t.drawH);
+    }
+    if (veil > 0) {
+      ctx.fillStyle = tone === 'dark' ? `rgba(0, 0, 0, ${veil})` : `rgba(245, 245, 245, ${veil})`;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    return canvas;
+  }
+
+  /** 引擎采样纹理：已烘焙蒙层。背景 / 蒙层 / tone / 自定义图变化时重烘（key 包含四者）。 */
+  function sampleTextureForBackground() {
+    const veil = theme.veil / 100;
+    const key = `${theme.bg}|${theme.bg === 'custom' ? customRev : ''}|${veil}|${derivedTone}`;
+    if (!bakedCache.has(key)) {
+      if (bakedCache.size > 12) bakedCache.clear();
+      bakedCache.set(key, bakeVeilCanvas(textureForBackground(), veil, derivedTone));
+    }
+    return bakedCache.get(key);
+  }
+
   function applyBackground() {
     const app = document.getElementById('app');
     const layer = document.getElementById('bg-layer');
@@ -136,21 +263,49 @@ export const ThemeStore = (() => {
     } else {
       layer.style.backgroundImage = `url(${textureForBackground().toDataURL()})`;
     }
-    LiquidGlass.setBackground(textureForBackground());
+    LiquidGlass.setBackground(sampleTextureForBackground());
   }
 
   function applyVars() {
     const root = document.documentElement.style;
     root.setProperty('--bg-veil', String(theme.veil / 100));
     root.setProperty('--glass-blur-amt', `${theme.glass}px`);
-    root.setProperty('--ink', theme.ink);
+    // tone 按壁纸实际平均亮度推导（不是只看调色板）：默认 pearl + 深色壁纸时翻转为 dark，
+    // 这样 styles.css 已有的 [data-tone=dark] 规则（--ink-2/--ink-3 等浅色）才会生效。
+    // data-tone 挂在 documentElement 上，正是 styles.css [data-tone=dark] 规则所期望的元素。
+    const paletteDark = !!PALETTES[theme.palette]?.dark;
+    const bgLuma = currentBackgroundLuminance();
+    derivedTone = deriveTone(bgLuma, paletteDark);
+    // --ink 是唯一不在 [data-tone=dark] CSS 规则里的主文字色：dark tone 且 ink 本身深时翻成浅色；
+    // 深色配色自带的浅 ink 不动。--ink-2/--ink-3（.top-status、chip 文字、.char-card-sub、
+    // .m-desc/.m-count、.tab 未选中、placeholder、.auto-row、.toggle-t、.time-divider/.msg-meta、
+    // .brand-caption）走 CSS 的 dark 规则翻转。
+    const inkIsDark = hexLuminance(theme.ink) < 0.5;
+    root.setProperty('--ink', derivedTone === 'dark' && inkIsDark ? '#f0f0f0' : theme.ink);
     document.documentElement.dataset.palette = theme.palette;
     document.documentElement.dataset.bubbleStyle = theme.bubbleStyle;
-    document.documentElement.dataset.tone = PALETTES[theme.palette]?.dark ? 'dark' : 'light';
+    document.documentElement.dataset.tone = derivedTone;
+    document.documentElement.dataset.chatWallpaper = theme.bg === 'none' ? 'plain' : 'image';
+    // Opaque chat colors respect custom swatches; standard palettes use monochrome iMessage values.
+    const preset = PALETTES[theme.palette] || PALETTES.pearl;
+    const chatMe = theme.me !== preset.me ? theme.me : derivedTone === 'dark' ? '#dedee0' : theme.palette === 'mist' ? '#565658' : '#3a3a3c';
+    const chatAi = theme.ai !== preset.ai ? theme.ai : derivedTone === 'dark' ? '#303032' : theme.palette === 'mist' ? '#dedee1' : '#e9e9eb';
+    root.setProperty('--chat-sent', chatMe);
+    root.setProperty('--chat-received', chatAi);
+    root.setProperty('--chat-sent-ink', contrastInk(chatMe));
+    root.setProperty('--chat-received-ink', contrastInk(chatAi));
     root.setProperty('--bubble-me-solid', theme.me);
     root.setProperty('--bubble-ai-solid', theme.ai);
     root.setProperty('--bubble-me', hexA(theme.me, theme.bubbleStyle === 'liquid' ? .35 : .94));
-    const background = PALETTES[theme.palette]?.dark ? '#292929' : '#eeeeee';
+    // blend 的底色是气泡背后实际看到的颜色：深 tone 时按深底算——
+    // 哪怕配色本身是 pearl（浅底 #eeeeee），深色壁纸推导出的 dark tone
+    // 下气泡背后也是深色壁纸，blend 仍按浅底算会把气泡字误判成深字
+    // （pearl + 深色壁纸时 AI 气泡字曾是 #303030，糊在深色壁纸上）。
+    // 只改 blend 的 backdrop 假设，不覆盖 --bubble-*-ink 本身：
+    // soft/ink 样式（alpha .92/.94，blend 几乎不起作用）与用户自定义色
+    // 仍走同一条 contrastInk 路径。
+    const background = derivedTone === 'dark' ? '#292929'
+      : (PALETTES[theme.palette]?.dark ? '#292929' : '#eeeeee');
     const blend = (hex, alpha) => {
       let h = hex.slice(1); if (h.length === 3) h = [...h].map(c => c + c).join('');
       return '#' + [0, 2, 4].map(i => Math.round(parseInt(h.slice(i, i + 2), 16) * alpha + parseInt(background.slice(i + 1, i + 3), 16) * (1 - alpha)).toString(16).padStart(2, '0')).join('');
@@ -163,6 +318,9 @@ export const ThemeStore = (() => {
   function apply() {
     applyVars();
     applyBackground();
+    // 气泡玻璃开关立即生效，不用刷新：开关状态挂在 #app 的 class 上，
+    // styles.css 里 #app.bubble-glass .bubble 覆盖默认清晰材质。
+    document.getElementById('app')?.classList.toggle('bubble-glass', theme.bubbleGlass === true);
     LiquidGlass.setParams(glassParamsFor(theme));
   }
 
@@ -172,22 +330,6 @@ export const ThemeStore = (() => {
     saveTimer = setTimeout(() => {
       backend.put('settings', { key: 'appearance', value: { ...theme } }).catch(() => {});
     }, 300);
-  }
-
-  function clampTheme(t) {
-    const out = { ...THEME_DEFAULTS, ...(t || {}) };
-    if (!PALETTES[out.palette]) out.palette = 'pearl';
-    if (!['liquid', 'soft', 'ink'].includes(out.bubbleStyle)) out.bubbleStyle = 'liquid';
-    for (const s of SLIDERS) {
-      const v = Number(out[s.key]);
-      out[s.key] = Number.isFinite(v) ? Math.min(s.max, Math.max(s.min, v)) : THEME_DEFAULTS[s.key];
-    }
-    if (!BG_PRESETS[out.bg] && out.bg !== 'custom') out.bg = 'none';
-    if (out.bg === 'custom' && !out.bgCustom) out.bg = 'none';
-    for (const k of ['ink', 'me', 'ai']) {
-      if (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(out[k])) out[k] = THEME_DEFAULTS[k];
-    }
-    return out;
   }
 
   function el(tag, cls, text) {
@@ -266,12 +408,24 @@ export const ThemeStore = (() => {
     }
     presetsCard.appendChild(palettes);
     const styles = el('div', 'bubble-options');
-    for (const [id, name] of [['liquid', '液态玻璃'], ['soft', '柔雾'], ['ink', '墨色']]) {
+    for (const [id, name] of [['liquid', '轻透'], ['soft', '柔雾'], ['ink', '墨色']]) {
       const b = el('button', theme.bubbleStyle === id ? 'active' : '', name);
       b.setAttribute('aria-pressed', String(theme.bubbleStyle === id));
       b.addEventListener('click', () => { update({ bubbleStyle: id }); renderAppearanceInto(container); }); styles.appendChild(b);
     }
-    presetsCard.append(el('h3', '', '气泡材质'), styles);
+    presetsCard.append(el('h3', '', '玻璃气泡外观'), styles);
+    // 液态玻璃气泡开关（默认关闭 = iMessage 式清晰材质；开启为可选的轻薄玻璃样式）。
+    const glassRow = el('div', 'setting-row');
+    const glassLabel = el('span', 'setting-label', '液态玻璃气泡');
+    glassLabel.appendChild(el('small', '', '可选样式'));
+    const glassToggle = el('label', 'switch');
+    const glassBox = document.createElement('input');
+    glassBox.type = 'checkbox';
+    glassBox.checked = theme.bubbleGlass === true;
+    glassBox.addEventListener('change', () => { update({ bubbleGlass: glassBox.checked }); });
+    glassToggle.append(glassBox, el('span', 'switch-track'));
+    glassRow.append(glassLabel, glassToggle);
+    presetsCard.append(glassRow, el('p', 'muted', '关闭时使用 iMessage 实色气泡；开启后使用轻薄玻璃，上方三种外观随之生效。'));
     const sample = el('div', 'bubble-preview');
     sample.append(el('span', 'preview-in', '在这里，多停留一会儿。'), el('span', 'preview-out', 'Take your time.'));
     presetsCard.appendChild(sample); container.appendChild(presetsCard);
@@ -303,6 +457,7 @@ export const ThemeStore = (() => {
         const img = new Image();
         img.onload = () => {
           customImage = img;
+          customRev++;
           update({ bg: 'custom', bgCustom: dataUrl });
           renderAppearanceInto(container);
         };
@@ -358,6 +513,7 @@ export const ThemeStore = (() => {
     getDefaults() { return { ...THEME_DEFAULTS }; },
     BG_PRESETS,
     SLIDERS,
+    clampTheme,
 
     /** backend：IndexedDB 后端（持久化用）；saved：之前存过的 appearance 记录。 */
     init(be, saved) {
@@ -367,7 +523,8 @@ export const ThemeStore = (() => {
         const img = new Image();
         img.onload = () => {
           customImage = img;
-          LiquidGlass.setBackground(img);
+          customRev++;
+          apply(); // 自定义图到齐后重推 tone 与蒙层烘焙
         };
         img.src = theme.bgCustom;
       }

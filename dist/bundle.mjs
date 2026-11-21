@@ -156,6 +156,17 @@ function applyStatusTemplate(raw, panel, ctx) {
   return { raw: m[0], html };
 }
 
+/** 合并头像标签自带的属性：class 与标记类合并成一个 class 属性。
+ *  直接拼接会产生两个 class 属性，浏览器只认第一个，模板自己的样式类就丢了
+ *  （例如 <char-avatar class="thx-ava"> 的 thx-ava 会失效）。 */
+function mergeAvatarAttrs(attrs, markerClass) {
+  const a = String(attrs || '');
+  const m = a.match(/class\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+  if (!m) return ` class="${markerClass}"${a}`;
+  const rest = a.replace(/class\s*=\s*(?:"[^"]*"|'[^']*')/i, '').trim();
+  return ` class="${markerClass} ${(m[1] ?? m[2]).trim()}"${rest ? ` ${rest}` : ''}`;
+}
+
 /** 原始 UWU processTemplate 的变量替换：头像与名字进模板。
  *  缺名字时用原始 UWU 的默认值（User/Character）；缺头像时把 <…-avatar> 标签
  *  换成空 span（不留破图、不留字面量占位符）。 */
@@ -174,9 +185,9 @@ function substituteTemplateVars(html, ctx = {}) {
   out = out.replace(/{{char_remark}}/g, charRemark);
   out = out.replace(/{{user_remark}}/g, userRemark);
   out = out.replace(/<user-avatar([^>]*)>\s*(?:<\/user-avatar>)?/gi, (_, attrs) =>
-    (userAvatar ? `<img src="${userAvatar}" class="uwu-user-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+    (userAvatar ? `<img src="${userAvatar}"${mergeAvatarAttrs(attrs, 'uwu-user-avatar')}>` : `<span${mergeAvatarAttrs(attrs, 'uwu-avatar-empty')}></span>`));
   out = out.replace(/<char-avatar([^>]*)>\s*(?:<\/char-avatar>)?/gi, (_, attrs) =>
-    (charAvatar ? `<img src="${charAvatar}" class="uwu-char-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+    (charAvatar ? `<img src="${charAvatar}"${mergeAvatarAttrs(attrs, 'uwu-char-avatar')}>` : `<span${mergeAvatarAttrs(attrs, 'uwu-avatar-empty')}></span>`));
   return out;
 }
 
@@ -292,7 +303,9 @@ function pickBodyAttrs(attrStr) {
  *  CSS 变量、伪元素、动画、媒体查询、图片、内联 SVG、details/summary、
  *  表单控件与脚本），去掉 <base>，再套上隔离样式与高度上报脚本。
  *  片段：直接作为 body 内容。opts.marker 会以注释形式插在 body 开头，
- *  用于父页面强制刷新同一份 srcdoc。 */
+ *  用于父页面强制刷新同一份 srcdoc。opts.frameId 会带进高度上报消息，
+ *  供父页面把高度路由到对应的 iframe（聊天页 HTML 卡片用；状态栏弹窗不传，
+ *  沿用原来的无 id 上报格式）。 */
 function buildStatusDocument(html, opts = {}) {
   const input = String(html ?? '');
   const isFullDoc = /<!doctype html|<html[\s>]/i.test(input);
@@ -315,6 +328,12 @@ function buildStatusDocument(html, opts = {}) {
   }
   headInner = headInner.replace(/<base\b[^>]*>/gi, '');
   const marker = opts.marker ? '<' + '!--' + String(opts.marker).replace(/--/g, '') + '-->' : '';
+  const heightScript = opts.frameId
+    ? STATUS_FRAME_SCRIPT.replace(
+      `parent.postMessage({type:MSG,height:contentHeight()},'*')`,
+      `parent.postMessage({type:MSG,height:contentHeight(),frame:${JSON.stringify(String(opts.frameId))}},'*')`,
+    )
+    : STATUS_FRAME_SCRIPT;
   // 注意：下面拼接的闭合 script 标签必须写成反斜杠转义形式，注释标记也要拆开写——
   // dist 是把 bundle 内联进 script 元素的单文件，字面量会提前闭合外层 script，
   // 导致整包截断（SyntaxError: Unexpected end of input）。运行时拼出的仍是正常字符串。
@@ -324,7 +343,7 @@ function buildStatusDocument(html, opts = {}) {
     + `<script>${STATUS_HEAD_SCRIPT}<\/script>`
     + headInner
     + `<style>\n${STATUS_FRAME_CSS}\n</style>`
-    + `</head><body${bodyAttrs}>${marker}${bodyInner}<script>${STATUS_FRAME_SCRIPT}<\/script></body></html>`;
+    + `</head><body${bodyAttrs}>${marker}${bodyInner}<script>${heightScript}<\/script></body></html>`;
 }
 
 /* ===== js/promptTemplates.js ===== */
@@ -508,9 +527,109 @@ if (c.myName) prompt = prompt.replace(/\{\{user\}\}/gi, c.myName);
 return prompt;
 }
 
+/* ===== js/statusMode.js ===== */
+// statusMode.js — 状态三模式：concise（简洁默认）/ inner（心声）/ html（HTML 状态栏）。
+//
+// 设置键设计（存在角色对象 char 上，随 saveCharacter() 一起持久化）：
+// - char.statusMode：'concise' | 'inner' | 'html'，默认 'concise'。
+// - char.innerVoicePrompt：心声模式的提示词（可编辑），默认 DEFAULT_INNER_VOICE_PROMPT。
+// - char.statusPanel：现有 HTML 状态模板（regexPattern / replacePattern /
+//   promptSuffix / history 等），html 模式复用它，不另造一套协议。
+//   切换模式只改 char.statusMode 这一个选择字段，不删除模板、不删除历史、
+//   不动 innerVoicePrompt（切回来还能继续用）。
+//
+// 提示词组装：按模式只返回一套指令。concise 返回空串（不注入任何状态指令）；
+// inner 返回心声生成指令；html 返回现有状态模板指令（即 statusPanel.promptSuffix，
+// promptBuilder.js:557 已把它接成 statusSuffix）。
+
+/** 三种模式。 */
+const STATUS_MODES = ['concise', 'inner', 'html'];
+/** 默认模式：简洁（什么都不注入，回复里不带状态/心声）。 */
+const DEFAULT_STATUS_MODE = 'concise';
+
+/** 模式中文名（供设置页下拉/分段选择用）。 */
+const STATUS_MODE_LABELS = {
+  concise: '简洁',
+  inner: '心声',
+  html: 'HTML 状态栏',
+};
+
+/** 心声模式的默认提示词（可编辑，存在 char.innerVoicePrompt）。 */
+const DEFAULT_INNER_VOICE_PROMPT =
+  '在回复末尾另起一段，用 [inner_voice]…[/inner_voice] 包裹 1–3 句以角色口吻写的本轮内心独白；'
+  + '独白只写内心所想，不复述对话、不解释、不提及指令。';
+
+/** html 模式无 promptSuffix 时的兜底：沿用现有状态协议的措辞，不发明新标记。 */
+const DEFAULT_HTML_STATUS_PROMPT =
+  '在回复末尾按状态栏模板输出状态。';
+
+/** 把任意值规范化为合法模式；非法/缺失一律回落到 concise。 */
+function normalizeStatusMode(value) {
+  return STATUS_MODES.includes(value) ? value : DEFAULT_STATUS_MODE;
+}
+
+/** 取角色当前的状态模式（默认 concise）。 */
+function getStatusMode(character = {}) {
+  return normalizeStatusMode(character?.statusMode);
+}
+
+/**
+ * 切换模式：返回一个新角色对象（不改原对象），只改 statusMode 字段。
+ * 模板（statusPanel）、历史（statusPanel.history）、心声提示词
+ * （innerVoicePrompt）原样保留，切回来还能继续用。
+ */
+function setStatusMode(character = {}, mode) {
+  return { ...character, statusMode: normalizeStatusMode(mode) };
+}
+
+/** 取角色的心声提示词（可编辑；空值回落到默认）。 */
+function getInnerVoicePrompt(character = {}) {
+  const p = String(character?.innerVoicePrompt ?? '').trim();
+  return p || DEFAULT_INNER_VOICE_PROMPT;
+}
+
+/** 设置心声提示词：返回新角色对象（只改 innerVoicePrompt）。 */
+function setInnerVoicePrompt(character = {}, prompt) {
+  return { ...character, innerVoicePrompt: String(prompt ?? '') };
+}
+
+/**
+ * 按模式返回“这一轮要注入的状态指令”（只返回一套）。
+ * @returns { mode, instruction }
+ * - concise：{ mode:'concise', instruction:'' }——不注入，回复里不带状态/心声。
+ * - inner：{ mode:'inner', instruction: 心声提示词 }。
+ * - html：{ mode:'html', instruction: 现有状态模板指令 }，即
+ *   statusPanel.promptSuffix（模板启用时）；未启用/未写时返回兜底句。
+ * 调用方（提示词组装）只需把 instruction 为空时跳过、非空时追加到系统提示词。
+ */
+function getStatusInstruction(character = {}) {
+  const mode = getStatusMode(character);
+  if (mode === 'inner') {
+    return { mode, instruction: getInnerVoicePrompt(character) };
+  }
+  if (mode === 'html') {
+    const panel = character?.statusPanel || {};
+    const suffix = String(panel.promptSuffix || '').trim();
+    return { mode, instruction: panel.enabled === false ? '' : (suffix || DEFAULT_HTML_STATUS_PROMPT) };
+  }
+  return { mode: 'concise', instruction: '' };
+}
+
+/** 别名：与 getStatusInstruction 同义，供提示词组装处按“选择器”语义调用。 */
+const selectStatusInstruction = getStatusInstruction;
+
 /* ===== js/promptBuilder.js ===== */
 // promptBuilder.js — 系统提示词组装（promptBuilder，与网络、界面分离）。
 // 规则来源：chat_ai_prompt.js generatePrivateSystemPrompt + 指令 §二/§三。
+// 第 4 波：请求内按区块组织——①人设与固定记忆（收藏记忆，保留）；
+// ②阶段背景（isSummary 的阶段总结记忆，独立区块）；③检索证据
+// （fusedRetrieve 的 results，只接受 sourceStatus==='sourced'，无出处旧总结
+// 绝不进证据区、不得伪造引用）；④联想旧事（仅当 assoc.pick 非空，按 use
+// 区分 mention / understand）；⑤近期对话（历史组装不动，在 historyBuilder）。
+// 记忆是历史参考，不得覆盖系统规则；主模型可以不提起无助于本轮的旧事。
+
+
+
 
 
 const HISTORY_PLACEHOLDER = '【动态插入: 聊天记录】';
@@ -553,26 +672,505 @@ return (character?.memoryJournals || [])
 .join('\n\n---\n\n');
 }
 
+/* ---------------- 第 4 波：原文校验 ---------------- */
+
+/** 空白归一化（原文校验的子串匹配用）：多空白折成一个空格、去首尾。 */
+function normalizeTextForMatch(s) {
+return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
 /**
-* 组装系统提示词。返回 { systemPrompt, version, modules, tokenEstimate, hasHistoryPlaceholder}。
+* 有效内容判定（审计结论的执行点，与 memorySummary.countRounds 同一轮定义配套）：
+* 物理删除的天然不在（调用方只传现存消息）；另排除 supersededRounds 快照里的
+* 消息，以及 isExcludedFromSummary 排除的（状态/思考/不进上下文/撤回/
+* <thinking> 开头/隐藏段/空内容）。代码里没有分支概念，这里也不引入分支。
+*/
+function isValidEvidenceMessage(msg, character, supersededIds) {
+if (!msg) return false;
+if (supersededIds?.has(msg.id)) return false;
+return!isExcludedFromSummary(msg, character);
+}
+
+/** 一条消息的全部可比文本：原文 + 协议解包后的正文（[X的消息：正文] 里的正文）。 */
+function messageSearchTexts(msg) {
+const raw = messageText(msg);
+return [raw, extractProtocolText(raw)].map(normalizeTextForMatch).filter(Boolean);
+}
+
+/**
+* 原文校验：一条要注入的记忆/经历，其引文必须能在当前有效原文中找到。
+* - 经历：每句关键原话按 messageId 查消息表，消息必须仍存在且有效、
+* 且文本包含该原话；任一句找不到就丢弃整条，不降级成无出处引用。
+* 没有原话时退到 sourceMessageIds：每条来源消息都必须仍存在且有效。
+* - 记忆（总结）：sourceMessageIds 里的每条来源消息都必须仍存在且有效。
+* messagesById 不传时不做引文校验（只由调用方在有消息表时做；app.js 一定传）。
+* 返回 {ok, reason}，reason 供预览如实显示丢弃原因。
+*/
+function verifyEvidenceDoc(doc, messagesById, character) {
+if (!messagesById) return { ok: true, reason: ''};
+const superseded = new Set();
+for (const r of character?.supersededRounds || []) {
+for (const m of r?.messages || []) if (m?.id) superseded.add(m.id);
+}
+const checkMessage = (id) => {
+const msg = messagesById.get(String(id));
+if (!msg) return `来源消息 ${id} 已不存在`;
+if (!isValidEvidenceMessage(msg, character, superseded)) return `来源消息 ${id} 已失效（撤回/隐藏/被替换）`;
+return null;
+};
+const quotes = Array.isArray(doc?.quotes)? doc.quotes: [];
+if (quotes.length) {
+for (const q of quotes) {
+const bad = checkMessage(q?.messageId);
+if (bad) return { ok: false, reason: `引文对不上原文：${bad}`};
+const msg = messagesById.get(String(q.messageId));
+const needle = normalizeTextForMatch(q?.text);
+if (!needle) return { ok: false, reason: '引文为空，无法校验'};
+const haystacks = messageSearchTexts(msg);
+if (!haystacks.some((h) => h.includes(needle))) {
+return { ok: false, reason: `引文对不上原文：消息 ${q.messageId} 的正文里找不到这句原话`};
+}
+}
+return { ok: true, reason: ''};
+}
+const ids = Array.isArray(doc?.sourceMessageIds)? doc.sourceMessageIds: [];
+if (!ids.length) return { ok: false, reason: '无可校验的引文（没有原话也没有来源消息）'};
+for (const id of ids) {
+const bad = checkMessage(id);
+if (bad) return { ok: false, reason: `引文对不上原文：${bad}`};
+}
+return { ok: true, reason: ''};
+}
+
+/* ---------------- 第 4 波：召回路径与共享 Token 预算 ---------------- */
+
+/**
+* 召回路径文案：关键词/向量/融合排名，如“关键词第 2 · 向量第 1 · 融合第 1”；
+* 某路未命中就不写那一路；三路都没有时写“直接召回”。
+*/
+function retrievalPathText(item, fusionRank) {
+const parts = [];
+if (Number.isFinite(item?.keywordRank)) parts.push(`关键词第 ${item.keywordRank}`);
+if (Number.isFinite(item?.vectorRank)) parts.push(`向量第 ${item.vectorRank}`);
+if (Number.isFinite(fusionRank)) parts.push(`融合第 ${fusionRank}`);
+return parts.length? parts.join(' · '): '直接召回';
+}
+
+/**
+* 检索证据 + 邻居 + 联想三路共用的记忆 Token 预算（与 vectorMemory
+* applyTokenBudget 同一规则：按顺序累计，超预算跳过该条，只有第一条
+* 超预算才截断；budget 为 0/falsy 时不截断）。
+* units: [{kind:'evidence'|'neighbor'|'assoc', text,...}]（顺序即排名顺序，
+* 邻居紧跟所属命中、联想最后）。返回 {kept, skipped:[被跳过的 units]}。
+*/
+function applySharedMemoryBudget(units, tokenBudget, countTokens = countTextTokens) {
+const budget = Number(tokenBudget) || 0;
+const list = [...(units || [])];
+if (!budget ||!list.length) return { kept: list, skipped: []};
+const kept = [];
+const skipped = [];
+let used = 0;
+for (const unit of list) {
+const text = String(unit?.text || '');
+const tokens = countTokens(text);
+if (kept.length && used + tokens > budget) { skipped.push(unit); continue;}
+if (!kept.length && tokens > budget) {
+// 第一条也超预算：按字符粗截到预算内（中文约 1.2 token/字，与 applyTokenBudget 同规则）。
+const keepChars = Math.max(40, Math.floor(budget / 1.2));
+kept.push({...unit, text: text.slice(0, keepChars), truncated: true});
+used = budget;
+continue;
+}
+kept.push(unit);
+used += tokens;
+}
+return { kept, skipped};
+}
+
+/** 时间戳转 “YYYY-MM-DD HH:mm”（本地时间，供邻居/联想展示用）。 */
+function formatEvidenceTime(ts) {
+if (!Number.isFinite(ts)) return '';
+const d = new Date(ts);
+if (Number.isNaN(d.getTime())) return '';
+const p = (n) => String(n).padStart(2, '0');
+return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 经历当前有效的线索：evidenceVersion 必须等于经历现在的 version（与 associative.validClues 同规则）。 */
+function validCluesOf(exp) {
+const version = exp?.version;
+return (exp?.clues || []).filter((c) => c && c.evidenceVersion === version);
+}
+
+/**
+* 组装记忆三区块（②阶段背景 / ③检索证据+邻居 / ④联想旧事）的结构化结果
+* 与注入文本。预览与发送共用同一份结果：buildSystemPrompt 调它，app.js
+* 把返回的 memorySections 原样放进 lastBuiltRequest，预览直接渲染它。
+*
+* 输入：
+* - character：当前角色（固定记忆去重 + supersededRounds 校验用）
+* - favoritedJournals：收藏记忆（只用于去重判断，文本仍由 collectFavoritedJournals 出）
+* - stageSummaries：isSummary 的阶段总结记忆（独立区块，带日期与来源；
+* 无出处旧总结只进这里、明确标注“无原文出处”，绝不进证据区）
+* - evidenceResults：fusedRetrieve 的 results（原始候选；只接受
+* sourceStatus==='sourced' 的文档，无出处的一律丢进 dropped）
+* - neighbors：fusedRetrieve 的 neighbors（附在所属命中之后，不占 topN）
+* - assoc：lastBuiltRequest.assoc（{pick, mode, use, reason, status}）
+* - assocExperience：assoc.pick 对应的经历记录（按 docId 取内容，assoc 里不存正文）
+* - messagesById：Map<messageId, message>，原文校验用；不传则跳过引文校验
+* - tokenBudget：三路共用的记忆 Token 预算（0/falsy 不截断）
+*
+* 返回 {stage, evidence, assoc, neighbors, skippedByBudget, dropped,
+* combinedText, injectedIntoPrompt}：
+* - stage/evidence/assoc 各含 {text（注入文本）, items:[结构化条目]}；
+* - evidence.items 每条 {docId, docKind, title, date, source, content,
+* retrievalPath, keywordRank, vectorRank, fusionRank, score, sourceStatus,
+* chunkId, alsoAssoc, truncated}；neighbors 在所属 evidence item 的
+*.neighbors 里（{messageId, speaker, role, timestamp, roundOffset, content}）；
+* - assoc: {text, item:{docId, title, date, use, reason, clues, quotes, source,
+* alsoInEvidence, truncated} | null, status}，status 为
+* 'in-evidence'（pick 已在证据里，不重复注入）/ 'injected' / 'dropped' / 'none'；
+* - skippedByBudget: [{kind, docId, title}]（因预算跳过，如实显示）；
+* - dropped: [{docId, title, where:'evidence'|'stage'|'assoc'|'neighbor', reason}]。
+*/
+function assembleMemorySections({
+character = null,
+favoritedJournals = [],
+stageSummaries = [],
+evidenceResults = [],
+neighbors = [],
+assoc = null,
+assocExperience = null,
+messagesById = null,
+tokenBudget = 0,
+} = {}) {
+const dropped = [];
+const favoritedIds = new Set(
+(favoritedJournals.length
+? favoritedJournals
+: (character?.memoryJournals || []).filter((j) => j.isFavorited)
+).map((j) => j.id).filter(Boolean),
+);
+
+/* —— ③检索证据：只接受 sourced；与固定记忆按 id 去重；原文校验 —— */
+const evidenceById = new Map();
+(evidenceResults || []).forEach((raw, idx) => {
+const docId = raw?.docId || raw?.journalId || raw?.id;
+if (!docId) return;
+const title = raw?.title || '未命名';
+if (evidenceById.has(docId)) return;
+if (favoritedIds.has(docId)) return; // 已在收藏记忆里，不重复
+if (raw?.sourceStatus!== 'sourced') {
+dropped.push({ docId, title, where: 'evidence', reason: '无原文出处，不进检索证据区'});
+return;
+}
+const check = verifyEvidenceDoc(raw, messagesById, character);
+if (!check.ok) {
+dropped.push({ docId, title, where: 'evidence', reason: check.reason});
+return;
+}
+evidenceById.set(docId, {
+docId,
+docKind: raw?.docKind || 'journal',
+title,
+date: raw?.date || '',
+source: raw?.source || '',
+content: String(raw?.content || raw?.body || ''),
+retrievalPath: retrievalPathText(raw, idx + 1),
+keywordRank: Number.isFinite(raw?.keywordRank)? raw.keywordRank: null,
+vectorRank: Number.isFinite(raw?.vectorRank)? raw.vectorRank: null,
+fusionRank: idx + 1,
+score: Number.isFinite(raw?.score)? raw.score: null,
+sourceStatus: 'sourced',
+chunkId: raw?.chunkId?? null,
+sourceMessageIds: Array.isArray(raw?.sourceMessageIds)? [...raw.sourceMessageIds]: [],
+alsoAssoc: false,
+truncated: false,
+neighbors: [],
+});
+});
+
+/* —— 邻居：附在所属命中之后；注入前再按 messageId 确认消息仍存在且有效（防 race） —— */
+const neighborByParent = new Map();
+for (const n of neighbors || []) {
+const parent = evidenceById.get(n?.docId);
+if (!parent) continue; // 所属命中没进证据区，邻居也不进
+const key = (n?.messageIds || []).join('|') || n?.messageId;
+if (!key || neighborByParent.has(`${n.docId}:${key}`)) continue;
+neighborByParent.set(`${n.docId}:${key}`, true);
+const ids = Array.isArray(n?.messageIds) && n.messageIds.length? n.messageIds: [n?.messageId].filter(Boolean);
+if (messagesById) {
+const supersededIds = new Set();
+for (const r of character?.supersededRounds || []) {
+for (const m of r?.messages || []) if (m?.id) supersededIds.add(m.id);
+}
+const missing = ids.find((id) => {
+const msg = messagesById.get(String(id));
+return!msg ||!isValidEvidenceMessage(msg, character, supersededIds);
+});
+if (missing) {
+dropped.push({ docId: n.docId, title: parent.title, where: 'neighbor', reason: `相邻对话的消息 ${missing} 已不存在或已失效，整条邻居未注入`});
+continue;
+}
+}
+parent.neighbors.push({
+messageId: n?.messageId || ids[0] || '',
+messageIds: ids,
+speaker: n?.speaker || '',
+role: n?.role || '',
+timestamp: n?.timestamp?? null,
+roundOffset: n?.roundOffset?? 0,
+content: String(n?.content || ''),
+});
+}
+
+/* —— ④联想旧事：pick 已在证据里不重复注入，只标注“联想亦选中” —— */
+let assocSection = { text: '', item: null, status: 'none'};
+const pickId = assoc?.pick || null;
+if (pickId) {
+if (evidenceById.has(pickId)) {
+evidenceById.get(pickId).alsoAssoc = true;
+assocSection = {
+text: '',
+item: {
+docId: pickId,
+title: evidenceById.get(pickId).title,
+date: evidenceById.get(pickId).date,
+use: assoc.use || 'understand',
+reason: assoc.reason || '',
+clues: [],
+quotes: [],
+source: evidenceById.get(pickId).source,
+alsoInEvidence: true,
+truncated: false,
+},
+status: 'in-evidence',
+};
+} else if (!assocExperience) {
+dropped.push({ docId: pickId, title: '', where: 'assoc', reason: '联想选中的经历记录找不到了，未注入'});
+assocSection = { text: '', item: null, status: 'dropped'};
+} else {
+const check = verifyEvidenceDoc(assocExperience, messagesById, character);
+if (!check.ok) {
+dropped.push({ docId: pickId, title: assocExperience?.title || '', where: 'assoc', reason: check.reason});
+assocSection = { text: '', item: null, status: 'dropped'};
+} else {
+assocSection = {
+text: '',
+item: {
+docId: pickId,
+title: assocExperience?.title || '未命名经历',
+date: assocExperience?.timestamp? new Date(assocExperience.timestamp).toISOString().slice(0, 10): '',
+use: assoc.use || 'understand',
+reason: assoc.reason || '',
+clues: validCluesOf(assocExperience),
+quotes: (assocExperience?.quotes || []).slice(0, 3).map((q) => ({ text: q.text, speaker: q.speaker || ''})),
+source: assocExperience?.source || '经历提取',
+alsoInEvidence: false,
+truncated: false,
+},
+status: 'injected',
+};
+}
+}
+}
+
+/* —— ②阶段背景：isSummary 独立区块；与固定记忆、证据区按 id 去重；
+* 有出处且校验失败的丢弃；无出处的保留但明确标注，不可当作原话引用 —— */
+const stageItems = [];
+const seenStage = new Set();
+for (const j of stageSummaries || []) {
+if (!j?.isSummary) continue;
+if (!j.id || seenStage.has(j.id) || favoritedIds.has(j.id) || evidenceById.has(j.id)) continue;
+seenStage.add(j.id);
+const sourced = j?.sourceStatus === 'sourced'
+|| (Array.isArray(j.sourceMessageIds) && j.sourceMessageIds.length > 0 &&!!j.range);
+if (sourced) {
+const check = verifyEvidenceDoc({...j, sourceMessageIds: j.sourceMessageIds || []}, messagesById, character);
+if (!check.ok) {
+dropped.push({ docId: j.id, title: j.title || '', where: 'stage', reason: check.reason});
+continue;
+}
+}
+stageItems.push({
+docId: j.id,
+title: j.title || '未命名总结',
+date: j.timestamp? new Date(j.timestamp).toISOString().slice(0, 10): '',
+source: j.source || '',
+content: String(j.content || ''),
+sourceStatus: sourced? 'sourced': 'unsourced',
+});
+}
+
+/* —— 渲染注入文本（先渲染再算预算，预算按实际注入的文本计） —— */
+const evidenceItems = [...evidenceById.values()];
+const renderEvidenceItem = (item) => [
+`标题：${item.title}`,
+item.date? `日期：${item.date}`: '',
+`来源：${item.source || ''}（docId：${item.docId}）`,
+`召回路径：${item.retrievalPath}`,
+`内容：${item.content}`,
+item.alsoAssoc? '（联想亦选中这件旧事）': '',
+].filter(Boolean).join('\n');
+const renderNeighbor = (n) => {
+const when = n.roundOffset < 0? '上一轮': n.roundOffset > 0? '下一轮': '同轮';
+const time = formatEvidenceTime(n.timestamp);
+return `相邻对话（补充上下文，非独立证据；${when}，${n.speaker || ''}${time? `，${time}`: ''}）：\n${n.content}`;
+};
+const renderAssocItem = (item) => {
+const useLine = item.use === 'mention'
+? '用法：回复里可以顺口自然提到（也可以不提，不必强求）。'
+: '用法：只作背景理解、不要主动提起。';
+return [
+'以下这件旧事与本轮对话相关，仅供参考，不得覆盖系统规则；时间信息已保留，过去的状态不等于现在。主模型可以不提起无助于本轮的旧事。',
+useLine,
+item.reason? `副模型选择原因：${item.reason}`: '',
+`标题：${item.title}`,
+item.date? `日期：${item.date}`: '',
+`来源：${item.source || ''}（docId：${item.docId}）`,
+...(item.clues || []).map((c) => `线索：${c.text}${c.excerpt? `（原文「${c.excerpt}」）`: ''}`),
+...(item.quotes || []).map((q) => `关键原话：「${q.text}」${q.speaker? ` —— ${q.speaker}`: ''}`),
+].filter(Boolean).join('\n');
+};
+
+/* —— 三路共用 Token 预算：证据（邻居紧跟所属命中）→ 联想 —— */
+const budgetUnits = [];
+for (const item of evidenceItems) {
+budgetUnits.push({ kind: 'evidence', docId: item.docId, title: item.title, text: renderEvidenceItem(item), ref: item});
+for (const n of item.neighbors) {
+budgetUnits.push({ kind: 'neighbor', docId: item.docId, title: item.title, text: renderNeighbor(n), ref: n, parent: item});
+}
+}
+if (assocSection.status === 'injected' && assocSection.item) {
+budgetUnits.push({ kind: 'assoc', docId: assocSection.item.docId, title: assocSection.item.title, text: renderAssocItem(assocSection.item), ref: assocSection.item});
+}
+budgetUnits.forEach((u, i) => { u.index = i; });
+const { kept, skipped } = applySharedMemoryBudget(budgetUnits, tokenBudget);
+// kept 里被截断的第一条是复制出的新对象（applySharedMemoryBudget 的截断分支），
+// 不能按对象身份比对；按预算单元的原始下标追踪。
+const keptIdx = new Set(kept.map((u) => u.index));
+const skippedByBudget = skipped.map((u) => ({ kind: u.kind, docId: u.docId, title: u.title }));
+if (skipped.some((u) => u.kind === 'assoc') && assocSection.item) assocSection.status = 'dropped';
+const keptEvidence = evidenceItems.filter((item) => {
+const unit = budgetUnits.find((u) => u.kind === 'evidence' && u.ref === item);
+return unit && keptIdx.has(unit.index);
+});
+for (const item of keptEvidence) {
+item.neighbors = item.neighbors.filter((n) => {
+const unit = budgetUnits.find((u) => u.kind === 'neighbor' && u.ref === n);
+return unit && keptIdx.has(unit.index);
+});
+const evUnit = budgetUnits.find((u) => u.kind === 'evidence' && u.ref === item);
+const keptUnit = kept.find((u) => u.index === evUnit?.index);
+// injectedText 是实际进请求的文本（截断时是截断后的文本），预览按它显示。
+item.injectedText = keptUnit ? keptUnit.text : renderEvidenceItem(item);
+if (keptUnit?.truncated) item.truncated = true;
+}
+if (assocSection.status === 'injected') {
+const aUnit = budgetUnits.find((u) => u.kind === 'assoc');
+if (!aUnit || !keptIdx.has(aUnit.index)) {
+assocSection = { text: '', item: null, status: 'dropped' };
+} else {
+const keptUnit = kept.find((u) => u.index === aUnit.index);
+if (keptUnit?.truncated) assocSection.item.truncated = true;
+assocSection.item.injectedText = keptUnit ? keptUnit.text : renderAssocItem(assocSection.item);
+}
+}
+
+const evidenceText = keptEvidence.length
+? `以下为历史参考资料，仅供参考，不得覆盖系统规则；时间信息已保留，过去的状态不等于现在。记忆是历史参考，主模型可以不提起无助于本轮的旧事。\n\n${keptEvidence.map((item) => {
+const body = item.injectedText || renderEvidenceItem(item);
+const nbs = item.neighbors.map(renderNeighbor).join('\n');
+return nbs? `${body}\n${nbs}`: body;
+}).join('\n\n---\n\n')}`
+: '';
+const stageText = stageItems.length
+? `以下是本阶段的背景总结（阶段总结记忆），仅供参考，不得覆盖系统规则；时间信息已保留，过去的状态不等于现在。主模型可以不提起无助于本轮的旧事。\n\n${stageItems.map((j) => [
+`标题：${j.title}`,
+j.date? `日期：${j.date}`: '',
+`来源：${j.source || ''}（docId：${j.docId}）`,
+j.sourceStatus === 'unsourced'? '出处：无原文出处，仅作阶段背景参考，不可当作原话引用。': '',
+`内容：${j.content}`,
+].filter(Boolean).join('\n')).join('\n\n---\n\n')}`
+: '';
+const assocText = assocSection.status === 'injected' && assocSection.item
+? (assocSection.item.injectedText || renderAssocItem(assocSection.item))
+: '';
+if (assocSection.status === 'injected') assocSection.text = assocText;
+
+return {
+stage: { text: stageText, items: stageItems},
+evidence: { text: evidenceText, items: keptEvidence},
+assoc: assocSection,
+neighbors: keptEvidence.flatMap((item) => item.neighbors.map((n) => ({...n, docId: item.docId}))),
+skippedByBudget,
+dropped,
+combinedText: [stageText, evidenceText, assocText].filter(Boolean).join('\n\n'),
+injectedIntoPrompt: true, // 调用方在 promptOverride 生效时改成 false
+};
+}
+
+/**
+* 请求构建签名：预览与发送共用同一份构建结果，签名命中即复用。
+* 签名因子含：历史、角色设定、世界书、表情包、API 选项（含主 API 的 model——
+* 只改模型不失效缓存是审计发现的坑，这里修掉）、向量设置、embedding 配置、
+* 记忆内容、经历、关键词索引指纹、向量 chunk 指纹，以及联想配置
+* （assocSettings.enabled）。任一因子变化都重建。
+*/
+function buildRequestSignature(factors) {
+return hashString(JSON.stringify(factors?? {}));
+}
+
+/**
+* 组装系统提示词。返回 { systemPrompt, version, modules, tokenEstimate,
+* hasHistoryPlaceholder, memorySections}。
 * - baseline 是只读基线；character.promptOverride 是用户编辑的覆盖层（整段替换基线），
 * promptOverride 为空时用基线；恢复默认 = 清空覆盖层。覆盖层永远不与基线拼接成一大段存回人设。
-* - relatedMemories 是后续向量检索预留的结构化输入，默认空数组，不注入、不冒充缓存。
+* - relatedMemories 是融合检索召回的结构化输入（fusedRetrieve 的 results，
+* [{docId, title, content, source, date, sourceStatus,...}]），只接受
+* sourceStatus==='sourced' 的文档进“检索证据”区；无出处旧总结不进证据区，
+* 阶段总结走 stageSummaries 独立区块。与已收藏记忆按记忆 ID 去重。
 * - 思维链：本阶段永不注入（cotSettings.enabled=false；即使导入值为 true 也不注入）。
+* - memorySections 是结构化注入结果（预览与发送共用同一份），见 assembleMemorySections。
 */
 function buildSystemPrompt(character, deps = {}) {
 const {
 worldBooks = [], stickers = [], globalSettings = {},
-relatedMemories = [], // [{title, content, source}]，默认 []
+relatedMemories = [], // 融合检索候选，默认 []
+stageSummaries = [], // isSummary 的阶段总结记忆，独立区块
+neighbors = [], // fusedRetrieve 的 neighbors，附在所属命中之后
+assoc = null, // lastBuiltRequest.assoc
+assocExperience = null, // assoc.pick 对应的经历记录
+messagesById = null, // Map<messageId, message>，原文校验用
+tokenBudget = 0, // 检索证据 + 邻居 + 联想三路共用的记忆 Token 预算
 now = new Date(),
 } = deps;
 const version = resolvePromptVersion(character, globalSettings);
 const wb = collectWorldBooks(character, worldBooks);
 const stickerNames = collectStickerNames(character, stickers);
 const favoritedJournals = collectFavoritedJournals(character);
+const favoritedList = (character?.memoryJournals || []).filter((j) => j.isFavorited);
+const sections = assembleMemorySections({
+character,
+favoritedJournals: favoritedList,
+stageSummaries,
+evidenceResults: relatedMemories,
+neighbors,
+assoc,
+assocExperience,
+messagesById,
+tokenBudget,
+});
 const galleryNames = (character?.useRealGallery && Array.isArray(character?.gallery))
 ? character.gallery.map((p) => p.name).filter(Boolean): [];
 
+// 状态指令按角色的状态模式只选一套（statusMode.js）：concise 不注入、
+// inner 注入心声提示词、html 沿用现有状态模板 promptSuffix。
+// 兼容：老角色没有 statusMode 字段、但状态模板已启用时，按 html 模式处理，
+// 不让一次升级悄悄关掉已在用的状态栏；新角色默认 concise。
+const _statusChar = (character?.statusMode === undefined && character?.statusPanel?.enabled)
+  ? { ...character, statusMode: 'html' } : character;
+const _statusInstruction = getStatusInstruction(_statusChar).instruction;
 const ctx = {
 realName: character?.realName || '角色',
 myName: character?.myName || '我',
@@ -584,7 +1182,7 @@ worldBooks: wb,
 stickerNames,
 galleryNames,
 useRealGallery:!!character?.useRealGallery,
-statusSuffix: character?.statusPanel?.enabled? (character.statusPanel.promptSuffix || ''): '',
+statusSuffix: _statusInstruction,
 bilingual:!!character?.bilingualModeEnabled,
 // TT 分支原函数用 replyCountMin||1 / ||6，但用户实际生效值为 3—8；
 // 本实现以角色值为准，缺省 3—8，不误套 1—6。见 MIGRATION.md。
@@ -592,14 +1190,16 @@ replyMin: clampInt(character?.replyCountMin, 1, 20, 3),
 replyMax: clampInt(character?.replyCountMax, 1, 20, 8),
 replyCountEnabled:!!character?.replyCountEnabled,
 favoritedJournals,
-relatedMemories: (relatedMemories || [])
-.map((m) => `标题：${m.title || ''}\n内容：${m.content || ''}${m.source? `\n来源：${m.source}`: ''}`)
-.join('\n\n---\n\n'),
+// 三区块（阶段背景 / 检索证据+邻居 / 联想旧事）合进模板原有的「相关记忆」
+// 槽位注入（promptTemplates.js 不动）；空时为空字符串，模板里不出现该区块。
+relatedMemories: sections.combinedText,
 };
 
 let systemPrompt;
 if (character?.promptOverride && String(character.promptOverride).trim()) {
 systemPrompt = String(character.promptOverride);
+// 覆盖层整段替换基线：记忆区块不在系统提示词里，预览要如实说明。
+sections.injectedIntoPrompt = false;
 } else {
 systemPrompt = version === 'tt'? buildTTPrompt(ctx): buildUWUPrompt(ctx);
 }
@@ -613,7 +1213,9 @@ const modules = [
 { name: '世界书·准则', source: 'worldBooks/guidelines', tokens: countTextTokens(wb.guidelines)},
 { name: '用户人设', source: 'character.myPersona', tokens: countTextTokens(ctx.myPersona)},
 { name: '收藏记忆', source: 'memoryJournals（已收藏）', tokens: countTextTokens(favoritedJournals)},
-{ name: '相关记忆（向量检索预留）', source: 'relatedMemories', tokens: countTextTokens(ctx.relatedMemories)},
+{ name: '阶段背景', source: 'memoryJournals（isSummary）', tokens: countTextTokens(sections.stage.text)},
+{ name: '检索证据', source: 'fusedRetrieve（仅 sourced）', tokens: countTextTokens(sections.evidence.text)},
+{ name: '联想旧事', source: 'associative（pick）', tokens: countTextTokens(sections.assoc.text || '')},
 { name: '表情包清单', source: 'stickers（已绑定分组）', tokens: countTextTokens(stickerNames.join(', '))},
 ];
 const dynamicTokens = modules.slice(1).reduce((s, m) => s + m.tokens, 0);
@@ -625,6 +1227,7 @@ version,
 modules,
 tokenEstimate: countTextTokens(systemPrompt),
 hasHistoryPlaceholder: systemPrompt.includes(HISTORY_PLACEHOLDER),
+memorySections: sections,
 };
 }
 
@@ -664,14 +1267,13 @@ function extractProtocolText(content) {
   return m ? m[1].trim() : content.trim();
 }
 
-/** 被撤回消息的可见占位：只保留占位文字，绝不把原 文重新加入上下文。 */
+/** 被撤回消息的可见占位：只保留占位文字，绝不把原文重新加入上下文。
+ * originalContent 只存在本地记录里（界面显示“你撤回了一则讯息”用），
+ * 发给模型的占位里只有“撤回了一条消息”，不含原文。 */
 function withdrawnPlaceholder(msg, character) {
   const name = msg?.role === 'user' ? (character?.myName || '我') : (character?.realName || '对方');
-  const orig = msg?.originalContent
-    || extractProtocolText(msg?.content || '')
-    || '';
   const sep = msg?.role === 'user' ? ' ' : '';
-  return `[${name}${sep}撤回了一条消息：${orig}]`;
+  return `[${name}${sep}撤回了一条消息]`;
 }
 
 function cleanTextForRequest(text, bilingual, role) {
@@ -1038,9 +1640,11 @@ function parseReplyText(raw, character, opts = {}) {
   const patterns = [
     { kind: 'withdraw', re: new RegExp(`^\\[(?:${rn}|${mn})撤回了一条消息[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'quote', re: new RegExp(`^\\[${rn}引用[“"]([\\s\\S]*?)["”]并回复[：:]([\\s\\S]*?)\\]${END}`) },
-    { kind: 'sticker', re: new RegExp(`^\\[${rn}的表情包[：:]([\\s\\S]*?)\\]${END}`) },
-    { kind: 'photo', re: new RegExp(`^\\[${rn}发来的照片\\/视频[：:]([\\s\\S]*?)\\]${END}`) },
-    { kind: 'voice', re: new RegExp(`^\\[${rn}的语音[：:]([\\s\\S]*?)\\]${END}`) },
+    { kind: 'sticker', re: new RegExp(`^\\[(?:${rn}|${mn})(?:发送)?的表情包[：:]([\\s\\S]*?)\\]${END}`) },
+    // 语音与照片描述：面板发出的消息用的是 myName（[朵朵的语音：…] /
+    // [朵朵发来的照片/视频：…]），与 sticker 同款写法认 (realName|myName)。
+    { kind: 'photo', re: new RegExp(`^\\[(?:${rn}|${mn})发来的照片\\/视频[：:]([\\s\\S]*?)\\]${END}`) },
+    { kind: 'voice', re: new RegExp(`^\\[(?:${rn}|${mn})的语音[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'transfer', re: new RegExp(`^\\[${rn}的转账[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'gift', re: new RegExp(`^\\[${rn}送来的礼物[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'status', re: new RegExp(`^\\[${rn}更新状态为[：:]([\\s\\S]*?)\\]${END}`) },
@@ -1443,15 +2047,3333 @@ async function sendChat(config, request, { signal, onDelta, fetchImpl = fetch } 
   return { text: parseNonStreamText(text, provider), streamed: false };
 }
 
+/* ===== js/auxApi.js ===== */
+// auxApi.js — 记忆总结副 API 与向量 Embedding API（auxApi）。
+// 与主 API 完全独立的配置：各自的 Base URL / Key / 模型，存在 settings 的
+// 'summaryApi'、'embeddingApi' 键里，不与主 API 混用。
+// 本文件只放纯逻辑 + fetch 注入（URL 拼接、响应格式校验、错误分类、真实调用），
+// 可在 Node 测试里用 fake fetch 验证；UI 层（app.js）只做绑定。
+// 绝不只看模型名字判断支不支持向量：Embedding 测试一定发一次真实 embeddings 调用。
+
+
+/** 去尾斜杠，并去掉已带上的 /v1 或 /v1/chat/completions，得到干净的 base。 */
+function resolveBase(baseUrl) {
+  return String(baseUrl || '').replace(/\/+$/, '').replace(/\/chat\/completions$/, '').replace(/\/v1$/, '');
+}
+
+/** OpenAI 兼容：GET {base}/v1/models（拉取模型列表用）。 */
+function resolveModelsEndpoint(baseUrl) {
+  return `${resolveBase(baseUrl)}/v1/models`;
+}
+
+/** OpenAI 兼容：POST {base}/v1/embeddings（向量接口）。 */
+function resolveEmbeddingsEndpoint(baseUrl) {
+  return `${resolveBase(baseUrl)}/v1/embeddings`;
+}
+
+/** Gemini：GET {base}/v1beta/models?key=（与 providerAdapter.testConnection 同一路）。 */
+function resolveGeminiModelsEndpoint(baseUrl) {
+  return `${resolveBase(baseUrl)}/v1beta/models`;
+}
+
+/** Gemini 原生向量：POST {base}/v1beta/models/{model}:embedContent?key=。 */
+function resolveGeminiEmbedEndpoint(baseUrl, model) {
+  return `${resolveBase(baseUrl)}/v1beta/models/${encodeURIComponent(model)}:embedContent`;
+}
+
+/** 去掉凭据，只留非 Key 字段（导入备份待确认、日志等场景用）。 */
+function withoutKey(cfg) {
+  const { key, ...rest } = cfg || {};
+  void key;
+  return rest;
+}
+
+/**
+ * 把 fetch / HTTP 错误转成给 Dolores 看的中文原因。
+ * 失败、未配置、鉴权失败、模型不支持、跨域/CORS 都明确说出来，绝不显示虚假成功。
+ */
+function classifyApiError(e, context = '请求') {
+  const status = e?.status ?? e?.response?.status;
+  if (status) {
+    switch (status) {
+      case 400: return `${context}失败（400）：请求有误，通常是模型名不对，或该模型不支持这个接口，请更换模型再试。`;
+      case 401:
+      case 403: return `${context}失败（${status}）：鉴权失败，API Key 无效或没有权限，请检查 Key。`;
+      case 404: return `${context}失败（404）：接口不存在，请检查 Base URL 是否正确，或该模型不支持这个接口。`;
+      case 429: return `${context}失败（429）：请求太频繁或额度不足，请稍后再试。`;
+      case 500:
+      case 502:
+      case 503:
+      case 504: return `${context}失败（${status}）：服务商那边出问题了，请稍后再试。`;
+      default: return `${context}失败（${status}）：${String(e?.message || '服务器返回错误').slice(0, 120)}`;
+    }
+  }
+  if (e instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(e?.message || '')) {
+    return `${context}失败：无法连接到服务器，可能是地址写错、网络问题，或浏览器跨域（CORS）拦截了请求。`;
+  }
+  if (/HTML|<!doctype|<html/i.test(e?.message || '')) {
+    return `${context}失败：服务器返回了网页而不是 JSON，请检查 Base URL 是否正确。`;
+  }
+  return `${context}失败：${e?.message || '未知错误'}`;
+}
+
+function checkAuxConfig(cfg) {
+  if (!cfg?.url || !cfg?.key || !cfg?.model) {
+    return { ok: false, message: '请先填写 Base URL、API Key 和模型。' };
+  }
+  if (isBlockedUrl(cfg.url)) return { ok: false, message: '当前 API 站点已被屏蔽，无法连接。' };
+  return null;
+}
+
+async function readJsonSafe(res) {
+  const text = await res.text().catch(() => '');
+  try { return JSON.parse(text); } catch { return { _raw: text }; }
+}
+
+function throwHttp(res, bodyText) {
+  const err = new Error(`API Error: ${res.status} ${String(bodyText || '').slice(0, 200)}`);
+  err.status = res.status;
+  err.body = bodyText;
+  throw err;
+}
+
+/**
+ * 拉取模型列表。OpenAI 兼容走 GET {base}/v1/models；
+ * Gemini 走 GET /v1beta/models?key=（与现有 testConnection 同一路）。
+ * 返回 { ok, models, message }；失败时 models 为 []，仍允许手动填写模型。
+ */
+async function fetchModels(config, fetchImpl = fetch) {
+  const bad = checkAuxConfig(config);
+  if (bad) return { ...bad, models: [] };
+  const { provider = 'openai', url, key } = config;
+  try {
+    if (provider === 'gemini') {
+      const res = await fetchImpl(`${resolveGeminiModelsEndpoint(url)}?key=${encodeURIComponent(pickKey(key))}`);
+      if (!res.ok) { const t = await res.text().catch(() => ''); throwHttp(res, t); }
+      const data = await readJsonSafe(res);
+      const models = (data.models || []).map((m) => String(m.name || '').replace(/^models\//, '')).filter(Boolean);
+      return { ok: true, models, message: models.length ? `已拉取 ${models.length} 个模型。` : '连接成功，但模型列表为空，请手动填写模型。' };
+    }
+    const res = await fetchImpl(resolveModelsEndpoint(url), {
+      headers: { Authorization: `Bearer ${pickKey(key)}` },
+    });
+    if (!res.ok) { const t = await res.text().catch(() => ''); throwHttp(res, t); }
+    const data = await readJsonSafe(res);
+    const models = (data.data || []).map((m) => m.id).filter(Boolean);
+    return { ok: true, models, message: models.length ? `已拉取 ${models.length} 个模型。` : '连接成功，但模型列表为空，请手动填写模型。' };
+  } catch (e) {
+    return { ok: false, models: [], message: classifyApiError(e, '拉取模型列表') };
+  }
+}
+
+function extractChatText(data, provider) {
+  if (provider === 'gemini') {
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    return parts.map((p) => p.text || '').join('').trim();
+  }
+  return String(data?.choices?.[0]?.message?.content || '').trim();
+}
+
+/**
+ * 总结副 API 测试：发一次最小的真实 chat 调用，以“能出字”为标准。
+ * 只调 models 列表不算通过；有响应但没出字也算失败。
+ */
+async function testSummaryApi(config, fetchImpl = fetch) {
+  const bad = checkAuxConfig(config);
+  if (bad) return bad;
+  const { provider = 'openai', url, key, model } = config;
+  try {
+    let res;
+    if (provider === 'gemini') {
+      res = await fetchImpl(`${resolveGeminiEndpoint(url, model, false)}?key=${encodeURIComponent(pickKey(key))}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: '你好，请只回一个字：好' }] }],
+          generationConfig: { maxOutputTokens: 8 },
+        }),
+      });
+    } else {
+      res = await fetchImpl(resolveOpenAIEndpoint(url), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pickKey(key)}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: '你好，请只回一个字：好' }],
+          max_tokens: 8,
+          temperature: 0,
+          stream: false,
+        }),
+      });
+    }
+    if (!res.ok) { const t = await res.text().catch(() => ''); throwHttp(res, t); }
+    const data = await readJsonSafe(res);
+    const text = extractChatText(data, provider);
+    if (!text) return { ok: false, message: '副 API 有响应，但没有返回任何文字，请检查模型是否支持聊天调用。' };
+    return { ok: true, message: `连接成功：副 API 可以正常出字（模型 ${model}，回了「${text.slice(0, 12)}」）。` };
+  } catch (e) {
+    return { ok: false, message: classifyApiError(e, '测试总结副 API') };
+  }
+}
+
+/**
+ * 校验 embeddings 响应。OpenAI 格式：{ data: [{ embedding: [数值…] }] }；
+ * Gemini 格式：{ embedding: { values: [数值…] } }。
+ * 要求 embedding 是数值数组、长度 > 0；多条时维度一致。
+ * 返回 { ok, dimensions, count, message }。
+ */
+function validateEmbeddingResponse(data, provider = 'openai') {
+  const fail = (message) => ({ ok: false, dimensions: 0, count: 0, message });
+  if (provider === 'gemini') {
+    const values = data?.embedding?.values;
+    if (!Array.isArray(values) || !values.length) return fail('向量接口返回格式不对：没有取到 embedding.values 数组。');
+    if (!values.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+      return fail('向量接口返回格式不对：embedding.values 里有非数值。');
+    }
+    return { ok: true, dimensions: values.length, count: 1, message: `向量正常，维度 ${values.length}。` };
+  }
+  const rows = data?.data;
+  if (!Array.isArray(rows) || !rows.length) return fail('向量接口返回格式不对：没有取到 data 数组。');
+  const dim = rows[0]?.embedding?.length;
+  if (!Array.isArray(rows[0]?.embedding) || !dim) return fail('向量接口返回格式不对：data[0].embedding 不是数值数组。');
+  for (const r of rows) {
+    if (!Array.isArray(r?.embedding) || r.embedding.length !== dim) {
+      return fail('向量接口返回格式不对：各条 embedding 维度不一致。');
+    }
+    if (!r.embedding.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+      return fail('向量接口返回格式不对：embedding 里有非数值。');
+    }
+  }
+  return { ok: true, dimensions: dim, count: rows.length, message: `向量正常，${rows.length} 条，维度 ${dim}。` };
+}
+
+/**
+ * 向量 Embedding API 测试：发一次真实 embeddings 调用，校验返回的向量。
+ * 不只看模型名字判断支不支持向量；模型不支持会在这里直接报错。
+ */
+async function testEmbeddingApi(config, fetchImpl = fetch) {
+  const bad = checkAuxConfig(config);
+  if (bad) return bad;
+  const { provider = 'openai', url, key, model } = config;
+  try {
+    let res;
+    if (provider === 'gemini') {
+      res = await fetchImpl(`${resolveGeminiEmbedEndpoint(url, model)}?key=${encodeURIComponent(pickKey(key))}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: { parts: [{ text: '测试向量' }] } }),
+      });
+    } else {
+      res = await fetchImpl(resolveEmbeddingsEndpoint(url), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pickKey(key)}` },
+        body: JSON.stringify({ model, input: ['测试向量'] }),
+      });
+    }
+    if (!res.ok) { const t = await res.text().catch(() => ''); throwHttp(res, t); }
+    const data = await readJsonSafe(res);
+    const v = validateEmbeddingResponse(data, provider);
+    if (!v.ok) return v;
+    return { ok: true, dimensions: v.dimensions, message: `连接成功：向量接口可用，${v.message}` };
+  } catch (e) {
+    return { ok: false, message: classifyApiError(e, '测试向量 Embedding API') };
+  }
+}
+
+/**
+ * 用总结副 API 做一次非流式聊天调用（记忆总结用）。返回纯文本。
+ * 出错时抛 Error（message 已是中文友好提示，带 .status）。
+ */
+async function callSummaryChat(config, messages, fetchImpl = fetch) {
+  const bad = checkAuxConfig(config);
+  if (bad) { const e = new Error(bad.message); e.status = 0; throw e; }
+  const { provider = 'openai', url, key, model } = config;
+  try {
+    let res;
+    if (provider === 'gemini') {
+      const system = (messages.find((m) => m.role === 'system')?.content) || '';
+      const userParts = messages.filter((m) => m.role !== 'system').map((m) => ({ text: m.content || '' }));
+      res = await fetchImpl(`${resolveGeminiEndpoint(url, model, false)}?key=${encodeURIComponent(pickKey(key))}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: userParts }],
+          system_instruction: system ? { parts: [{ text: system }] } : undefined,
+          generationConfig: { temperature: 0.3, maxOutputTokens: 2000 },
+        }),
+      });
+    } else {
+      res = await fetchImpl(resolveOpenAIEndpoint(url), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pickKey(key)}` },
+        body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 2000, stream: false }),
+      });
+    }
+    if (!res.ok) { const t = await res.text().catch(() => ''); throwHttp(res, t); }
+    const data = await readJsonSafe(res);
+    return extractChatText(data, provider);
+  } catch (e) {
+    if (e.status !== undefined) throw e;
+    const err = new Error(classifyApiError(e, '调用总结副 API'));
+    err.status = 0;
+    throw err;
+  }
+}
+
+/**
+ * 调向量接口取文本向量（后续向量检索用，本轮只提供可测试的调用层）。
+ * 返回 { vectors: number[][], dimensions }；出错时抛中文 Error。
+ */
+async function callEmbeddings(config, texts, fetchImpl = fetch) {
+  const bad = checkAuxConfig(config);
+  if (bad) { const e = new Error(bad.message); e.status = 0; throw e; }
+  const { provider = 'openai', url, key, model } = config;
+  const inputs = (Array.isArray(texts) ? texts : [texts]).filter((t) => String(t || '').trim());
+  if (!inputs.length) return { vectors: [], dimensions: 0 };
+  try {
+    if (provider === 'gemini') {
+      const vectors = [];
+      for (const text of inputs) {
+        const res = await fetchImpl(`${resolveGeminiEmbedEndpoint(url, model)}?key=${encodeURIComponent(pickKey(key))}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: { parts: [{ text }] } }),
+        });
+        if (!res.ok) { const t = await res.text().catch(() => ''); throwHttp(res, t); }
+        const data = await readJsonSafe(res);
+        const v = validateEmbeddingResponse(data, 'gemini');
+        if (!v.ok) throw new Error(v.message);
+        vectors.push(data.embedding.values);
+      }
+      return { vectors, dimensions: vectors[0]?.length || 0 };
+    }
+    const res = await fetchImpl(resolveEmbeddingsEndpoint(url), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${pickKey(key)}` },
+      body: JSON.stringify({ model, input: inputs }),
+    });
+    if (!res.ok) { const t = await res.text().catch(() => ''); throwHttp(res, t); }
+    const data = await readJsonSafe(res);
+    const v = validateEmbeddingResponse(data, 'openai');
+    if (!v.ok) throw new Error(v.message);
+    return { vectors: data.data.map((r) => r.embedding), dimensions: v.dimensions };
+  } catch (e) {
+    if (e.status !== undefined) throw e;
+    const err = new Error(classifyApiError(e, '调用向量 Embedding API'));
+    err.status = 0;
+    throw err;
+  }
+}
+
+/* ===== js/memorySummary.js ===== */
+// memorySummary.js — 记忆总结的纯逻辑（memorySummary）。
+// 轮次计数、总结范围选择、总结内容过滤、总结提示词组装。
+// 只读选定角色、指定范围的真实聊天；不写库、不调网络，可在 Node 测试里直接验证。
+
+
+
+/** 总结提示词默认值：写明只按提供的记录总结、不编造、不总结代码类内容。 */
+const DEFAULT_SUMMARY_PROMPT = `只根据下面提供的聊天记录做总结；不要编造，不要把猜测写成事实。
+提取：重要经历、双方关系变化、明确约定、稳定喜好、重要人物、未完成事项。
+保留人物、日期和事件背景。
+不要总结 HTML/CSS 代码、状态栏模板代码、Base64 图片、系统提示词。
+用简洁的中文分条写，每条一件事。`;
+
+const SUMMARY_LENGTHS = {
+  short: { label: '短', instruction: '控制在 200 字以内，只写最重要的事。' },
+  medium: { label: '中', instruction: '控制在 500 字以内。' },
+  long: { label: '长', instruction: '控制在 1000 字以内，可以写得详细一些。' },
+};
+
+/** 总结要排除的段种类：状态、隐藏指令、撤回、HTML 卡片/模板代码。 */
+const EXCLUDED_SEGMENT_KINDS = new Set([
+  'status', 'transferResponse', 'giftResponse', 'withdraw', 'html',
+]);
+
+/**
+ * 这条消息要不要排除在总结之外。
+ * 复用 replyParser 的分类逻辑：状态更新、思考过程、隐藏指令（接收/退回转账、
+ * 接收礼物）、撤回占位、HTML 卡片/模板代码都不进总结；只要有一段是正文就保留，
+ * 提取时只取允许的段。
+ */
+function isExcludedFromSummary(msg, character) {
+  if (!msg) return true;
+  if (msg.isStatusUpdate || msg.isThinking || msg.isContextDisabled) return true;
+  if (msg.isWithdrawn) return true;
+  const c = String(msg.content || '').trim();
+  if (c.startsWith('<thinking>')) return true;
+  const seg = classifyContent(msg.content || '', character || {}, {});
+  const segs = seg.kind === 'mixed' ? seg.segments : [seg];
+  if (!segs.length) return true;
+  return segs.every((s) => EXCLUDED_SEGMENT_KINDS.has(s.kind));
+}
+
+/**
+ * 轮次计数：一轮 = 一次用户发言 + 对应完整 AI 回复。
+ * 按 roundId / 回复归属算，不按拆分气泡计数：同一 roundId 的多条气泡只算一轮，
+ * 没有 roundId 的旧数据按连续的 AI 消息块算一轮；只有用户发言、还没有 AI 回复
+ * 的不完整轮次不算；状态/思考等隐藏消息不算。
+ */
+function countRounds(messages, character) {
+  const list = (messages || []).filter((m) => !isExcludedFromSummary(m, character));
+  let rounds = 0;
+  let pendingUser = false;
+  let inAssistantBlock = false;
+  let currentRoundId = null;
+  for (const m of list) {
+    if (m.role === 'user') {
+      pendingUser = true;
+      inAssistantBlock = false;
+      currentRoundId = null;
+    } else if (m.role === 'assistant') {
+      if (!pendingUser) continue;
+      const rid = m.roundId || null;
+      if (!inAssistantBlock) {
+        rounds++;
+        inAssistantBlock = true;
+        currentRoundId = rid;
+      } else if (rid && currentRoundId && rid !== currentRoundId) {
+        // 同一 AI 消息块里出现新的 roundId（极少见）：算作另一轮回复
+        rounds++;
+        currentRoundId = rid;
+      }
+    }
+  }
+  return rounds;
+}
+
+/** 每一轮的起始下标（该轮第一条用户消息）。 */
+function roundStarts(messages, character) {
+  const starts = [];
+  const list = messages || [];
+  let pendingUser = false;
+  let inAssistantBlock = false;
+  let currentRoundId = null;
+  let roundUserStart = -1;
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    if (isExcludedFromSummary(m, character)) continue;
+    if (m.role === 'user') {
+      // 新一轮的用户发言：上一轮已由 AI 回复收尾（inAssistantBlock 为真时），
+      // 或这是第一轮；记下本轮第一条用户消息的位置。
+      if (!pendingUser || inAssistantBlock) roundUserStart = i;
+      pendingUser = true;
+      inAssistantBlock = false;
+      currentRoundId = null;
+    } else if (m.role === 'assistant') {
+      if (!pendingUser) continue;
+      const rid = m.roundId || null;
+      if (!inAssistantBlock) {
+        starts.push(roundUserStart);
+        inAssistantBlock = true;
+        currentRoundId = rid;
+      } else if (rid && currentRoundId && rid !== currentRoundId) {
+        starts.push(roundUserStart);
+        currentRoundId = rid;
+      }
+    }
+  }
+  return starts;
+}
+
+/** 取最近 N 轮的消息（含该轮的全部用户消息与 AI 回复气泡）。 */
+function selectMessagesForRounds(messages, n, character) {
+  const count = Math.max(1, Math.floor(n) || 1);
+  const starts = roundStarts(messages, character);
+  if (!starts.length) return [];
+  const from = starts[Math.max(0, starts.length - count)];
+  return (messages || []).slice(from);
+}
+
+/** 取上次总结锚点之后、尚未总结过的消息；锚点为空或找不到时返回全部。 */
+function unsummarizedMessages(messages, lastSummarizedMessageId) {
+  const list = messages || [];
+  if (!lastSummarizedMessageId) return list;
+  const idx = list.findIndex((m) => m.id === lastSummarizedMessageId);
+  if (idx === -1) return list;
+  return list.slice(idx + 1);
+}
+
+/** 单个解析段转成可进总结的文本；排除的段返回 ''。 */
+function segmentSummaryText(s) {
+  switch (s.kind) {
+    case 'text':
+      return extractProtocolText(s.content);
+    case 'bilingual':
+      return `${s.foreign}（${s.chinese}）`;
+    case 'quote':
+      return `引用“${s.quoted}”并回复：${s.reply}`;
+    case 'photo':
+      return `[照片：${s.body || ''}]`;
+    case 'voice':
+      return `[语音：${s.body || ''}]`;
+    case 'sticker':
+    case 'stickerUnknown':
+      return `[表情包：${s.name}]`;
+    case 'transfer':
+      return `[转账：${s.body || ''}]`;
+    case 'gift':
+      return `[礼物：${s.body || ''}]`;
+    case 'forward':
+      return '[转发的聊天记录]';
+    default:
+      return '';
+  }
+}
+
+function cleanSummaryLine(t) {
+  return String(t || '')
+    .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => {
+      if (!l) return false;
+      if (l.includes('data:image/')) return false; // Base64 图片绝不进总结
+      if (/^<[^>]+>$/.test(l)) return false; // 整行就是一个 HTML 标签
+      if (/^<\/?(style|script|div|span|html|body|head|template)\b/i.test(l)) return false;
+      return true;
+    })
+    .join('\n');
+}
+
+function formatSummaryTime(ts) {
+  const d = new Date(ts || 0);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * 把选定范围的消息转成给总结模型看的纯文本记录。
+ * 只取文本：图片只留 “[图片]” 标记，不带 Base64；状态/思考/HTML/隐藏指令已排除。
+ * 返回多行文本，每行「[时间] 名字：内容」。
+ */
+function extractSummarizableText(messages, character) {
+  const lines = [];
+  const myName = character?.myName || '我';
+  const realName = character?.realName || '对方';
+  for (const msg of messages || []) {
+    if (isExcludedFromSummary(msg, character)) continue;
+    const name = msg.role === 'user' ? myName : realName;
+    const time = formatSummaryTime(msg.timestamp);
+    let text = '';
+    if (msg.role === 'user') {
+      const quoted = serializeUserMessage(msg, character);
+      if (quoted !== null) {
+        text = quoted;
+      } else {
+        const parts = effectiveParts(msg).filter((p) => p.type === 'text');
+        text = parts.map((p) => extractProtocolText(p.text || '')).join('') || extractProtocolText(messageText(msg));
+      }
+      if (effectiveParts(msg).some((p) => p.type === 'image')) text += (text ? ' ' : '') + '[图片]';
+    } else {
+      const seg = classifyContent(msg.content || '', character || {}, {});
+      const segs = seg.kind === 'mixed' ? seg.segments : [seg];
+      text = segs.map(segmentSummaryText).filter(Boolean).join('\n');
+      if (effectiveParts(msg).some((p) => p.type === 'image')) text += (text ? '\n' : '') + '[图片]';
+    }
+    text = cleanSummaryLine(text);
+    if (!text) continue;
+    lines.push(`[${time}] ${name}：${text}`);
+  }
+  return lines.join('\n');
+}
+
+/** 组装一次总结调用的 messages：系统提示词（用户可编辑的提示词 + 长度档）+ 聊天记录。 */
+function buildSummaryRequest({ prompt, length = 'medium', transcript }) {
+  const len = SUMMARY_LENGTHS[length] || SUMMARY_LENGTHS.medium;
+  const system = `${String(prompt || DEFAULT_SUMMARY_PROMPT).trim()}\n\n${len.instruction}`;
+  return {
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: `下面是需要总结的聊天记录：\n\n${transcript || ''}` },
+    ],
+  };
+}
+
+/* ===== js/experiences.js ===== */
+// experiences.js — 经历记忆（experiences store，第 1 波）。
+// 经历 = 从聊天原文里提取出的、可追溯到具体消息的一件事：标题 + 关键细节 +
+// 关键原话（每条必须带来源消息 ID）+ 计划/结果状态。
+// 规则（见 spec）：
+//  - plan_state 与 outcome_state 是两个独立字段；outcome 只有拿到后续原文
+//    （evidenceMessageIds 非空）才能填，日期过去不自动算完成；
+//  - status='invalid' 表示来源被删/撤回后失效，失效的不进检索（第 2 波在检索层
+//    过滤，本文件只提供 isExperienceValid / markExperienceInvalid）；
+//  - 提取复用总结副 API，不新增服务；提取是用户主动触发，不开机自动跑；
+//    批量队列/暂停/恢复/Worker 由第 4 波做，本波只提供单次范围提取。
+// 纯逻辑 + IndexedDB 读写，可被 Node 测试 import；不碰 DOM。
+
+
+
+/** 计划状态：none 无计划含义 / planned 已约好 / completed 已完成 / cancelled 已取消 /
+ *  hypothetical 假设剧情 / setting 角色设定 / paraphrase 转述。 */
+const PLAN_STATES = new Set(['none', 'planned', 'completed', 'cancelled', 'hypothetical', 'setting', 'paraphrase']);
+const PLAN_STATE_LABELS = {
+  none: '', planned: '计划', completed: '已完成', cancelled: '已取消',
+  hypothetical: '假设剧情', setting: '角色设定', paraphrase: '转述',
+};
+/** 结果状态：只有拿到后续原文佐证才能填。 */
+const OUTCOME_STATES = new Set(['completed', 'cancelled', 'rescheduled']);
+const OUTCOME_STATE_LABELS = { completed: '已完成', cancelled: '已取消', rescheduled: '已改期' };
+
+/**
+ * 联想线索种类（第 3 波，固定四种）：context 当时处境 / quote 特殊原话 /
+ * future 未来可能怎样问 / unfinished 未完成事项。一件经历最多 4 条线索，
+ * 0 条合法。线索存在经历记录的 clues 字段里，不另建 store。
+ */
+const CLUE_KINDS = ['context', 'quote', 'future', 'unfinished'];
+
+/**
+ * 归一化一条线索（只做形状校验，不校验 excerpt 是否出自原文——那一步在
+ * associative.js 里对照经历内容做）。非法形状返回 null。
+ * 线索结构：{text, kind, excerpt（原文片段）, sourceMessageIds, evidenceVersion}，
+ * evidenceVersion = 生成时经历的 version；经历被编辑导致 version 变化后，
+ * evidenceVersion 过期的线索视为失效（由 associative.validClues 过滤）。
+ */
+function normalizeClue(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const text = String(raw.text || '').trim();
+  const excerpt = String(raw.excerpt || '').trim();
+  if (!text || !excerpt) return null;
+  if (!CLUE_KINDS.includes(raw.kind)) return null;
+  const sourceMessageIds = [...new Set(
+    (Array.isArray(raw.sourceMessageIds) ? raw.sourceMessageIds : []).map((id) => String(id)).filter(Boolean),
+  )];
+  if (!sourceMessageIds.length) return null;
+  if (!Number.isFinite(raw.evidenceVersion)) return null;
+  return {
+    text: text.slice(0, 200),
+    kind: raw.kind,
+    excerpt: excerpt.slice(0, 500),
+    sourceMessageIds,
+    evidenceVersion: Math.floor(raw.evidenceVersion),
+  };
+}
+
+/** 归一化线索列表：非法条目丢弃，最多保留 4 条（多余的按原顺序截断）。 */
+function normalizeClues(clues) {
+  const out = [];
+  for (const c of Array.isArray(clues) ? clues : []) {
+    const n = normalizeClue(c);
+    if (n) out.push(n);
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+function normalizeQuotes(quotes) {
+  const out = [];
+  for (const q of Array.isArray(quotes) ? quotes : []) {
+    const text = String(q?.text || '').trim();
+    const messageId = String(q?.messageId || '').trim();
+    if (!text || !messageId) continue; // 原话必须带来源消息 ID，否则丢弃
+    out.push({
+      text,
+      messageId,
+      speaker: String(q?.speaker || '').trim(),
+      timestamp: Number.isFinite(q?.timestamp) ? q.timestamp : null,
+    });
+  }
+  return out;
+}
+
+function normalizeOutcome(outcome) {
+  if (!outcome || typeof outcome !== 'object') return null;
+  if (!OUTCOME_STATES.has(outcome.state)) return null;
+  const evidence = [...new Set((outcome.evidenceMessageIds || []).map((id) => String(id)).filter(Boolean))];
+  if (!evidence.length) return null; // 没有后续原文佐证，结果状态不成立
+  return {
+    state: outcome.state,
+    evidenceMessageIds: evidence,
+    at: Number.isFinite(outcome.at) ? outcome.at : Date.now(),
+  };
+}
+
+/**
+ * 建一条经历记录（不写库，只做结构归一化）。
+ * 输入：{charId（必填）, title, summary, quotes, speakers, timestamp,
+ *   plan_state, outcome_state, sourceMessageIds, range, source, retrievalEnabled}。
+ */
+function createExperienceRecord(input = {}) {
+  if (!input?.charId) throw new Error('创建经历记录需要 charId。');
+  const now = Date.now();
+  const quotes = normalizeQuotes(input.quotes);
+  const sourceMessageIds = [...new Set(
+    (Array.isArray(input.sourceMessageIds) ? input.sourceMessageIds : quotes.map((q) => q.messageId))
+      .map((id) => String(id)).filter(Boolean),
+  )];
+  return {
+    id: input.id || uid('exp'),
+    charId: input.charId,
+    title: String(input.title || '未命名经历').trim().slice(0, 200) || '未命名经历',
+    summary: String(input.summary || '').trim(),
+    quotes,
+    speakers: [...new Set((input.speakers || []).map((s) => String(s).trim()).filter(Boolean))],
+    timestamp: Number.isFinite(input.timestamp) ? input.timestamp : now,
+    createdAt: Number.isFinite(input.createdAt) ? input.createdAt : now,
+    updatedAt: now,
+    version: Number.isFinite(input.version) && input.version >= 1 ? Math.floor(input.version) : 1,
+    status: input.status === 'invalid' ? 'invalid' : 'active',
+    plan_state: PLAN_STATES.has(input.plan_state) ? input.plan_state : 'none',
+    outcome_state: normalizeOutcome(input.outcome_state),
+    sourceMessageIds,
+    range: input.range && typeof input.range === 'object'
+      ? {
+          fromMessageId: input.range.fromMessageId || null,
+          toMessageId: input.range.toMessageId || null,
+          rounds: Number.isFinite(input.range.rounds) ? input.range.rounds : 0,
+        }
+      : null,
+    source: String(input.source || '经历提取'),
+    retrievalEnabled: input.retrievalEnabled !== false,
+    // 联想线索（第 3 波）：0–4 条，每条连回原文；无线索时为空数组。
+    clues: normalizeClues(input.clues),
+    // 上一次回复实际提及这件经历时的已完成 AI 回合序号（第 3 波冷却用）；
+    // 从未被提及过为 null。只由回执结算写，不由内容编辑改。
+    lastMentionedRoundSeq: Number.isFinite(input.lastMentionedRoundSeq)
+      ? Math.floor(input.lastMentionedRoundSeq) : null,
+  };
+}
+
+/** 这条经历是否有效：status='invalid'（来源被删/撤回后失效）的不进检索。 */
+function isExperienceValid(exp) {
+  return !!exp && exp.status !== 'invalid';
+}
+
+/** 把一条经历标为失效（来源被删/撤回后调用）；不存在返回 null。 */
+async function markExperienceInvalid(backend, id) {
+  const old = await backend.get('experiences', id);
+  if (!old) return null;
+  if (old.status === 'invalid') return old;
+  const next = { ...old, status: 'invalid', updatedAt: Date.now() };
+  await backend.put('experiences', next);
+  return next;
+}
+
+/**
+ * 编辑经历：只改白名单字段，version+1。quotes 至少保留一句带来源的原话，
+ * 否则抛错；来源消息集合随 quotes 一起更新。
+ */
+async function updateExperience(backend, id, patch = {}) {
+  const old = await backend.get('experiences', id);
+  if (!old) return null;
+  const allowed = {};
+  if (typeof patch.title === 'string') allowed.title = patch.title.trim().slice(0, 200) || old.title;
+  if (typeof patch.summary === 'string') allowed.summary = patch.summary.trim();
+  if (Array.isArray(patch.quotes)) {
+    const quotes = normalizeQuotes(patch.quotes);
+    if (!quotes.length) throw new Error('经历至少需要一句带来源的原话，不能全删。');
+    allowed.quotes = quotes;
+    allowed.sourceMessageIds = [...new Set(quotes.map((q) => q.messageId))];
+  }
+  if (Array.isArray(patch.speakers)) {
+    allowed.speakers = [...new Set(patch.speakers.map((s) => String(s).trim()).filter(Boolean))];
+  }
+  if (PLAN_STATES.has(patch.plan_state)) allowed.plan_state = patch.plan_state;
+  if ('outcome_state' in patch) allowed.outcome_state = normalizeOutcome(patch.outcome_state);
+  if (typeof patch.retrievalEnabled === 'boolean') allowed.retrievalEnabled = patch.retrievalEnabled;
+  if (patch.status === 'active' || patch.status === 'invalid') allowed.status = patch.status;
+  // 联想线索（第 3 波）：编辑经历时可整体替换线索；替换后 evidenceVersion
+  // 按写入时的新 version 计——调用方（线索生成）应走 updateExperienceMeta，
+  // 它不 bump version，evidenceVersion 才不会刚写就过期。
+  if (Array.isArray(patch.clues)) allowed.clues = normalizeClues(patch.clues);
+  if (Number.isFinite(patch.lastMentionedRoundSeq)) {
+    allowed.lastMentionedRoundSeq = Math.floor(patch.lastMentionedRoundSeq);
+  } else if (patch.lastMentionedRoundSeq === null) {
+    allowed.lastMentionedRoundSeq = null;
+  }
+  const next = { ...old, ...allowed, version: (old.version || 1) + 1, updatedAt: Date.now() };
+  await backend.put('experiences', next);
+  return next;
+}
+
+/**
+ * 只写经历的派生元数据（第 3 波系统写路径）：clues / lastMentionedRoundSeq。
+ * 不 bump version——线索是经历内容的派生、回执是提及记录，都不是内容编辑；
+ * bump 的话线索的 evidenceVersion 会刚写就过期、回执也会让线索失效。
+ * patch 里其它字段一律忽略。
+ */
+async function updateExperienceMeta(backend, id, patch = {}) {
+  const old = await backend.get('experiences', id);
+  if (!old) return null;
+  const allowed = {};
+  if (Array.isArray(patch.clues)) allowed.clues = normalizeClues(patch.clues);
+  if (Number.isFinite(patch.lastMentionedRoundSeq)) {
+    allowed.lastMentionedRoundSeq = Math.floor(patch.lastMentionedRoundSeq);
+  } else if (patch.lastMentionedRoundSeq === null) {
+    allowed.lastMentionedRoundSeq = null;
+  }
+  if (!Object.keys(allowed).length) return old;
+  const next = { ...old, ...allowed, updatedAt: Date.now() };
+  await backend.put('experiences', next);
+  return next;
+}
+
+/** 物理删除一条经历（第 2 波接索引清理；本波先把记录删掉即可）。 */
+async function deleteExperience(backend, id) {
+  await backend.delete('experiences', id);
+}
+
+/** 取某角色的全部经历，按事件时间倒序。失效的也返回，由调用方用 isExperienceValid 过滤。 */
+async function getExperiencesForChar(backend, charId) {
+  const all = await backend.getAll('experiences');
+  return all
+    .filter((e) => e?.charId === charId)
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+}
+
+/**
+ * 给 UI 的中文状态文案。plan_state 与 outcome_state 独立：有后续原文佐证的
+ * outcome 时优先显示结果（已完成/已取消/已改期），否则显示计划状态。
+ */
+function planOutcomeLabel(exp) {
+  const outcome = exp?.outcome_state;
+  if (outcome?.state && OUTCOME_STATE_LABELS[outcome.state]) {
+    const n = (outcome.evidenceMessageIds || []).length;
+    return n ? `${OUTCOME_STATE_LABELS[outcome.state]}（${n} 条后续原文佐证）` : OUTCOME_STATE_LABELS[outcome.state];
+  }
+  return PLAN_STATE_LABELS[exp?.plan_state] || '';
+}
+
+/**
+ * 记忆（journal）有没有原文出处。唯一可操作的判定：isSummary 且
+ * sourceMessageIds 非空且 range 存在 → 'sourced'，否则 'unsourced'。
+ * source 字段只是自由文本，不能当作出处依据；代码里没有 hasSource 这类字段。
+ * 记忆页列表与后续检索证据区共用它。
+ */
+function sourceStatusOfJournal(j) {
+  if (j?.isSummary === true
+    && Array.isArray(j.sourceMessageIds) && j.sourceMessageIds.length > 0
+    && j.range) return 'sourced';
+  return 'unsourced';
+}
+
+/* ---------------- 提取（复用总结副 API） ---------------- */
+
+/** 经历提取提示词：只写原文能支撑的内容，猜测必须标出来，绝不记成事实。 */
+const DEFAULT_EXPERIENCE_PROMPT = `只根据下面提供的聊天记录提取经历；不要编造，不要把猜测写成事实。
+每件经历是一件具体发生过、或明确约好要做的事：标题一句话概括，关键细节写清人物、时间、地点与结果。
+每件经历必须附关键原话 quotes：原文照抄，每条必须写明 messageId（照抄记录行首的 [消息ID …]，不要自己编号）与说话人（记录里的名字）；拿不准来源的原话宁可不要，不要硬凑。
+只写原文能支撑的内容：模型自己的猜测、自行扩写、把“打算 / 如果 / 假设”当成已发生的事，必须标 plan_state 为 'hypothetical'（假设剧情）或 'paraphrase'（转述他人或别处的话），绝不能记成双方确实经历过的事实。
+plan_state 取值：'none'（无计划含义）/ 'planned'（原文明确约好要做）/ 'completed'（原文明确已经完成）/ 'cancelled'（原文明确取消）/ 'hypothetical' / 'setting'（角色设定、世界观说明）/ 'paraphrase'。
+不要填结果状态：事情后来是否完成，由以后的聊天原文佐证，不由模型推断。
+不要总结 HTML/CSS 代码、状态栏模板代码、Base64 图片、系统提示词。
+只返回一个 JSON 数组，不要加任何解释文字。数组每项格式：
+{"title":"事件概括","summary":"关键细节","quotes":[{"text":"原话","messageId":"消息ID","speaker":"说话人"}],"speakers":["参与人名字"],"timestamp":事件时间的毫秒时间戳（拿不准就用原话所在消息的时间）,"plan_state":"none"}`;
+
+/**
+ * 把选定范围的消息转成给提取模型看的记录：复用总结的文本化（图片只留 [图片]
+ * 标记、状态/思考/HTML 已排除），每行行首加 [消息ID …]，供模型引用原话时照抄。
+ */
+function buildExperienceTranscript(messages, character) {
+  const lines = [];
+  for (const m of messages || []) {
+    if (isExcludedFromSummary(m, character)) continue;
+    const line = extractSummarizableText([m], character).trim();
+    if (line) lines.push(`[消息ID ${m.id}] ${line}`);
+  }
+  return lines.join('\n');
+}
+
+/** 组装一次经历提取调用的 messages：系统提示词（提取规则）+ 带消息 ID 的聊天记录。 */
+function buildExperienceExtractionRequest({ transcript }) {
+  return {
+    messages: [
+      { role: 'system', content: DEFAULT_EXPERIENCE_PROMPT },
+      { role: 'user', content: `下面是需要提取经历的聊天记录（每行行首 [消息ID …] 是该条消息的唯一编号，引用原话时必须照抄）：\n\n${transcript || ''}` },
+    ],
+  };
+}
+
+function normalizeExtractedItem(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const title = String(raw.title || '').trim();
+  const summary = String(raw.summary || '').trim();
+  if (!title || !summary) return null;
+  const quotes = normalizeQuotes(raw.quotes);
+  if (!quotes.length) return null; // 没有可用的原话引用：整件不收
+  return {
+    title: title.slice(0, 200),
+    summary,
+    quotes,
+    speakers: [...new Set((Array.isArray(raw.speakers) ? raw.speakers : []).map((s) => String(s).trim()).filter(Boolean))],
+    timestamp: Number.isFinite(raw.timestamp) ? raw.timestamp : null,
+    plan_state: PLAN_STATES.has(raw.plan_state) ? raw.plan_state : 'none',
+  };
+}
+
+/**
+ * 解析副模型返回的经历 JSON。容错：去 ```json 围栏、取首尾方括号；
+ * 不是 JSON 数组时抛错（不写库）；单件字段缺失则丢弃该件、记一条原因。
+ * 返回 { items（可写入的规范化经历）, dropped: [{reason}] }。
+ */
+function parseExperienceExtractionResponse(text) {
+  const raw = String(text || '').trim();
+  const start = raw.indexOf('[');
+  const end = raw.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error('副模型返回的内容不是有效的 JSON 数组，无法提取经历，请重试。');
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    throw new Error('副模型返回的内容不是有效的 JSON 数组，无法提取经历，请重试。');
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('副模型返回的内容不是有效的 JSON 数组，无法提取经历，请重试。');
+  }
+  const items = [];
+  const dropped = [];
+  for (const entry of parsed) {
+    const item = normalizeExtractedItem(entry);
+    if (!item) {
+      dropped.push({ reason: '有一件经历缺少标题、关键细节或可用的原话引用，已跳过。' });
+      continue;
+    }
+    items.push(item);
+  }
+  return { items, dropped };
+}
+
+/**
+ * 单次范围提取：选定范围的有效消息 → 总结副 API → 逐件写库。
+ * 写前校验每条 quote 的 messageId 确实在当前有效消息集合里，否则丢弃该 quote；
+ * 整件经历没有任何有效 quote 时不写入、记一条跳过原因。
+ * 返回 { created（写库的经历记录数组）, skipped: [{reason}] }。
+ * 不推进总结锚点、不开机自动跑；批量队列/暂停/恢复/Worker 由第 4 波做。
+ * options：{ onProgress({phase, done, total}), summaryApi（总结副 API 配置）,
+ *   callSummaryChat（可注入 fake，默认调真实总结副 API） }。
+ */
+async function extractExperiencesFromRange(backend, char, messages, {
+  onProgress, summaryApi, callSummaryChat: callChat = callSummaryChat,
+} = {}) {
+  const valid = (messages || []).filter((m) => !isExcludedFromSummary(m, char));
+  if (!valid.length) {
+    return { created: [], skipped: [{ reason: '选定范围里没有可提取的有效消息（状态、思考、撤回、HTML 模板类内容不进提取）。' }] };
+  }
+  const transcript = buildExperienceTranscript(valid, char);
+  if (!transcript.trim()) {
+    return { created: [], skipped: [{ reason: '选定范围里没有可提取的正文。' }] };
+  }
+  if (!summaryApi?.url || !summaryApi?.key || !summaryApi?.model) {
+    throw new Error('未配置记忆总结副 API：请先在「我 → API 设置 → 记忆总结副 API」里填写 Base URL、API Key 和模型。提取不会使用主 API。');
+  }
+  onProgress?.({ phase: 'calling', done: 0, total: 0 });
+  const req = buildExperienceExtractionRequest({ transcript });
+  const text = (await callChat(summaryApi, req.messages)).trim();
+  if (!text) throw new Error('副 API 没有返回文字，请重试。');
+  onProgress?.({ phase: 'parsing', done: 0, total: 0 });
+  const { items, dropped } = parseExperienceExtractionResponse(text);
+  const skipped = [...dropped];
+  const validById = new Map(valid.map((m) => [m.id, m]));
+  const rounds = countRounds(valid, char);
+  const range = { fromMessageId: valid[0].id, toMessageId: valid[valid.length - 1].id, rounds };
+  const created = [];
+  for (const item of items) {
+    const quotes = [];
+    let droppedQuotes = 0;
+    for (const q of item.quotes) {
+      const src = validById.get(q.messageId);
+      if (!src) { droppedQuotes++; continue; } // 引用了范围外 / 已排除消息的原话：丢弃
+      quotes.push({
+        text: q.text,
+        messageId: q.messageId,
+        speaker: q.speaker || (src.role === 'user' ? (char?.myName || '我') : (char?.realName || '对方')),
+        timestamp: Number.isFinite(q.timestamp) ? q.timestamp : (src.timestamp || null),
+      });
+    }
+    if (!quotes.length) {
+      skipped.push({ reason: `「${item.title}」的原话都无法对应到选定范围内的有效消息，已跳过。` });
+      continue;
+    }
+    if (droppedQuotes > 0) {
+      skipped.push({ reason: `「${item.title}」：${droppedQuotes} 句原话的来源不在选定范围内，已丢弃，只保留了其余 ${quotes.length} 句。` });
+    }
+    const ts = Number.isFinite(item.timestamp)
+      ? item.timestamp
+      : (quotes[quotes.length - 1].timestamp || Date.now());
+    const rec = createExperienceRecord({
+      charId: char.id,
+      title: item.title,
+      summary: item.summary,
+      quotes,
+      speakers: item.speakers,
+      timestamp: ts,
+      plan_state: item.plan_state,
+      sourceMessageIds: [...new Set(quotes.map((q) => q.messageId))],
+      range,
+    });
+    await backend.put('experiences', rec);
+    created.push(rec);
+    onProgress?.({ phase: 'saving', done: created.length, total: items.length });
+  }
+  return { created, skipped };
+}
+
+/* ===== js/keywordSearch.js ===== */
+// keywordSearch.js — 中文关键词检索（第 2 波）。
+// JS 自研倒排索引，不引外部库；纯逻辑 + IndexedDB 读写，可被 Node 测试 import。
+// 分词：按非字母数字切分；连续汉字取相邻两字 bigram + 完整词串，
+// 英文/数字按词切分并小写化。停用词表只去最常见的虚词（“的/了/是/在/和”
+// 一类），绝不去实词——“海边”“香菜”“猫”这类词必须能命中。
+// 单个汉字不再当 term：单字在中文里几乎没有区分度，“天/好”这类单字
+// 会把无关文档也召回（见 4b：“今天中午吃什么拉面好呢”误召回 3 条经历）。
+// 索引与查询都只保留二元字串与完整词串；命中还要求至少含一个长度 ≥2 的
+// term（二元字串 / 完整词串 / 多字词），只有单字/单字母命中的文档不要。
+// 打分：BM25（k1=1.2、b=0.75，IDF = ln(1 + (N - df + 0.5)/(df + 0.5))）。
+// 索引写进 keywordIndex store（DB v3 已建，keyPath 'id'）：
+// 每条记录 {id:`${charId}:${term}`, charId, term,
+//   postings:[{docId, docKind:'journal'|'experience', tf, docLen}]}。
+// 索引文档 = 可检索的记忆与经历；无原文出处的旧总结也可以进索引用于
+// “找到它”，但返回时标 sourceStatus='unsourced'，由调用方决定不进“检索证据”区。
+
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
+
+/** 停用词：只去最常见的虚词。单字虚词与英文虚词各一小撮，实词一律保留。 */
+const STOPWORDS = new Set([
+  '的', '了', '是', '在', '和', '与', '或', '但', '就', '也', '都', '还', '很', '最',
+  '呢', '吗', '吧', '啊', '哦', '嗯', '这', '那', '着', '过', '之', '我', '你', '他', '她', '它',
+  'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'is', 'are', 'was', 'were', 'be',
+]);
+
+const CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+const ALNUM_RE = /[A-Za-z0-9]/;
+
+/**
+ * 分词：返回含重复的 term 列表（重复次数即词频 tf）。
+ * 连续汉字串：完整词串 + 相邻两字 bigram；单个汉字不当 term（无区分度，
+ * 会把无关文档召回，见文件头）；英文/数字串：整词小写；其余字符只作分隔符。
+ */
+function tokenize(text) {
+  const s = String(text || '');
+  const terms = [];
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (CJK_RE.test(ch)) {
+      let j = i;
+      while (j < s.length && CJK_RE.test(s[j])) j++;
+      const run = s.slice(i, j);
+      if (run.length > 1) terms.push(run);
+      // 单个汉字不当 term：单字几乎没有区分度（“天/好”会误召回无关文档）。
+      for (let k = 0; k + 1 < run.length; k++) terms.push(run.slice(k, k + 2));
+      i = j;
+    } else if (ALNUM_RE.test(ch)) {
+      let j = i;
+      while (j < s.length && ALNUM_RE.test(s[j])) j++;
+      terms.push(s.slice(i, j).toLowerCase());
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return terms.filter((t) => t && !STOPWORDS.has(t));
+}
+
+/** 经历的检索正文：关键细节 + 关键原话（原话是经历的证据，也是关键词来源）。 */
+function experienceContent(exp) {
+  const quotes = (exp?.quotes || []).map((q) => q?.text || '').filter(Boolean);
+  return [exp?.summary || '', ...quotes].filter(Boolean).join('\n');
+}
+
+/** 记忆的检索正文：就是 content。 */
+function journalContent(journal) {
+  return String(journal?.content || '');
+}
+
+/**
+ * 把一条原始记忆 / 经历归一化成检索文档。
+ * {docId, docKind:'journal'|'experience', charId, title, content, source,
+ *  date, timestamp, sourceStatus:'sourced'|'unsourced', sourceMessageIds,
+ *  retrievalEnabled, text}。text 是分词的输入（标题 + 内容）。
+ * 经历没有 quotes/sourceMessageIds 时 sourceStatus 为 'unsourced'。
+ */
+function normalizeRetrievalDoc(doc) {
+  if (!doc || typeof doc !== 'object') throw new Error('检索文档不能为空。');
+  const docId = doc.docId || doc.id;
+  if (!docId) throw new Error('检索文档需要 id。');
+  const docKind = doc.docKind || doc.kind
+    || (Array.isArray(doc.quotes) || typeof doc.summary === 'string' ? 'experience' : 'journal');
+  const isExp = docKind === 'experience';
+  const content = isExp ? experienceContent(doc) : journalContent(doc);
+  const title = String(doc.title || '');
+  const sourceMessageIds = [...new Set(
+    (Array.isArray(doc.sourceMessageIds) ? doc.sourceMessageIds : [])
+      .concat((doc.quotes || []).map((q) => q?.messageId).filter(Boolean))
+      .map((id) => String(id)).filter(Boolean),
+  )];
+  const sourceStatus = isExp
+    ? (sourceMessageIds.length ? 'sourced' : 'unsourced')
+    : sourceStatusOfJournal(doc);
+  const ts = Number.isFinite(doc.timestamp) ? doc.timestamp
+    : (Number.isFinite(doc.createdAt) ? doc.createdAt : 0);
+  return {
+    docId,
+    docKind,
+    charId: doc.charId || '',
+    title,
+    content,
+    source: doc.source || (isExp ? '经历提取' : '手动记录'),
+    date: ts ? new Date(ts).toISOString().slice(0, 10) : '',
+    timestamp: ts,
+    sourceStatus,
+    sourceMessageIds,
+    retrievalEnabled: doc.retrievalEnabled !== false,
+    valid: isExp ? isExperienceValid(doc) : true,
+    text: [title, content].filter(Boolean).join('\n'),
+  };
+}
+
+function keywordDocFromJournal(journal) {
+  return normalizeRetrievalDoc({ ...journal, docKind: 'journal' });
+}
+
+function keywordDocFromExperience(exp) {
+  return normalizeRetrievalDoc({ ...exp, docKind: 'experience' });
+}
+
+/** 记忆 + 经历拼成检索文档列表（fusedRetrieve 与索引重建共用）。 */
+function retrievalDocsForChar(journals = [], experiences = []) {
+  const docs = [];
+  for (const j of journals || []) docs.push(keywordDocFromJournal(j));
+  for (const e of experiences || []) docs.push(keywordDocFromExperience(e));
+  return docs;
+}
+
+/** 这条文档是否参与检索：记忆看 retrievalEnabled；经历还要有效（未失效）。 */
+function retrievalDocRetrievable(doc) {
+  const d = doc?.docId ? doc : normalizeRetrievalDoc(doc);
+  if (d.retrievalEnabled === false) return false;
+  if (d.docKind === 'experience' && d.valid === false) return false;
+  return true;
+}
+
+/** 该角色的关键词索引是否已建（有任意倒排记录即算已建）。 */
+async function hasKeywordIndex(backend, charId) {
+  const all = await backend.getAll('keywordIndex');
+  return all.some((r) => r?.charId === charId);
+}
+
+/** 删掉该角色的全部倒排记录（重建前调用）。 */
+async function clearKeywordIndexForChar(backend, charId) {
+  const all = await backend.getAll('keywordIndex');
+  for (const r of all.filter((x) => x?.charId === charId)) {
+    await backend.delete('keywordIndex', r.id);
+  }
+}
+
+/**
+ * 全量重建某角色的关键词索引：先清该角色旧记录，再按文档写倒排。
+ * 不参与检索的文档（retrievalEnabled=false / 已失效经历）不进索引。
+ * 返回 {charId, docs, terms}。
+ */
+async function buildKeywordIndex(backend, charId, docs) {
+  if (!charId) throw new Error('建关键词索引需要 charId。');
+  await clearKeywordIndexForChar(backend, charId);
+  const byTerm = new Map(); // term -> Map(docId -> posting)
+  let docCount = 0;
+  for (const raw of docs || []) {
+    const doc = raw?.docId ? raw : normalizeRetrievalDoc(raw);
+    if (doc.charId && doc.charId !== charId) continue;
+    if (!retrievalDocRetrievable(doc)) continue;
+    const terms = tokenize(doc.text);
+    if (!terms.length) continue;
+    docCount++;
+    const tf = new Map();
+    for (const t of terms) tf.set(t, (tf.get(t) || 0) + 1);
+    for (const [term, count] of tf) {
+      if (!byTerm.has(term)) byTerm.set(term, new Map());
+      byTerm.get(term).set(doc.docId, {
+        docId: doc.docId, docKind: doc.docKind, tf: count, docLen: terms.length,
+      });
+    }
+  }
+  for (const [term, postings] of byTerm) {
+    await backend.put('keywordIndex', {
+      id: `${charId}:${term}`, charId, term, postings: [...postings.values()],
+    });
+  }
+  return { charId, docs: docCount, terms: byTerm.size };
+}
+
+/** 从全部倒排记录里删掉某文档的 postings；变空的 term 记录随之删除。返回清掉的 posting 数。 */
+async function removeDocFromPostings(backend, docId, onlyCharId = null) {
+  const all = await backend.getAll('keywordIndex');
+  let removed = 0;
+  for (const row of all) {
+    if (onlyCharId && row?.charId !== onlyCharId) continue;
+    if (!Array.isArray(row?.postings) || !row.postings.some((p) => p.docId === docId)) continue;
+    const rest = row.postings.filter((p) => p.docId !== docId);
+    removed += row.postings.length - rest.length;
+    if (!rest.length) await backend.delete('keywordIndex', row.id);
+    else await backend.put('keywordIndex', { ...row, postings: rest });
+  }
+  return removed;
+}
+
+/**
+ * 单文档同步：先清掉该文档的旧 postings，再按新内容重建。
+ * 不参与检索的文档（retrievalEnabled=false / 已失效经历）只清不建——
+ * 编辑后立即不可见就靠这一步。doc 必须带 charId（没有时按 docId 全库扫描）。
+ */
+async function updateKeywordDoc(backend, doc) {
+  const d = doc?.docId ? doc : normalizeRetrievalDoc(doc);
+  if (!d.docId) throw new Error('更新关键词索引需要文档 id。');
+  if (!retrievalDocRetrievable(d)) {
+    // 不参与检索：只清不建（charId 缺失时按 docId 全库扫描）。
+    await removeDocFromPostings(backend, d.docId, d.charId || null);
+    return { docId: d.docId, indexed: false };
+  }
+  if (!d.charId) throw new Error('更新关键词索引需要 charId。');
+  await removeDocFromPostings(backend, d.docId, d.charId || null);
+  const terms = tokenize(d.text);
+  if (!terms.length) return { docId: d.docId, indexed: false };
+  const tf = new Map();
+  for (const t of terms) tf.set(t, (tf.get(t) || 0) + 1);
+  for (const [term, count] of tf) {
+    const id = `${d.charId}:${term}`;
+    const row = (await backend.get('keywordIndex', id))
+      || { id, charId: d.charId, term, postings: [] };
+    const postings = row.postings.filter((p) => p.docId !== d.docId);
+    postings.push({ docId: d.docId, docKind: d.docKind, tf: count, docLen: terms.length });
+    await backend.put('keywordIndex', { ...row, postings });
+  }
+  return { docId: d.docId, indexed: true };
+}
+
+/** 删除一条文档的全部关键词 postings（记忆/经历删除时调用）。返回清掉的 posting 数。 */
+async function deleteKeywordDoc(backend, docId) {
+  if (!docId) return 0;
+  return removeDocFromPostings(backend, docId);
+}
+
+/**
+ * 关键词检索：BM25 打分，按分降序返回 [{docId, docKind, score, rank}]。
+ * 不设分数阈值——有命中即候选，靠 RRF 排名与 topN 控制；但有一道 term 形状门：
+ * 命中至少包含一个长度 ≥2 的 term（二元字串 / 完整词串 / 多字词），只有
+ * 单字/单字母命中的文档不要——单字在中文里几乎没有区分度，任意 score>0
+ * 即入选会把无关话题也召回（见 4b）。返回 [] 只表示本路无命中。
+ * N 是该角色索引里的文档总数，avgdl 是它们的平均长度。
+ */
+async function searchKeyword(backend, charId, query, { topN = 5 } = {}) {
+  const queryTerms = [...new Set(tokenize(query))];
+  if (!queryTerms.length || !charId) return [];
+  const rows = (await backend.getAll('keywordIndex')).filter((r) => r?.charId === charId);
+  if (!rows.length) return [];
+  // 该角色的文档集合：docLen 取任意一条 posting 里的值（同一文档各 term 的 docLen 相同）。
+  const docInfo = new Map(); // docId -> {docKind, docLen}
+  for (const row of rows) {
+    for (const p of row.postings || []) {
+      if (!docInfo.has(p.docId)) docInfo.set(p.docId, { docKind: p.docKind, docLen: p.docLen || 0 });
+    }
+  }
+  const N = docInfo.size;
+  if (!N) return [];
+  const avgdl = [...docInfo.values()].reduce((s, d) => s + (d.docLen || 0), 0) / N || 1;
+  const scores = new Map(); // docId -> score
+  const matchedTerms = new Map(); // docId -> Set(term)，供 term 形状门用
+  for (const term of queryTerms) {
+    const row = rows.find((r) => r.term === term);
+    if (!row?.postings?.length) continue;
+    const df = row.postings.length;
+    const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
+    for (const p of row.postings) {
+      const docLen = p.docLen || 0;
+      const tfPart = (p.tf * (BM25_K1 + 1))
+        / (p.tf + BM25_K1 * (1 - BM25_B + BM25_B * (docLen / avgdl)));
+      scores.set(p.docId, (scores.get(p.docId) || 0) + idf * tfPart);
+      if (!matchedTerms.has(p.docId)) matchedTerms.set(p.docId, new Set());
+      matchedTerms.get(p.docId).add(term);
+    }
+  }
+  const ranked = [...scores.entries()]
+    // term 形状门：至少命中一个长度 ≥2 的 term。单字 term 已不在分词里，
+    // 这道门防的是旧索引里的单字行、以及单字母词等残留噪声。
+    .filter(([docId]) => {
+      const terms = matchedTerms.get(docId);
+      if (!terms) return false;
+      for (const t of terms) if (t.length >= 2) return true;
+      return false;
+    })
+    .map(([docId, score]) => ({
+      docId, docKind: docInfo.get(docId)?.docKind || 'journal', score,
+    }))
+    .sort((a, b) => b.score - a.score || (a.docId < b.docId ? -1 : 1))
+    .slice(0, Math.max(1, topN));
+  return ranked.map((r, i) => ({ ...r, rank: i + 1 }));
+}
+
+/* ===== js/vectorMemory.js ===== */
+// vectorMemory.js — 向量记忆的纯逻辑（vectorMemory）。
+// 分段、哈希、索引空间键、余弦相似度、检索排序去重、查询文本组装，
+// 以及后端无关的索引编排（建索引 / 补齐 / 重建 / 取消 / 进度）。
+// 向量只来自文字→embedding 的真实接口调用（app.js 里调 auxApi.callEmbeddings），
+// 本文件绝不伪造向量、不调网络、不碰 DOM；IndexedDB 的具体读写走
+// storage.js 的 backend（getAll / put / delete / getVectorChunks）。
+// 记忆原文永远保留在 journals 表；vectorChunks 只是可重建的缓存，
+// 恢复备份后按 journals 重新建索引即可。
+
+
+
+
+
+/**
+ * 向量记忆默认设置。
+ * threshold 默认值 0.40 的实测依据（见 tests/vectorMemory.test.mjs 两组「阈值实测」）：
+ * (1) 裸句对（桩向量，单字哈希 128 维归一化）：相关组余弦 0.546–0.857，
+ * 不相关组 0.000–0.355，0.40 落在两者之间；
+ * (2) 真实查询组装（最新发言 + 最近 2 轮对话拼成查询文本、索引侧用带标题+日期的
+ * 分段文本，近乎原文的问句）：不加权时相关组最低只有 0.342，单降阈值到 0.40 仍
+ * 召回不了；最新发言在查询文本里重复一次加权后，相关组 0.436–0.664，种子句
+ * 「我们上周去海边约好下周再去吗？」对记忆段 0.561，0.40 能稳定召回。
+ * 不相关组在桩向量下个别虚高到 0.485，经复核是单字哈希 128 维的碰撞噪声
+ * （无碰撞的字面余弦最高仅 0.127），不是真实相似；真实模型的相似度分布与桩
+ * 不同，所以阈值必须在记忆页可调；换模型后建议先用「测试召回」校准再定。
+ */
+const DEFAULT_VECTOR_SETTINGS = {
+  enabled: true,
+  topK: 5,
+  threshold: 0.40,
+  tokenBudget: 1500,
+  dimensions: 0,
+  dimensionsFor: '',
+};
+
+const VECTOR_CHUNK_MAX = 600; // 每段正文最多 600 字
+const VECTOR_CHUNK_OVERLAP = 80; // 相邻段重叠约 80 字
+const VECTOR_INDEX_BATCH = 20; // 每批 20 条
+const VECTOR_INDEX_CONCURRENCY = 2; // 批内并发 2
+
+/** FNV-1a 32 位确定性哈希（十六进制）：同内容同哈希，改一字即变。 */
+function fnv1aHex(text) {
+  let h = 0x811c9dc5;
+  const s = String(text ?? '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+function formatMemoryDate(ts) {
+  const d = new Date(ts || 0);
+  if (Number.isNaN(d.getTime()) || !ts) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 记忆正文切段：每段正文 ≤600 字、重叠约 80 字，每段前附标题+日期作上下文。 */
+function chunkMemoryText({ title = '', content = '', timestamp = 0 } = {}) {
+  const body = String(content || '').trim();
+  if (!body) return [];
+  const date = formatMemoryDate(timestamp);
+  const header = [title ? `标题：${title}` : '', date ? `日期：${date}` : '']
+    .filter(Boolean).join('\n');
+  const chunks = [];
+  let start = 0;
+  let index = 0;
+  while (start < body.length) {
+    const end = Math.min(start + VECTOR_CHUNK_MAX, body.length);
+    const slice = body.slice(start, end);
+    const text = header ? `${header}\n${slice}` : slice;
+    chunks.push({ index, text, body: slice, hash: fnv1aHex(slice) });
+    if (end >= body.length) break;
+    start = end - VECTOR_CHUNK_OVERLAP;
+    index++;
+  }
+  return chunks;
+}
+
+/** 归一化 baseUrl：去尾斜杠、去 /v1 与 /chat/completions 后缀（与 auxApi.resolveBase 同规则）。 */
+function normalizeBaseUrl(baseUrl) {
+  return String(baseUrl || '').trim().toLowerCase()
+    .replace(/\/+$/, '').replace(/\/chat\/completions$/, '').replace(/\/v1$/, '');
+}
+
+/**
+ * 索引空间键 = 归一化 baseUrl + 模型 + 维度。
+ * 维度相同但模型不同也绝不能混用；baseUrl 不同、模型不同、维度不同都换空间。
+ */
+function spaceKeyFor({ baseUrl = '', model = '', dimensions = 0 } = {}) {
+  return `${normalizeBaseUrl(baseUrl)}|${String(model || '').trim().toLowerCase()}|${Number(dimensions) || 0}`;
+}
+
+/** 余弦相似度：相同向量 1、相反 -1、正交 0；零向量返回 0。 */
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (!na || !nb) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+/**
+ * 检索排序去重：按余弦从高到低，低于阈值的不要；同一记忆 ID 只留分数最高的一段；
+ * 默认最多召回 topK 条。entries: [{ journalId, vector, ... }]。
+ */
+function rankCandidates(queryVector, entries, { topK = 5, threshold = 0.40 } = {}) {
+  const scored = [];
+  for (const e of entries || []) {
+    if (!e?.vector) continue;
+    const score = cosineSimilarity(queryVector, e.vector);
+    if (score < threshold) continue;
+    scored.push({ ...e, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const seen = new Set();
+  const out = [];
+  for (const s of scored) {
+    if (seen.has(s.journalId)) continue;
+    seen.add(s.journalId);
+    out.push(s);
+    if (out.length >= Math.max(1, topK)) break;
+  }
+  return out;
+}
+
+/** 召回结果去掉已固定注入的收藏记忆（按记忆 ID），同一条不要出现两次。 */
+function dedupeAgainstFavorited(retrieved, favoritedIds) {
+  const fav = new Set(favoritedIds || []);
+  return (retrieved || []).filter((r) => !fav.has(r.journalId));
+}
+
+/**
+ * 记忆 Token 预算：按排名顺序取，累计估算 Token 超出预算的跳过；
+ * 但至少保留排名第一的一条（超出时截断其内容以贴合预算）。
+ */
+function applyTokenBudget(items, tokenBudget, countTokens = countTextTokens) {
+  const budget = Number(tokenBudget) || 0;
+  if (!budget || !items?.length) return items || [];
+  const out = [];
+  let used = 0;
+  for (const item of items) {
+    const text = item.content || item.body || item.text || '';
+    const tokens = countTokens(text);
+    if (out.length && used + tokens > budget) continue;
+    if (!out.length && tokens > budget) {
+      // 首条也超预算：按字符粗截到预算内（中文约 1.2 token/字）。
+      const keepChars = Math.max(40, Math.floor(budget / 1.2));
+      out.push({ ...item, content: String(text).slice(0, keepChars), truncated: true });
+      used = budget;
+      continue;
+    }
+    out.push(item);
+    used += tokens;
+  }
+  return out;
+}
+
+/**
+ * 检索查询文本：最新用户发言 + 最近 2 轮对话文本拼在一起，
+ * 「那次」「那里」这类指代靠最近对话的文本本身消解，不做额外改写。
+ * 最新发言在查询里出现两次（加权）：只拼最近对话会稀释余弦——实测近乎原文的
+ * 问句对记忆段最低只有 0.342，低于阈值；重复一次最新发言后升到 0.436，
+ * 种子句 0.561，近乎原文的查询才能稳定召回（见测试「阈值实测（真实查询组装）」）。
+ * 没有最近对话时只返回最新发言，不重复。
+ */
+function buildRetrievalQueryText(latestUserText, recentTexts = []) {
+  const latest = String(latestUserText || '').trim();
+  const recent = (recentTexts || []).map((t) => String(t || '').trim()).filter(Boolean);
+  if (!recent.length) return latest;
+  return `最近对话：${recent.join(' / ')}\n最新发言：${latest}\n最新发言：${latest}`;
+}
+
+/** 召回结果转成进提示词的可读文字（带标题、日期、来源；发给主模型的是文字，不是向量）。 */
+function formatRetrievedForPrompt(items) {
+  return (items || []).map((m) => [
+    m.title ? `标题：${m.title}` : '',
+    m.date ? `日期：${m.date}` : '',
+    m.source ? `来源：${m.source}` : '',
+    `内容：${m.content || m.body || ''}`,
+  ].filter(Boolean).join('\n')).join('\n\n---\n\n');
+}
+
+/** 文档种类：显式 kind/docKind 优先；原始经历对象没有 kind 字段时按形状识别
+ *（有 quotes 或 summary 即经历，与 keywordSearch.normalizeRetrievalDoc 同一规则）。 */
+function docKindOf(doc) {
+  return doc?.docKind || doc?.kind
+    || (Array.isArray(doc?.quotes) || typeof doc?.summary === 'string' ? 'experience' : 'journal');
+}
+
+/**
+ * 检索文档的向量正文：记忆是 content；经历是关键细节 + 关键原话。
+ * 与 keywordSearch.experienceContent 同一规则（标题由 chunkMemoryText 的
+ * header 另行附上，这里只给正文）。
+ */
+function documentContent(doc) {
+  const kind = docKindOf(doc);
+  if (kind === 'experience') {
+    const quotes = (doc?.quotes || []).map((q) => q?.text || '').filter(Boolean);
+    return [doc?.summary || '', ...quotes].filter(Boolean).join('\n');
+  }
+  return String(doc?.content || '');
+}
+
+/** 一条检索文档（记忆或经历）的全部待索引分段记录（不含向量；向量由调用方填）。 */
+function buildDocumentChunkRecords(doc, charId, spaceKey) {
+  const kind = docKindOf(doc);
+  const chunks = chunkMemoryText({
+    title: doc?.title || '',
+    content: documentContent(doc),
+    timestamp: doc?.timestamp || doc?.createdAt || 0,
+  });
+  return chunks.map((c) => ({
+    id: `${doc.id}:c${c.index}`,
+    journalId: doc.id,
+    kind,
+    charId,
+    spaceKey,
+    chunkIndex: c.index,
+    text: c.text,
+    body: c.body,
+    hash: c.hash,
+    title: doc?.title || '',
+    source: doc?.source || (kind === 'experience' ? '经历提取' : '手动记录'),
+    timestamp: doc?.timestamp || doc?.createdAt || 0,
+    date: formatMemoryDate(doc?.timestamp || doc?.createdAt || 0),
+  }));
+}
+
+/** 一条记忆的全部待索引分段记录（不含向量；向量由调用方填）。 */
+function buildChunkRecords(journal, charId, spaceKey, kind = 'journal') {
+  return buildDocumentChunkRecords({ ...journal, kind }, charId, spaceKey);
+}
+
+/** 一条经历的全部待索引分段记录：复用同一 chunk 结构，journalId 存经历 id，kind='experience'。 */
+function buildExperienceChunkRecords(exp, charId, spaceKey) {
+  return buildDocumentChunkRecords({ ...exp, kind: 'experience' }, charId, spaceKey);
+}
+
+/** 记忆是否参与检索：retrievalEnabled 缺省（老数据）视为 true。 */
+function journalRetrievable(journal) {
+  return journal?.retrievalEnabled !== false;
+}
+
+/** 检索文档是否参与检索：记忆看 retrievalEnabled；经历还要有效（未失效）。 */
+function documentRetrievable(doc) {
+  const kind = docKindOf(doc);
+  if (doc?.retrievalEnabled === false) return false;
+  // 归一化后的文档用 valid 字段表示有效性（无 status 字段时以它为准）。
+  if (kind === 'experience') return doc?.valid !== false && isExperienceValid(doc);
+  return true;
+}
+
+/** 检索文档的原文出处状态：记忆按 sourceStatusOfJournal；经历有来源消息即 sourced。 */
+function documentSourceStatus(doc) {
+  const kind = docKindOf(doc);
+  if (kind === 'experience') {
+    const ids = doc?.sourceMessageIds?.length
+      ? doc.sourceMessageIds
+      : (doc?.quotes || []).map((q) => q?.messageId).filter(Boolean);
+    return ids.length ? 'sourced' : 'unsourced';
+  }
+  return sourceStatusOfJournal(doc);
+}
+
+/** 读当前角色+当前空间的索引（只加载这部分，不加载全库）。 */
+async function getChunksForSpace(backend, charId, spaceKey) {
+  if (typeof backend.getVectorChunks === 'function') {
+    return backend.getVectorChunks(charId, spaceKey) || [];
+  }
+  const all = await backend.getAll('vectorChunks');
+  return all.filter((c) => c.charId === charId && c.spaceKey === spaceKey);
+}
+
+/** 当前角色各索引空间的条数（记忆页显示用）。 */
+async function getIndexSpaces(backend, charId) {
+  const all = (await backend.getAll('vectorChunks')).filter((c) => c.charId === charId);
+  const bySpace = new Map();
+  for (const c of all) bySpace.set(c.spaceKey, (bySpace.get(c.spaceKey) || 0) + 1);
+  return [...bySpace.entries()].map(([spaceKey, count]) => ({ spaceKey, count }))
+    .sort((a, b) => b.count - a.count);
+}
+
+/** 索引状态：每条文档已索引几段、缺失几段；恢复备份后这里显示真实状态，不造假。 */
+async function getIndexStatus(backend, charId, journals, spaceKey) {
+  const existing = await getChunksForSpace(backend, charId, spaceKey);
+  const byJournal = new Map();
+  for (const c of existing) {
+    if (!byJournal.has(c.journalId)) byJournal.set(c.journalId, []);
+    byJournal.get(c.journalId).push(c);
+  }
+  const perJournal = [];
+  let totalChunks = 0, indexedChunks = 0;
+  for (const j of journals || []) {
+    if (!documentRetrievable(j)) continue;
+    const want = buildDocumentChunkRecords(j, charId, spaceKey);
+    totalChunks += want.length;
+    const have = byJournal.get(j.id) || [];
+    const ok = want.filter((w) => have.some((h) => h.chunkIndex === w.chunkIndex && h.hash === w.hash)).length;
+    indexedChunks += ok;
+    perJournal.push({
+      journalId: j.id, docKind: docKindOf(j), title: j.title,
+      wanted: want.length, indexed: ok, missing: want.length - ok,
+    });
+  }
+  const spaces = await getIndexSpaces(backend, charId);
+  return { spaceKey, totalChunks, indexedChunks, missing: totalChunks - indexedChunks, perJournal, spaces };
+}
+
+/** 删除一条文档（记忆或经历）的全部索引段（编辑/删除时调用）。 */
+async function deleteJournalIndex(backend, journalId) {
+  const all = await backend.getAll('vectorChunks');
+  let n = 0;
+  for (const c of all.filter((x) => x.journalId === journalId)) {
+    await backend.delete('vectorChunks', c.id);
+    n++;
+  }
+  return n;
+}
+
+/** deleteJournalIndex 的通用名：chunk 的 journalId 字段存的就是文档 id，两种文档通用。 */
+const deleteDocumentIndex = deleteJournalIndex;
+
+/** 删除当前角色在指定空间的全部索引（重建用）。 */
+async function deleteSpaceIndex(backend, charId, spaceKey) {
+  const list = await getChunksForSpace(backend, charId, spaceKey);
+  for (const c of list) await backend.delete('vectorChunks', c.id);
+  return list.length;
+}
+
+/**
+ * 建索引 / 补齐缺失（通用：记忆 + 经历）：只对参与检索的文档分段；内容未变
+ * （哈希相同）复用已有向量，不重复调接口；大任务分批（每批 20 条、批内并发 2），
+ * 失败重试一次；每批完成后保存进度（saveProgress），刷新后按已保存进度继续；
+ * signal.cancelled 为真时在批间停下（暂停），已保存的段不丢失。
+ * embedTexts(texts) => { vectors, dimensions }，由调用方接真实向量接口。
+ * documents 里的条目用 kind/docKind 区分（'journal' | 'experience'，缺省 journal）；
+ * 老 chunk 缺 kind 字段时视为 journal。
+ */
+async function indexDocuments({
+  backend, charId, documents, spaceKey,
+  embedTexts, onProgress, saveProgress, signal,
+  batchSize = VECTOR_INDEX_BATCH, concurrency = VECTOR_INDEX_CONCURRENCY,
+} = {}) {
+  const eligible = (documents || []).filter(documentRetrievable);
+  const existing = await getChunksForSpace(backend, charId, spaceKey);
+  const existingById = new Map(existing.map((c) => [c.id, c]));
+  const wanted = eligible.flatMap((j) => buildDocumentChunkRecords(j, charId, spaceKey));
+  // 内容已变或维度对不上的旧段先清掉（旧段的 hash 不一致即视为过期）。
+  // 清理范围是本次传入的全部文档（不只是仍参与检索的）：某条文档改成
+  // 不参与检索 / 失效后，它的旧段也要在这次重建里清掉，否则会继续被召回。
+  // 没传入的文档的旧段绝不动：单条文档重建时绝不能误删其他文档的索引。
+  const passedIds = new Set((documents || []).map((j) => j.id));
+  for (const old of existing) {
+    if (!passedIds.has(old.journalId)) continue;
+    const w = wanted.find((x) => x.id === old.id);
+    if (!w || w.hash !== old.hash) await backend.delete('vectorChunks', old.id);
+  }
+  const toEmbed = wanted.filter((w) => {
+    const old = existingById.get(w.id);
+    return !old || old.hash !== w.hash;
+  });
+  const total = wanted.length;
+  let done = total - toEmbed.length;
+  const progress = { charId, spaceKey, done, total, status: 'running', updatedAt: Date.now() };
+  const reportProgress = async () => {
+    progress.done = done;
+    progress.updatedAt = Date.now();
+    onProgress?.({ ...progress });
+    await saveProgress?.({ ...progress });
+  };
+  await reportProgress();
+  let embedded = 0;
+  let failed = 0;
+  for (let i = 0; i < toEmbed.length; i += batchSize) {
+    if (signal?.cancelled) {
+      progress.status = 'paused';
+      await reportProgress();
+      return { ...progress, embedded, failed, cancelled: true };
+    }
+    const batch = toEmbed.slice(i, i + batchSize);
+    // 批内并发 2：两个 worker 从队列里取段。
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(concurrency, batch.length) }, async () => {
+      while (cursor < batch.length) {
+        const chunk = batch[cursor++];
+        if (signal?.cancelled) return;
+        let vectors = null;
+        let dimensions = 0;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const res = await embedTexts([chunk.text]);
+            vectors = res.vectors;
+            dimensions = res.dimensions;
+            break;
+          } catch (e) {
+            if (attempt === 1) throw e;
+          }
+        }
+        if (!vectors?.[0]) throw new Error('向量接口没有返回向量');
+        await backend.put('vectorChunks', { ...chunk, vector: vectors[0], dimensions });
+        embedded++;
+        done++;
+      }
+    });
+    try {
+      await Promise.all(workers);
+    } catch (e) {
+      failed += batch.length;
+      progress.status = 'error';
+      progress.error = e?.message || String(e);
+      await reportProgress();
+      throw e;
+    }
+    await reportProgress();
+    // 每批之间让出主线程，手机不卡。
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  progress.status = toEmbed.length ? 'done' : 'done';
+  progress.done = total;
+  await reportProgress();
+  return { ...progress, embedded, failed, cancelled: false };
+}
+
+/**
+ * 建索引 / 补齐缺失（记忆版，旧签名保持兼容）：与 indexDocuments 同一逻辑，
+ * 只是入参叫 journals。经历进索引请用 indexDocuments（documents 里带 kind）。
+ */
+async function indexJournals(opts = {}) {
+  const { journals, ...rest } = opts;
+  return indexDocuments({ ...rest, documents: journals });
+}
+
+/**
+ * 裸向量候选（供 RRF 融合用，不做 Token 预算、不去收藏、不截断）：
+ * 只检索当前角色、当前空间、参与检索的文档；按余弦降序、同一文档只留
+ * 分数最高的一段；返回前 topN（默认 20）并带 1 起始的 rank。
+ * documentsById：Map<文档 id, 原始记忆/经历>，kind 决定可检索性与 sourceStatus。
+ * 阈值只作用于向量路（默认 0.40 不变）。
+ */
+async function retrieveVectorCandidates({
+  backend, charId, spaceKey, queryVector,
+  documentsById, topN = 20, threshold = 0.40,
+} = {}) {
+  const chunks = await getChunksForSpace(backend, charId, spaceKey);
+  const eligible = chunks.filter((c) => {
+    const d = documentsById?.get(c.journalId);
+    return d && documentRetrievable(d);
+  });
+  const scored = [];
+  for (let i = 0; i < eligible.length; i += 200) {
+    const slice = eligible.slice(i, i + 200);
+    for (const c of slice) {
+      const score = cosineSimilarity(queryVector, c.vector);
+      if (score >= threshold) scored.push({ ...c, score });
+    }
+    if (i + 200 < eligible.length) await new Promise((r) => setTimeout(r, 0));
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const seen = new Set();
+  const out = [];
+  for (const s of scored) {
+    if (seen.has(s.journalId)) continue;
+    seen.add(s.journalId);
+    const d = documentsById.get(s.journalId);
+    out.push({
+      docId: s.journalId,
+      journalId: s.journalId,
+      docKind: s.kind || docKindOf(d),
+      chunkId: s.id,
+      title: s.title,
+      content: s.body || s.text,
+      source: s.source,
+      date: s.date,
+      timestamp: s.timestamp,
+      score: s.score,
+      rank: out.length + 1,
+      sourceStatus: documentSourceStatus(d),
+      sourceMessageIds: d?.sourceMessageIds || (d?.quotes || []).map((q) => q?.messageId).filter(Boolean) || [],
+    });
+    if (out.length >= Math.max(1, topN)) break;
+  }
+  return out;
+}
+
+/**
+ * 真正检索：只检索当前角色、当前空间、参与检索的记忆；
+ * 相似度计算分片执行（每 200 条让出一次主线程），不一次卡住手机。
+ * 返回已去重（固定注入除外）、已按 Token 预算截取的召回条目。
+ * journalsById 也可换成 documentsById（记忆 + 经历）；返回条目除原有
+ * journalId 字段外，另带 docId / docKind / sourceStatus 供融合层复用。
+ */
+async function retrieveFromIndex({
+  backend, charId, spaceKey, queryVector,
+  journalsById, documentsById, topK = 5, threshold = 0.40, tokenBudget = 1500,
+  favoritedIds = [], countTokens,
+} = {}) {
+  const byId = documentsById || journalsById;
+  const picked = await retrieveVectorCandidates({
+    backend, charId, spaceKey, queryVector, documentsById: byId, topN: topK, threshold,
+  });
+  const deduped = dedupeAgainstFavorited(picked, favoritedIds);
+  return applyTokenBudget(deduped, tokenBudget, countTokens);
+}
+
+/* ---------------- RRF 融合 + 邻居补全（第 2 波） ---------------- */
+
+const RRF_K = 60;
+
+/**
+ * RRF 融合：只按排名融合，绝不直接混加不同量纲的分数。
+ * score_fused = Σ 1/(k + rank)，k 默认 60；rank 1 起始，未提供 rank 时按列表顺序补。
+ * 返回 Map<docId, {docId, score, keywordRank, vectorRank}>（未命中一路的 rank 为 null）。
+ */
+function rrfFuse(keywordRanked = [], vectorRanked = [], k = RRF_K) {
+  const map = new Map();
+  const add = (list, key) => {
+    (list || []).forEach((item, i) => {
+      const docId = item?.docId || item?.journalId;
+      if (!docId) return;
+      const rank = Number.isFinite(item?.rank) ? item.rank : i + 1;
+      const cur = map.get(docId) || { docId, score: 0, keywordRank: null, vectorRank: null };
+      cur.score += 1 / (k + rank);
+      cur[key] = rank;
+      map.set(docId, cur);
+    });
+  };
+  add(keywordRanked, 'keywordRank');
+  add(vectorRanked, 'vectorRank');
+  return map;
+}
+
+/**
+ * 把消息按轮次分组（与 memorySummary.countRounds / roundStarts 同一轮定义：
+ * 一轮 = 一次用户发言 + 对应完整 AI 回复；同一 roundId 的多气泡只算一轮）。
+ * 排除：物理删除的天然不在（调用方只传现存消息）、isExcludedFromSummary
+ * 排除的（状态/思考/不进上下文/撤回/<thinking> 开头/隐藏段/空内容）、
+ * 以及 char.supersededRounds 快照里的消息（已被替换的上一轮）。
+ * 返回 [{messages, roundId, hasAssistant}]，按时间顺序。
+ */
+function groupMessagesIntoRounds(messages, character) {
+  const superseded = new Set();
+  for (const r of character?.supersededRounds || []) {
+    for (const m of r?.messages || []) if (m?.id) superseded.add(m.id);
+  }
+  const rounds = [];
+  let current = null;
+  let pendingUser = false;
+  let currentRoundId = null;
+  for (const m of messages || []) {
+    if (!m || superseded.has(m.id)) continue;
+    if (isExcludedFromSummary(m, character)) continue;
+    if (m.role === 'user') {
+      if (!current || current.hasAssistant) {
+        current = { messages: [], roundId: null, hasAssistant: false };
+        rounds.push(current);
+      }
+      current.messages.push(m);
+      pendingUser = true;
+      currentRoundId = null;
+    } else if (m.role === 'assistant') {
+      if (!pendingUser || !current) continue;
+      const rid = m.roundId || null;
+      if (!current.hasAssistant) {
+        current.messages.push(m);
+        current.hasAssistant = true;
+        currentRoundId = rid;
+      } else if (rid && currentRoundId && rid !== currentRoundId) {
+        // 同一 AI 消息块里出现新的 roundId：算作另一轮回复（与 countRounds 一致）。
+        current = { messages: [m], roundId: rid, hasAssistant: true };
+        rounds.push(current);
+        currentRoundId = rid;
+      } else {
+        current.messages.push(m);
+      }
+    }
+  }
+  return rounds;
+}
+
+/** 一轮消息拼成邻居条目的正文：每条「说话人：正文」，撤回/隐藏的轮次进不到这里。 */
+function roundNeighborContent(round, character) {
+  const lines = [];
+  for (const m of round.messages) {
+    const text = extractProtocolText(messageText(m)) || messageText(m);
+    if (!String(text || '').trim()) continue;
+    const speaker = m.role === 'user' ? (character?.myName || '我') : (character?.realName || '对方');
+    lines.push(`${speaker}：${text.trim()}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 邻居补全：对一次命中，补同一会话内仍有效的紧邻轮次（前后各 1 轮）。
+ * sourceMessageIds 是命中的来源消息（经历的 quotes/sourceMessageIds，
+ * 或有出处的总结的 sourceMessageIds）；找不到来源轮次（无出处旧总结、
+ * 来源消息已删）时返回 []。每命中最多补 2 条（前 1 轮 + 后 1 轮），
+ * 每条邻居代表一整轮：{messageId（该轮首条消息）, messageIds, speaker,
+ * role, timestamp, roundOffset:-1|+1, content}。邻居不参与 RRF 打分、
+ * 不占 topN 名额，由调用方独立附加。
+ */
+function getNeighborContext({ messages, character, sourceMessageIds, maxNeighbors = 2 } = {}) {
+  const src = new Set((sourceMessageIds || []).map((id) => String(id)).filter(Boolean));
+  if (!src.size) return [];
+  const rounds = groupMessagesIntoRounds(messages, character);
+  const hitIdx = new Set();
+  rounds.forEach((r, i) => {
+    if (r.messages.some((m) => src.has(m.id))) hitIdx.add(i);
+  });
+  if (!hitIdx.size) return [];
+  const out = [];
+  const seenRounds = new Set();
+  for (const i of [...hitIdx].sort((a, b) => a - b)) {
+    for (const [j, offset] of [[i - 1, -1], [i + 1, 1]]) {
+      if (j < 0 || j >= rounds.length || seenRounds.has(j)) continue;
+      seenRounds.add(j);
+      const round = rounds[j];
+      const content = roundNeighborContent(round, character);
+      if (!content) continue;
+      const first = round.messages[0];
+      out.push({
+        messageId: first.id,
+        messageIds: round.messages.map((m) => m.id),
+        speaker: first.role === 'user' ? (character?.myName || '我') : (character?.realName || '对方'),
+        role: first.role,
+        timestamp: first.timestamp || null,
+        roundOffset: offset,
+        content,
+      });
+      if (out.length >= Math.max(1, maxNeighbors)) return out;
+    }
+  }
+  return out;
+}
+
+/** 对一批融合命中逐个补邻居：同一轮邻居只出现一次，并标明它属于哪件命中（docId）。 */
+function collectNeighborsForResults(results, messages, character) {
+  const all = [];
+  const seen = new Set();
+  for (const r of results || []) {
+    const ns = getNeighborContext({
+      messages, character, sourceMessageIds: r?.sourceMessageIds || [],
+    });
+    for (const n of ns) {
+      const key = n.messageIds.join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      all.push({ ...n, docId: r.docId });
+    }
+  }
+  return all;
+}
+
+/**
+ * 融合检索（第 2 波主入口，放 vectorMemory.js：两路候选都在这里汇合）。
+ *
+ * fusedRetrieve(backend, char, queryText, queryEmbedding, opts)
+ * opts：{spaceKey, journals, experiences, documentsById, history,
+ *   topN=5, threshold=0.40, tokenBudget=1500, favoritedIds=[],
+ *   keywordTopN=20, vectorTopN=20, countTokens}
+ * - 关键词路：searchKeyword，每路按各自排名取前 keywordTopN（默认 20），不设阈值；
+ * - 向量路：retrieveVectorCandidates，前 vectorTopN（默认 20），阈值只作用于这一路；
+ * - 融合：RRF k=60，只按排名（1/(60+rank)），不混分数；融合后按事件去重
+ *   （同一文档 id 只留一件）；再按融合分取 topN；融合后不再二次阈值过滤；
+ * - 收藏去重在取 topN 之后、Token 预算之前（被收藏占掉的名额不补，与旧行为一致）；
+ * - 两路独立：一路失败/未配置时另一路照常。向量未配置（无 queryEmbedding 或
+ *   无 spaceKey）时只走关键词并返回 keywordOnly=true；关键词索引未建时只走
+ *   向量并返回 vectorOnly=true。失败不抛到聊天：错误只汇总进 error 字段。
+ *
+ * 返回 {results, neighbors, error, keywordOnly, vectorOnly, spaceKey, query,
+ *   keywordError, vectorError}。
+ * results 每条：{docId, docKind, journalId（=docId，旧字段兼容）, title, content,
+ *   source, date, timestamp, score（融合分）, keywordRank（null=该路未命中）,
+ *   vectorRank（同上）, vectorScore（向量余弦，null=该路未命中；供“测试召回”
+ *   显示相关度与阈值校准用）, sourceStatus（'sourced'|'unsourced'）, chunkId（关键词
+ *   独占命中时为 null）, sourceMessageIds}。
+ * neighbors 每条：{docId（所属命中）, messageId, messageIds, speaker, role,
+ *   timestamp, roundOffset:-1|+1, content}。history 未传时 neighbors 为 []。
+ * 注意：neighbors 本波只返回、不注入提示词——注入是第 4 波聊天请求重组的事；
+ * sourceStatus='unsourced' 的条目可以进 results 供“找到它”，但调用方
+ * （第 4 波）决定不把它放进“检索证据”区。
+ */
+async function fusedRetrieve(backend, char, queryText, queryEmbedding, opts = {}) {
+  const {
+    spaceKey = null, journals = [], experiences = [], documentsById = null,
+    history = null, topN = 5, threshold = DEFAULT_VECTOR_SETTINGS.threshold,
+    tokenBudget = DEFAULT_VECTOR_SETTINGS.tokenBudget, favoritedIds = [],
+    keywordTopN = 20, vectorTopN = 20, countTokens,
+  } = opts;
+  const charId = char?.id;
+  const docs = documentsById
+    ? [...documentsById.values()].map((d) => normalizeRetrievalDoc(d))
+    : retrievalDocsForChar(journals, experiences);
+  // 融合前只留当前可检索的文档：关键词索引可能是旧的（失效/关闭检索后
+  // 还没来得及同步），不能只靠索引里的 postings 判断——失效经历不可召回。
+  const retrievableDocs = docs.filter(retrievalDocRetrievable);
+  const byId = new Map(retrievableDocs.map((d) => [d.docId, d]));
+  const rawById = new Map();
+  for (const d of [...(journals || []), ...(experiences || [])]) rawById.set(d.id, d);
+  if (documentsById) for (const [id, d] of documentsById) rawById.set(id, d);
+
+  // 关键词路：索引未建时 searchKeyword 返回 []，与“建了但无命中”用 hasKeywordIndex 区分。
+  let keywordRanked = [];
+  let keywordError = null;
+  let keywordBuilt = false;
+  try {
+    keywordBuilt = await hasKeywordIndex(backend, charId);
+    keywordRanked = await searchKeyword(backend, charId, queryText, { topN: keywordTopN });
+  } catch (e) {
+    keywordError = e?.message || String(e);
+  }
+
+  // 向量路：未配置（无向量或无空间键）时不跑，只走关键词。
+  const vectorConfigured = Array.isArray(queryEmbedding) && queryEmbedding.length > 0 && !!spaceKey;
+  let vectorRanked = [];
+  let vectorError = null;
+  if (vectorConfigured) {
+    try {
+      vectorRanked = await retrieveVectorCandidates({
+        backend, charId, spaceKey, queryVector: queryEmbedding,
+        documentsById: rawById, topN: vectorTopN, threshold,
+      });
+    } catch (e) {
+      vectorError = e?.message || String(e);
+    }
+  }
+
+  const fused = rrfFuse(keywordRanked, vectorRanked, RRF_K);
+  let results = [...fused.values()]
+    .map((f) => {
+      const d = byId.get(f.docId);
+      if (!d) return null;
+      const vHit = vectorRanked.find((v) => v.docId === f.docId);
+      return {
+        docId: f.docId,
+        docKind: d.docKind,
+        journalId: f.docId,
+        title: d.title,
+        content: vHit ? vHit.content : d.content,
+        source: d.source,
+        date: d.date,
+        timestamp: d.timestamp,
+        score: f.score,
+        keywordRank: f.keywordRank,
+        vectorRank: f.vectorRank,
+        vectorScore: vHit ? vHit.score : null,
+        sourceStatus: d.sourceStatus,
+        chunkId: vHit ? vHit.chunkId : null,
+        sourceMessageIds: d.sourceMessageIds || [],
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score || (a.docId < b.docId ? -1 : 1));
+  results = results.slice(0, Math.max(1, topN));
+  results = dedupeAgainstFavorited(results, favoritedIds);
+  results = applyTokenBudget(results, tokenBudget, countTokens);
+  const neighbors = history ? collectNeighborsForResults(results, history, char) : [];
+  return {
+    results,
+    neighbors,
+    error: keywordError || vectorError || null,
+    keywordError,
+    vectorError,
+    keywordOnly: !vectorConfigured,
+    vectorOnly: vectorConfigured && (!keywordBuilt || !!keywordError),
+    spaceKey,
+    query: queryText,
+  };
+}
+
+/* ---------------- 索引同步（第 2 波，供 app.js 的编辑/删除 handler 用） ---------------- */
+
+/**
+ * 单文档索引同步：关键词重建该文档 + 向量按 hash 复用或重算。
+ * 不参与检索的文档（retrievalEnabled=false / 已失效经历）只清不建。
+ * spaceKey/embedTexts 未给时只同步关键词（向量路等下次建索引时补）。
+ */
+async function syncDocumentIndexes({
+  backend, charId, doc, spaceKey = null, embedTexts = null, saveProgress,
+} = {}) {
+  const norm = normalizeRetrievalDoc(doc);
+  if (!documentRetrievable(doc)) {
+    await deleteDocumentIndexes(backend, norm.docId);
+    return { docId: norm.docId, removed: true };
+  }
+  await updateKeywordDoc(backend, norm);
+  if (spaceKey && embedTexts) {
+    await indexDocuments({
+      backend, charId, documents: [doc], spaceKey, embedTexts, saveProgress,
+    });
+  }
+  return { docId: norm.docId, removed: false };
+}
+
+/** 删除一条文档的全部索引：向量 chunk + 关键词 postings。返回各路清掉的数量。 */
+async function deleteDocumentIndexes(backend, docId) {
+  const vectorChunks = await deleteJournalIndex(backend, docId);
+  const keywordPostings = await deleteKeywordDoc(backend, docId);
+  return { vectorChunks, keywordPostings };
+}
+
+/** 全量重建某角色的关键词索引（建向量索引时顺带调用；无网络请求，纯本地）。 */
+async function rebuildKeywordIndexForChar(backend, charId, journals = [], experiences = []) {
+  return buildKeywordIndex(backend, charId, retrievalDocsForChar(journals, experiences));
+}
+
+/* ===== js/associative.js ===== */
+// associative.js — 可关闭的联想召回（第 3 波，Callback_DLC 思路）。
+// 本阶段只做当轮联想，不做轮间预备（prepare_after / 短名单缓存留给后续增强）。
+//
+// 三段式：
+//  1. 线索生成：每件重要经历可生成 0–4 条线索（四种固定：当时处境 / 特殊原话 /
+//     未来可能怎样问 / 未完成事项；0 条合法）。由总结副 API 在经历写入/更新时
+//     生成（不用主聊天 API）；每条线索必须连回原文，存进经历记录的 clues 字段，
+//     evidenceVersion = 生成时经历的 version；经历被编辑导致 version 变化后，
+//     evidenceVersion 过期的线索视为失效（下次生成时更新或丢弃）。
+//  2. 当轮联想检索：按线索文本（关键词 + 向量，与 fusedRetrieve 同款 RRF 思路）
+//     从当前对话找候选（默认 6 件），与准确检索结果（fusedRetrieve 的 results）
+//     按 docId 去重；失效 / 无出处 / 不参与检索的文档不得入选。
+//  3. 副模型选择：调总结副 API 从候选中严格选“一个或空”，JSON 契约
+//     {mode:'pick'|'none', pick: docId|null, use:'mention'|'understand', reason}，
+//     不许强行挑选；解析失败 / 格式不对按“选空”处理。
+//
+// 超时与预算：联想选择单次超时 ≤8 秒（AbortController + Promise.race 双保险，
+// 超时按选空）；调用预算按月计数的本地预算记录（settings 'assocBudget'，
+// {month:'YYYY-MM', used, limit}，默认 limit 300 次/月）；超预算跳过联想、
+// 不阻断聊天、不弹窗，只在记忆页显示预算状态。
+//
+// 冷却 6 轮：已提及（mentioned=true）的事件，在最近 6 个完整 AI 回复内降低
+// 主动推荐优先级（联想候选里直接排除）；明确追问不受限制（该经历同时出现
+// 在当轮 fusedRetrieve 的 results 里，或关键词路命中前 3 时绕过冷却）。
+// 回执三态：已检索（进过选择）/ 已注入（选中并进请求）/ 回复实际提及
+// （回复落盘后核对）。本波把数据结构与回执写好，预览展示由第 4 波重组时接上。
+//
+// 纯逻辑 + IndexedDB/设置读写，可被 Node 测试 import；不碰 DOM、不改提示词
+// 区块结构（联想经历进请求的重组是第 4 波的事）。
+
+
+
+
+const CLUE_KIND_LABELS = {
+  context: '当时处境', quote: '特殊原话', future: '未来可能怎样问', unfinished: '未完成事项',
+};
+
+/** 联想总开关（settings 'assocSettings'）：默认开；未配置副 API 时静默不启用。 */
+const DEFAULT_ASSOC_SETTINGS = { enabled: true };
+/** 联想调用预算默认上限：300 次/月（settings 'assocBudget' 里可调）。 */
+const DEFAULT_ASSOC_BUDGET_LIMIT = 300;
+/** 联想选择单次超时（毫秒）：≤8 秒，超时按选空处理。 */
+const ASSOC_PICK_TIMEOUT_MS = 8000;
+/** 回执改述核验超时（毫秒）：比选择更短，超时只用标记匹配的结果。 */
+const ASSOC_VERIFY_TIMEOUT_MS = 5000;
+/** 联想候选默认件数。 */
+const ASSOC_CANDIDATE_TOP_N = 6;
+/** 冷却轮数：已提及的事件在最近这么多个完整 AI 回复内不主动推荐。 */
+const ASSOC_COOLDOWN_ROUNDS = 6;
+/** 回执记录保留条数（settings 'assocReceipts'）。 */
+const ASSOC_RECEIPTS_LIMIT = 100;
+
+const ASSOC_BUDGET_KEY = 'assocBudget';
+const ASSOC_ROUND_SEQ_KEY = 'assocRoundSeq';
+const ASSOC_RECEIPTS_KEY = 'assocReceipts';
+
+/** 副 API 是否已配置（未配置时联想静默不启用，不弹窗）。 */
+function isSummaryApiConfigured(summaryApi) {
+  return !!(summaryApi?.url && summaryApi?.key && summaryApi?.model);
+}
+
+/** 这件经历当前有效的线索：evidenceVersion 必须等于经历现在的 version。 */
+function validClues(exp) {
+  const version = exp?.version;
+  return (exp?.clues || []).filter((c) => c && c.evidenceVersion === version);
+}
+
+/** 线索文本（检索用）：标题 + 每条线索的 text 与 excerpt。 */
+function clueTextFor(exp) {
+  const parts = [exp?.title || ''];
+  for (const c of validClues(exp)) parts.push(`${c.text} ${c.excerpt}`);
+  return parts.filter(Boolean).join('\n');
+}
+
+/* ---------------- 线索生成 ---------------- */
+
+const DEFAULT_CLUE_PROMPT = `只根据下面提供的经历内容生成联想线索；不要编造，不要把猜测写成事实。
+线索是以后聊天时可能自然联想起这件经历的“钩子”，固定四种，每种最多一条，一件经历最多 4 条，0 条也合法（没把握就别写）：
+- context（当时处境）：这件事发生时的处境、背景或氛围；
+- quote（特殊原话）：经历里最特别、最可能被原样提起的一句原话；
+- future（未来可能怎样问）：以后对方可能怎样问起、提起这件事；
+- unfinished（未完成事项）：这件事里还没做完、还没兑现的部分（没有就别写）。
+每条线索必须连回原文：excerpt 必须是经历内容（关键细节或关键原话）里的原文片段，照抄，不要改写；sourceMessageIds 必须是该片段来源消息的 ID（照抄记录里的 ID，不要自己编号）。
+只返回一个 JSON 数组，不要加任何解释文字。数组每项格式：
+{"text":"线索内容","kind":"context","excerpt":"原文片段","sourceMessageIds":["消息ID"]}`;
+
+/** 组装一次线索生成调用的 messages：系统提示词（生成规则）+ 经历内容。 */
+function buildClueGenerationRequest(exp) {
+  const quotes = (exp?.quotes || [])
+    .map((q) => `[消息ID ${q.messageId}] ${q.speaker ? `${q.speaker}：` : ''}${q.text}`)
+    .join('\n');
+  const body = [
+    `标题：${exp?.title || '未命名经历'}`,
+    exp?.summary ? `关键细节：${exp.summary}` : '',
+    quotes ? `关键原话：\n${quotes}` : '',
+    exp?.timestamp ? `日期：${new Date(exp.timestamp).toISOString().slice(0, 10)}` : '',
+  ].filter(Boolean).join('\n');
+  return {
+    messages: [
+      { role: 'system', content: DEFAULT_CLUE_PROMPT },
+      { role: 'user', content: `下面是需要生成联想线索的经历（每条原话行首 [消息ID …] 是该条消息的唯一编号，线索的 excerpt 必须照抄这里的原文，sourceMessageIds 必须照抄这里的 ID）：\n\n${body}` },
+    ],
+  };
+}
+
+function normForMatch(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 一条线索是否连回原文：excerpt 必须是经历关键细节或某句关键原话里的
+ * 原文片段（空白归一化后子串匹配），且 sourceMessageIds 必须全在经历的
+ * 来源消息集合里。任一不满足即无效（丢弃，不写库）。
+ */
+function validateClueAgainstExperience(clue, exp) {
+  const c = normalizeClue(clue);
+  if (!c) return false;
+  const excerpt = normForMatch(c.excerpt);
+  if (!excerpt) return false;
+  const haystacks = [
+    normForMatch(exp?.summary),
+    ...(exp?.quotes || []).map((q) => normForMatch(q?.text)),
+  ].filter(Boolean);
+  if (!haystacks.some((h) => h.includes(excerpt))) return false;
+  const sources = new Set([
+    ...(exp?.sourceMessageIds || []),
+    ...(exp?.quotes || []).map((q) => q?.messageId).filter(Boolean),
+  ].map((id) => String(id)));
+  if (!c.sourceMessageIds.every((id) => sources.has(id))) return false;
+  return true;
+}
+
+/**
+ * 解析副模型返回的线索 JSON。容错：去 ```json 围栏、取首尾方括号；
+ * 不是 JSON 数组时抛错（不写库）；单条线索形状不对 / 连不回原文则丢弃该条、
+ * 记一条原因；最多保留 4 条。
+ * 返回 { clues（可写入的规范化线索，evidenceVersion = 经历当前 version）,
+ *   dropped: [{reason}] }。
+ */
+function parseClueGenerationResponse(text, exp) {
+  const raw = String(text || '').trim();
+  const start = raw.indexOf('[');
+  const end = raw.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error('副模型返回的内容不是有效的 JSON 数组，无法生成线索，请重试。');
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    throw new Error('副模型返回的内容不是有效的 JSON 数组，无法生成线索，请重试。');
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('副模型返回的内容不是有效的 JSON 数组，无法生成线索，请重试。');
+  }
+  const clues = [];
+  const dropped = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') {
+      dropped.push({ reason: '有一条线索不是有效的对象，已跳过。' });
+      continue;
+    }
+    if (!CLUE_KINDS.includes(entry.kind)) {
+      dropped.push({ reason: '有一条线索的种类不在四种固定种类里，已跳过。' });
+      continue;
+    }
+    const withVersion = { ...entry, evidenceVersion: exp?.version ?? 1 };
+    if (!validateClueAgainstExperience(withVersion, exp)) {
+      dropped.push({ reason: '有一条线索的原文片段或来源消息对不上经历原文，已跳过。' });
+      continue;
+    }
+    clues.push(normalizeClue(withVersion));
+    if (clues.length >= 4) break;
+  }
+  return { clues, dropped };
+}
+
+/**
+ * 为一件经历生成线索（经历写入/更新成功后触发；生成失败不阻断保存，
+ * 由调用方静默跳过）。未配置副 API 时不调用、返回 {clues: [], skipped: 'no-api'}。
+ * 成功时把线索写进经历记录的 clues 字段（updateExperienceMeta，不 bump version，
+ * 否则 evidenceVersion 会刚写就过期）；失败时抛错（不写库）。
+ * options：{summaryApi, callSummaryChat（可注入 fake，默认调真实总结副 API）}。
+ */
+async function generateCluesForExperience(backend, exp, {
+  summaryApi, callSummaryChat: callChat = callSummaryChat,
+} = {}) {
+  if (!exp?.id) throw new Error('生成线索需要经历记录。');
+  if (!isSummaryApiConfigured(summaryApi)) {
+    return { clues: [], dropped: [], skipped: 'no-api' };
+  }
+  const req = buildClueGenerationRequest(exp);
+  const text = (await callChat(summaryApi, req.messages)).trim();
+  if (!text) throw new Error('副 API 没有返回文字，请重试。');
+  const { clues, dropped } = parseClueGenerationResponse(text, exp);
+  await updateExperienceMeta(backend, exp.id, { clues });
+  return { clues, dropped, updated: true };
+}
+
+/* ---------------- 预算（settings 'assocBudget'） ---------------- */
+
+/** 本地月份键 'YYYY-MM'（按本地时间；跨月自动归零）。 */
+function monthKey(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+/** 读预算记录：无记录时默认 {month: 本月, used: 0, limit: 300}；跨月自动归零（不写库）。 */
+async function loadAssocBudget(backend, now = new Date()) {
+  const cur = monthKey(now);
+  const row = await backend.get('settings', ASSOC_BUDGET_KEY);
+  const saved = row?.value;
+  if (!saved || typeof saved !== 'object') {
+    return { month: cur, used: 0, limit: DEFAULT_ASSOC_BUDGET_LIMIT };
+  }
+  if (saved.month !== cur) {
+    return { month: cur, used: 0, limit: Number.isFinite(saved.limit) ? saved.limit : DEFAULT_ASSOC_BUDGET_LIMIT };
+  }
+  return {
+    month: cur,
+    used: Number.isFinite(saved.used) ? Math.max(0, Math.floor(saved.used)) : 0,
+    limit: Number.isFinite(saved.limit) ? Math.max(0, Math.floor(saved.limit)) : DEFAULT_ASSOC_BUDGET_LIMIT,
+  };
+}
+
+async function saveAssocBudget(backend, budget) {
+  await backend.put('settings', { key: ASSOC_BUDGET_KEY, value: { ...budget } });
+  return budget;
+}
+
+/** 预算检查（只读）：{allowed, used, limit, budgetLeft, month}。 */
+async function checkAssocBudget(backend, now = new Date()) {
+  const b = await loadAssocBudget(backend, now);
+  return { allowed: b.used < b.limit, used: b.used, limit: b.limit, budgetLeft: Math.max(0, b.limit - b.used), month: b.month };
+}
+
+/**
+ * 消费一次预算：超限返回 null（调用方跳过联想）；否则 used+1 并写库，
+ * 返回 {used, limit, budgetLeft}。跨月时先归零再计。
+ */
+async function consumeAssocBudget(backend, now = new Date()) {
+  const b = await loadAssocBudget(backend, now);
+  if (b.used >= b.limit) return null;
+  const next = { ...b, used: b.used + 1 };
+  await saveAssocBudget(backend, next);
+  return { used: next.used, limit: next.limit, budgetLeft: next.limit - next.used };
+}
+
+/* ---------------- 已完成 AI 回合序号（settings 'assocRoundSeq'） ---------------- */
+
+/** 每角色的已完成 AI 回合序号：一轮 = 一次完整 AI 回复（多气泡同一 roundId 只算一轮）。 */
+async function getCompletedRoundSeq(backend, charId) {
+  if (!charId) return 0;
+  const row = await backend.get('settings', ASSOC_ROUND_SEQ_KEY);
+  const seq = row?.value?.[charId];
+  return Number.isFinite(seq) ? Math.max(0, Math.floor(seq)) : 0;
+}
+
+/** 每完成一次 AI 回复 +1，返回新序号。 */
+async function bumpCompletedRoundSeq(backend, charId) {
+  if (!charId) return 0;
+  const row = await backend.get('settings', ASSOC_ROUND_SEQ_KEY);
+  const map = { ...(row?.value || {}) };
+  const next = (Number.isFinite(map[charId]) ? Math.floor(map[charId]) : 0) + 1;
+  map[charId] = next;
+  await backend.put('settings', { key: ASSOC_ROUND_SEQ_KEY, value: map });
+  return next;
+}
+
+/** 这件经历是否在冷却期内：最近 6 个完整 AI 回复内被提及过。 */
+function isCooledDown(exp, currentSeq) {
+  const last = exp?.lastMentionedRoundSeq;
+  if (!Number.isFinite(last)) return false;
+  return currentSeq - last <= ASSOC_COOLDOWN_ROUNDS;
+}
+
+/**
+ * 是否明确追问（绕过冷却）：该经历同时出现在当轮 fusedRetrieve 的 results 里，
+ * 或关键词路命中前 3。keywordTopIds 是当轮关键词检索前 3 的 docId 集合
+ * （fusedRetrieve 的 topN 可能把它截掉，单靠 results 看不见）。
+ */
+function isExplicitFollowup(exp, fusedResults = [], keywordTopIds = []) {
+  if (!exp?.id) return false;
+  if ((keywordTopIds || []).includes(exp.id)) return true;
+  return (fusedResults || []).some((r) => (r?.docId || r?.journalId) === exp.id);
+}
+
+/* ---------------- 当轮联想候选 ---------------- */
+
+/** 经历是否有原文出处：来源消息非空（无出处的不进联想）。 */
+function experienceSourced(exp) {
+  const ids = exp?.sourceMessageIds?.length
+    ? exp.sourceMessageIds
+    : (exp?.quotes || []).map((q) => q?.messageId).filter(Boolean);
+  return ids.length > 0;
+}
+
+/**
+ * 当轮联想候选：按线索文本（关键词 + 向量，与 fusedRetrieve 同款 RRF 思路）
+ * 从当前对话找，取少量候选（默认 6 件），与准确检索结果按 docId 去重。
+ * 失效 / 无出处 / 不参与检索 / 无有效线索的经历不得入选；冷却期内的经历
+ * 直接排除（明确追问除外）。
+ *
+ * opts：{backend, charId, experiences, queryText, queryEmbedding, spaceKey,
+ *   fusedResults, currentSeq, embedTexts（可选，(texts)=>{vectors}），
+ *   topN=6, keywordTopN=10, vectorTopN=10, threshold=0.40}
+ * 返回候选数组，每条 {docId, docKind:'experience', title, date, timestamp,
+ *   clues（有效线索）, quotes（前 2 条关键原话）, keywordRank, vectorRank, score}。
+ */
+async function findAssocCandidates({
+  backend, charId, experiences, queryText, queryEmbedding, spaceKey,
+  fusedResults = [], currentSeq = 0, embedTexts = null,
+  topN = ASSOC_CANDIDATE_TOP_N, keywordTopN = 10, vectorTopN = 10, threshold = 0.40,
+} = {}) {
+  const query = String(queryText || '').trim();
+  if (!query) return [];
+  // 明确追问判定用的关键词前 3（当轮查询文本对关键词索引跑一次）。
+  let keywordTopIds = [];
+  try {
+    const top3 = await searchKeyword(backend, charId, query, { topN: 3 });
+    keywordTopIds = top3.map((r) => r.docId);
+  } catch { keywordTopIds = []; }
+  const eligible = (experiences || []).filter((exp) => {
+    if (!exp?.id || !isExperienceValid(exp)) return false;
+    if (exp.retrievalEnabled === false) return false;
+    if (!experienceSourced(exp)) return false;
+    if (!validClues(exp).length) return false;
+    if (isCooledDown(exp, currentSeq) && !isExplicitFollowup(exp, fusedResults, keywordTopIds)) return false;
+    return true;
+  });
+  if (!eligible.length) return [];
+
+  // 关键词路：查询词与线索文本（标题 + 线索 text/excerpt）的共有词数。
+  const queryTerms = [...new Set(tokenize(query))];
+  const keywordRanked = [];
+  if (queryTerms.length) {
+    const scored = eligible.map((exp) => {
+      const terms = new Set(tokenize(clueTextFor(exp)));
+      let shared = 0;
+      for (const t of queryTerms) if (terms.has(t)) shared++;
+      return { docId: exp.id, score: shared };
+    }).filter((s) => s.score > 0)
+      .sort((a, b) => b.score - a.score || (a.docId < b.docId ? -1 : 1))
+      .slice(0, Math.max(1, keywordTopN));
+    scored.forEach((s, i) => keywordRanked.push({ docId: s.docId, rank: i + 1 }));
+  }
+
+  // 向量路：线索文本批量取向量，与查询向量比余弦（阈值只作用于这一路）。
+  // 失败时只走关键词路（与 fusedRetrieve 的两路独立一致），不抛错。
+  let vectorRanked = [];
+  if (Array.isArray(queryEmbedding) && queryEmbedding.length > 0 && spaceKey && typeof embedTexts === 'function') {
+    try {
+      const texts = eligible.map((exp) => clueTextFor(exp));
+      const { vectors } = await embedTexts(texts);
+      const scored = [];
+      (vectors || []).forEach((v, i) => {
+        if (!v) return;
+        const score = cosineSimilarity(queryEmbedding, v);
+        if (score >= threshold) scored.push({ docId: eligible[i].id, score });
+      });
+      scored.sort((a, b) => b.score - a.score || (a.docId < b.docId ? -1 : 1))
+        .slice(0, Math.max(1, vectorTopN))
+        .forEach((s, i) => vectorRanked.push({ docId: s.docId, rank: i + 1 }));
+    } catch { /* 向量路失败：只走关键词路 */ }
+  }
+
+  const fused = rrfFuse(keywordRanked, vectorRanked);
+  const fusedIds = new Set((fusedResults || []).map((r) => r?.docId || r?.journalId).filter(Boolean));
+  const byId = new Map(eligible.map((e) => [e.id, e]));
+  const out = [...fused.values()]
+    .sort((a, b) => b.score - a.score || (a.docId < b.docId ? -1 : 1))
+    .filter((f) => !fusedIds.has(f.docId)) // 与准确检索结果按 docId 去重
+    .slice(0, Math.max(1, topN))
+    .map((f) => {
+      const exp = byId.get(f.docId);
+      if (!exp) return null;
+      return {
+        docId: exp.id,
+        docKind: 'experience',
+        title: exp.title || '',
+        date: exp.timestamp ? new Date(exp.timestamp).toISOString().slice(0, 10) : '',
+        timestamp: exp.timestamp || 0,
+        clues: validClues(exp),
+        quotes: (exp.quotes || []).slice(0, 2).map((q) => ({ text: q.text, speaker: q.speaker || '' })),
+        keywordRank: f.keywordRank,
+        vectorRank: f.vectorRank,
+        score: f.score,
+      };
+    })
+    .filter(Boolean);
+  return out;
+}
+
+/* ---------------- 副模型选择 ---------------- */
+
+/** 给副模型看的候选卡片：只含标题 / 线索 / 关键原话 / 日期，不含向量分数。 */
+function candidateCard(c, i) {
+  const lines = [
+    `【候选${i + 1}】${c.title || '未命名经历'}（id: ${c.docId}）`,
+    c.date ? `日期：${c.date}` : '',
+    ...(c.quotes || []).map((q) => `关键原话：「${q.text}」${q.speaker ? ` —— ${q.speaker}` : ''}`),
+    ...((c.clues || []).map((cl) => `线索（${CLUE_KIND_LABELS[cl.kind] || cl.kind}）：${cl.text}`)),
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+const DEFAULT_ASSOC_PICK_PROMPT = `你是聊天助手的联想判断员。当前对话在下面给出，候选是一件件过去的经历（每件带标题、日期、关键原话与联想线索）。
+你的任务：判断当前对话是否自然地让人联想起其中某件经历——像是聊天中会顺口提起的那种联想，不是硬凑的关联。
+规则：
+- 最多选一件；没有哪件是自然联想，就选空，绝不强行挑选；
+- 选中的那件应该是当前对话里确实在聊、或刚被提起的相关事，而不是“有点像”而已；
+- use 表示怎么用这件经历：'mention'（回复里可以顺口提到它）或 'understand'（只用来理解背景，回复里不必提）；
+- 只返回一个 JSON 对象，不要加任何解释文字。格式：
+{"mode":"pick","pick":"候选的 id","use":"mention","reason":"一句话原因"}
+选空时返回：{"mode":"none","pick":null,"use":"understand","reason":"一句话原因"}`;
+
+/** 组装一次联想选择调用的 messages：系统提示词（选择规则）+ 当前对话 + 候选卡片。 */
+function buildAssocPickRequest({ candidates, queryText }) {
+  const cards = (candidates || []).map((c, i) => candidateCard(c, i)).join('\n\n');
+  return {
+    messages: [
+      { role: 'system', content: DEFAULT_ASSOC_PICK_PROMPT },
+      {
+        role: 'user',
+        content: `当前对话（最新发言与最近对话拼成）：\n${queryText || ''}\n\n候选经历：\n${cards}`,
+      },
+    ],
+  };
+}
+
+/** 选空结果（mode none / pick null / 解析失败 / 超时 / 预算耗尽都归到这里）。 */
+function emptyPick(status = 'none', reason = '') {
+  return { mode: 'none', pick: null, use: 'understand', reason: String(reason || ''), status };
+}
+
+/**
+ * 解析副模型返回的选择 JSON。容错：去 ```json 围栏、取首尾花括号；
+ * mode 不是 pick/none、pick 不在候选里、pick 为空都按选空处理（不抛错）。
+ * 返回 {mode, pick, use, reason, status}，status 为 'picked' | 'none'。
+ */
+function parseAssocPickResponse(text, candidateIds = []) {
+  const ids = new Set(candidateIds || []);
+  const raw = String(text || '').trim();
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) {
+    return emptyPick('none', '副模型返回的内容不是有效的 JSON，已按选空处理。');
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return emptyPick('none', '副模型返回的内容不是有效的 JSON，已按选空处理。');
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return emptyPick('none', '副模型返回的格式不对，已按选空处理。');
+  }
+  const use = parsed.use === 'mention' ? 'mention' : 'understand';
+  const reason = String(parsed.reason || '').slice(0, 200);
+  if (parsed.mode === 'pick' && typeof parsed.pick === 'string' && ids.has(parsed.pick)) {
+    return { mode: 'pick', pick: parsed.pick, use, reason, status: 'picked' };
+  }
+  return { mode: 'none', pick: null, use, reason: reason || '没有自然联想起的经历。', status: 'none' };
+}
+
+/**
+ * 带超时的副 API 调用：AbortController（真 fetch 会被 abort）+ Promise.race
+ * （副 API 封装不接受 signal 时也能保证 ≤timeoutMs 毫秒返回）。
+ * 超时抛一个 name='TimeoutError' 的 Error。
+ */
+async function callSummaryChatWithTimeout(callChat, summaryApi, messages, timeoutMs, fetchImpl) {
+  const controller = new AbortController();
+  const impl = fetchImpl || fetch;
+  const fetchWithSignal = (url, opts) => impl(url, { ...(opts || {}), signal: controller.signal });
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      const e = new Error('联想选择超时');
+      e.name = 'TimeoutError';
+      reject(e);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([callChat(summaryApi, messages, fetchWithSignal), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * 副模型选择：从候选中严格选“一个或空”。超时 / 解析失败 / 格式不对 /
+ * 副模型报错都按选空处理，绝不抛错、不阻断聊天。
+ * 返回 {mode, pick, use, reason, status}，status 为
+ * 'picked' | 'none' | 'timeout' | 'error' | 'no-api' | 'no-candidates'。
+ * options：{summaryApi, callSummaryChat（可注入 fake）, timeoutMs=8000, fetchImpl}。
+ */
+async function pickAssocCandidate({
+  summaryApi, callSummaryChat: callChat = callSummaryChat,
+  candidates, queryText, timeoutMs = ASSOC_PICK_TIMEOUT_MS, fetchImpl,
+} = {}) {
+  if (!candidates?.length) return emptyPick('no-candidates', '本轮没有联想候选。');
+  if (!isSummaryApiConfigured(summaryApi)) return emptyPick('no-api', '未配置总结副 API，联想未启用。');
+  const ids = candidates.map((c) => c.docId);
+  const req = buildAssocPickRequest({ candidates, queryText });
+  try {
+    const text = await callSummaryChatWithTimeout(callChat, summaryApi, req.messages, timeoutMs, fetchImpl);
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return emptyPick('none', '副模型没有返回文字，已按选空处理。');
+    return parseAssocPickResponse(trimmed, ids);
+  } catch (e) {
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      return emptyPick('timeout', '联想选择超时，已按选空处理。');
+    }
+    return emptyPick('error', `联想选择失败，已按选空处理（${String(e?.message || e).slice(0, 80)}）。`);
+  }
+}
+
+/** 联想选择空结果（存进 lastBuiltRequest.assoc 的形状）。 */
+function emptyAssoc(status = 'none', extra = {}) {
+  return {
+    pick: null, mode: 'none', use: 'understand', reason: '',
+    candidates: [], budgetLeft: null, injectedAt: null, status,
+    ...extra,
+  };
+}
+
+/**
+ * 当轮联想总入口（供 app.js 的 buildCurrentRequest 调用）：
+ * 开关 / 副 API / 候选 / 预算 / 选择依次把关，任一步不满足都按选空返回，
+ * 绝不抛错、不阻断聊天。
+ *
+ * opts：{backend, charId, queryText, queryEmbedding, spaceKey, fusedResults,
+ *   experiences, summaryApi, embedTexts（可选）, callSummaryChat（可注入 fake）,
+ *   assocEnabled=true, timeoutMs=8000, fetchImpl, now=Date.now()}
+ * 返回 {pick（docId 或 null）, mode, use, reason,
+ *   candidates:[{docId, docKind, title}], budgetLeft, injectedAt, status}。
+ * status：'ok'（选中）/ 'none'（选空）/ 'disabled' / 'no-api' /
+ *   'no-candidates' / 'budget-exceeded' / 'timeout' / 'error'。
+ */
+async function runAssocForChat({
+  backend, charId, queryText, queryEmbedding, spaceKey,
+  fusedResults = [], experiences = [], summaryApi, embedTexts = null,
+  callSummaryChat: callChat = callSummaryChat, assocEnabled = true,
+  timeoutMs = ASSOC_PICK_TIMEOUT_MS, fetchImpl, now = Date.now(),
+} = {}) {
+  if (!assocEnabled) return emptyAssoc('disabled', { reason: '联想召回总开关已关闭。' });
+  if (!isSummaryApiConfigured(summaryApi)) return emptyAssoc('no-api', { reason: '未配置总结副 API，联想未启用。' });
+  const currentSeq = await getCompletedRoundSeq(backend, charId);
+  const candidates = await findAssocCandidates({
+    backend, charId, experiences, queryText, queryEmbedding, spaceKey,
+    fusedResults, currentSeq, embedTexts,
+  });
+  const budget = await checkAssocBudget(backend);
+  if (!candidates.length) {
+    return emptyAssoc('no-candidates', { reason: '本轮没有联想候选。', budgetLeft: budget.budgetLeft });
+  }
+  if (!budget.allowed) {
+    return emptyAssoc('budget-exceeded', {
+      reason: `联想预算已用完（本月 ${budget.used}/${budget.limit} 次）。`,
+      budgetLeft: 0,
+    });
+  }
+  const consumed = await consumeAssocBudget(backend);
+  if (!consumed) {
+    return emptyAssoc('budget-exceeded', { reason: '联想预算已用完。', budgetLeft: 0 });
+  }
+  const picked = await pickAssocCandidate({
+    summaryApi, callSummaryChat: callChat, candidates, queryText, timeoutMs, fetchImpl,
+  });
+  return {
+    pick: picked.pick,
+    mode: picked.mode,
+    use: picked.use,
+    reason: picked.reason,
+    candidates: candidates.map((c) => ({ docId: c.docId, docKind: c.docKind, title: c.title })),
+    budgetLeft: consumed.budgetLeft,
+    injectedAt: picked.mode === 'pick' ? now : null,
+    status: picked.status === 'picked' ? 'ok' : picked.status,
+  };
+}
+
+/* ---------------- 回执结算（三态之“回复实际提及”） ---------------- */
+
+/** 日期标记：YYYY-MM-DD / YYYY年M月D日 / M月D日 三种写法都算。 */
+function dateMarkers(timestamp) {
+  if (!Number.isFinite(timestamp)) return [];
+  const d = new Date(timestamp);
+  if (Number.isNaN(d.getTime())) return [];
+  const y = d.getFullYear();
+  const m = d.getMonth() + 1;
+  const day = d.getDate();
+  const p = (n) => String(n).padStart(2, '0');
+  return [`${y}-${p(m)}-${p(day)}`, `${y}年${m}月${day}日`, `${m}月${day}日`];
+}
+
+/**
+ * 原文标记匹配：关键原话（全文，超过 30 字时另加前 30 字前缀）/ 日期 /
+ * 参与人名字（排除角色本人的名字，由调用方传 excludeNames）任一标记在
+ * 回复文本里出现即算提及。返回 {mentioned, matched:[命中的标记文本]}。
+ */
+function markerMentioned(replyText, exp, { excludeNames = [] } = {}) {
+  const reply = normForMatch(replyText);
+  if (!reply) return { mentioned: false, matched: [] };
+  const markers = [];
+  for (const q of exp?.quotes || []) {
+    const t = normForMatch(q?.text);
+    if (t.length < 4) continue;
+    markers.push(t);
+    if (t.length > 30) markers.push(t.slice(0, 30));
+  }
+  for (const d of dateMarkers(exp?.timestamp)) markers.push(d);
+  const excluded = new Set((excludeNames || []).map((n) => String(n).trim()).filter(Boolean));
+  for (const s of exp?.speakers || []) {
+    const name = String(s || '').trim();
+    if (name.length >= 2 && !excluded.has(name)) markers.push(name);
+  }
+  const matched = [...new Set(markers.filter((m) => m && reply.includes(m)))];
+  return { mentioned: matched.length > 0, matched: matched.slice(0, 5) };
+}
+
+const DEFAULT_ASSOC_VERIFY_PROMPT = `判断下面这段 AI 回复是否提到了给出的那件经历：原样提到、改述、化用都算提到；只是话题有点像、没有实际涉及那件事，不算。
+只返回一个 JSON 对象，不要加任何解释文字。格式：{"mentioned":true,"reason":"一句话原因"} 或 {"mentioned":false,"reason":"一句话原因"}`;
+
+/** 组装一次改述核验调用的 messages：经历（标题/关键细节/关键原话/日期）+ 回复文本。 */
+function buildAssocVerifyRequest({ exp, replyText }) {
+  const quotes = (exp?.quotes || []).slice(0, 3).map((q) => `「${q.text}」`).join('\n');
+  const body = [
+    `标题：${exp?.title || '未命名经历'}`,
+    exp?.summary ? `关键细节：${exp.summary}` : '',
+    quotes ? `关键原话：\n${quotes}` : '',
+    exp?.timestamp ? `日期：${new Date(exp.timestamp).toISOString().slice(0, 10)}` : '',
+  ].filter(Boolean).join('\n');
+  return {
+    messages: [
+      { role: 'system', content: DEFAULT_ASSOC_VERIFY_PROMPT },
+      { role: 'user', content: `经历：\n${body}\n\nAI 回复：\n${replyText || ''}` },
+    ],
+  };
+}
+
+/** 解析改述核验的 JSON：返回 true/false，解析失败返回 null（用标记匹配的结果）。 */
+function parseAssocVerifyResponse(text) {
+  const raw = String(text || '').trim();
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    const parsed = JSON.parse(raw.slice(start, end + 1));
+    return typeof parsed?.mentioned === 'boolean' ? parsed.mentioned : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 读回执记录（settings 'assocReceipts'，最新在前，只保留最近 100 条）。 */
+async function getAssocReceipts(backend) {
+  const row = await backend.get('settings', ASSOC_RECEIPTS_KEY);
+  const list = Array.isArray(row?.value) ? row.value : [];
+  return list.filter((r) => r && typeof r === 'object');
+}
+
+/** 某件经历的最近一条回执（没有返回 null）。 */
+function latestReceiptForExp(receipts, experienceId) {
+  return (receipts || []).find((r) => r?.experienceId === experienceId) || null;
+}
+
+/** 回执给记忆页看的中文状态文案。 */
+function receiptStatusText(receipt) {
+  if (!receipt) return '未注入过';
+  if (receipt.mentioned) {
+    return receipt.method === 'model' ? '最近回执：已提及（副模型核验）' : '最近回执：已提及（原文标记）';
+  }
+  return '最近回执：已注入，未提及';
+}
+
+/**
+ * 回执结算（AI 回复落盘后挂钩子调用，不要另起保存路径）：
+ * 先做原文标记匹配（命中即 mentioned=true，method='marker'）；未命中时再用
+ * 副模型改述核验（预算内、超时短；副模型不可用 / 超时 / 解析失败时只用
+ * 标记匹配的结果，method 仍为 'marker'）。
+ * 结果写入回执记录（settings 'assocReceipts'，只保留最近 100 条）与经历记录
+ * 的 lastMentionedRoundSeq（仅 mentioned=true 时更新，序号取结算时的
+ * 已完成 AI 回合序号）。没有 pick 时返回 null。
+ * options：{backend, charId, roundId, replyText, assoc（lastBuiltRequest.assoc）,
+ *   summaryApi, callSummaryChat（可注入 fake）, excludeNames（角色本人名字）,
+ *   verifyTimeoutMs=5000, fetchImpl, now=Date.now()}。
+ */
+async function settleAssocReceipt({
+  backend, charId, roundId, replyText, assoc,
+  summaryApi, callSummaryChat: callChat = callSummaryChat,
+  excludeNames = [], verifyTimeoutMs = ASSOC_VERIFY_TIMEOUT_MS, fetchImpl, now = Date.now(),
+} = {}) {
+  if (!assoc?.pick) return null;
+  const exp = await backend.get('experiences', assoc.pick);
+  if (!exp) return null;
+  const marker = markerMentioned(replyText, exp, { excludeNames });
+  let mentioned = marker.mentioned;
+  let method = 'marker';
+  if (!mentioned && isSummaryApiConfigured(summaryApi)) {
+    // 改述核验也要计预算：超预算 / 消费失败时只用标记匹配的结果。
+    const consumed = await consumeAssocBudget(backend);
+    if (consumed) {
+      try {
+        const req = buildAssocVerifyRequest({ exp, replyText });
+        const text = await callSummaryChatWithTimeout(callChat, summaryApi, req.messages, verifyTimeoutMs, fetchImpl);
+        const verdict = parseAssocVerifyResponse(text);
+        if (verdict === true) { mentioned = true; method = 'model'; }
+      } catch { /* 副模型不可用 / 超时：只用标记匹配的结果 */ }
+    }
+  }
+  const currentSeq = await getCompletedRoundSeq(backend, charId);
+  const receipt = {
+    experienceId: exp.id,
+    roundId: roundId || null,
+    injectedAt: assoc.injectedAt ?? null,
+    mentioned,
+    checkedAt: now,
+    method,
+  };
+  const receipts = await getAssocReceipts(backend);
+  receipts.unshift(receipt);
+  await backend.put('settings', {
+    key: ASSOC_RECEIPTS_KEY, value: receipts.slice(0, ASSOC_RECEIPTS_LIMIT),
+  });
+  if (mentioned) {
+    await updateExperienceMeta(backend, exp.id, { lastMentionedRoundSeq: currentSeq });
+  }
+  return receipt;
+}
+
+/* ===== js/retrievalWorker.js ===== */
+// retrievalWorker.js — 第 4 波：较重计算的 Worker 与批量任务队列。
+//
+// 本文件分两层：
+//  1. Worker 层：RETRIEVAL_WORKER_SOURCE 是完整的 Worker 源码字符串，
+//     由调用方用 Blob URL 创建 Worker（预览是单文件 artifact，独立 worker
+//     文件走不到）。Worker 内只做两件纯计算：关键词倒排构建、余弦打分；
+//     源码自包含、不 import 任何业务模块。
+//  2. 主线程层：与 Worker 源码同一份算法的纯函数（回退用）、Worker 创建与
+//     任务执行（含建不出 Worker 时的主线程分片回退）、批量任务队列的纯逻辑
+//     （任务记录、暂停/恢复、进度持久化）与整角色删除时的检索残留清理。
+// 本文件不 import 业务模块、不碰 DOM、不调网络，可被 Node 测试直接 import。
+// 注意：RETRIEVAL_WORKER_SOURCE 里不能出现反引号与 ${}（它是外层模板字符串）。
+
+/* ---------------- Worker 源码字符串 ---------------- */
+
+const RETRIEVAL_WORKER_SOURCE = `
+'use strict';
+var STOPWORDS = {};
+['的','了','是','在','和','与','或','但','就','也','都','还','很','最','呢','吗','吧','啊','哦','嗯','这','那','着','过','之','我','你','他','她','它','the','a','an','and','or','of','to','in','is','are','was','were','be'].forEach(function (w) { STOPWORDS[w] = true; });
+var CJK_RE = /[\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff]/;
+var ALNUM_RE = /[A-Za-z0-9]/;
+function tokenize(text) {
+  var s = String(text || '');
+  var terms = [];
+  var i = 0;
+  while (i < s.length) {
+    var ch = s[i];
+    if (CJK_RE.test(ch)) {
+      var j = i;
+      while (j < s.length && CJK_RE.test(s[j])) j++;
+      var run = s.slice(i, j);
+      if (run.length > 1) terms.push(run);
+      // 单个汉字不当 term：单字几乎没有区分度（与 keywordSearch.tokenize 同算法）。
+      for (var k2 = 0; k2 + 1 < run.length; k2++) terms.push(run.slice(k2, k2 + 2));
+      i = j;
+    } else if (ALNUM_RE.test(ch)) {
+      var j2 = i;
+      while (j2 < s.length && ALNUM_RE.test(s[j2])) j2++;
+      terms.push(s.slice(i, j2).toLowerCase());
+      i = j2;
+    } else {
+      i++;
+    }
+  }
+  return terms.filter(function (t) { return t && !STOPWORDS[t]; });
+}
+function buildPostings(docs) {
+  var byTerm = {};
+  for (var d = 0; d < (docs || []).length; d++) {
+    var doc = docs[d];
+    var terms = tokenize(doc.text || '');
+    if (!terms.length) continue;
+    var tf = {};
+    for (var i = 0; i < terms.length; i++) tf[terms[i]] = (tf[terms[i]] || 0) + 1;
+    for (var term in tf) {
+      if (!byTerm[term]) byTerm[term] = [];
+      byTerm[term].push({ docId: doc.docId, docKind: doc.docKind || 'journal', tf: tf[term], docLen: terms.length });
+    }
+  }
+  var out = [];
+  for (var term2 in byTerm) out.push({ term: term2, postings: byTerm[term2] });
+  out.sort(function (a, b) { return a.term < b.term ? -1 : a.term > b.term ? 1 : 0; });
+  return { postings: out, docs: (docs || []).length };
+}
+function cosine(a, b) {
+  if (!a || !b || !a.length || a.length !== b.length) return 0;
+  var dot = 0, na = 0, nb = 0;
+  for (var i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  if (!na || !nb) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+function scoreEntries(queryVector, entries) {
+  var out = [];
+  for (var i = 0; i < (entries || []).length; i++) {
+    var e = entries[i];
+    if (!e || !e.vector) continue;
+    out.push({ id: e.id, score: cosine(queryVector, e.vector) });
+  }
+  out.sort(function (a, b) { return b.score - a.score; });
+  return out;
+}
+self.onmessage = function (e) {
+  var msg = e.data || {};
+  try {
+    var result = null;
+    if (msg.kind === 'build-keyword-postings') {
+      result = buildPostings((msg.payload || {}).docs || []);
+    } else if (msg.kind === 'cosine-scores') {
+      result = scoreEntries((msg.payload || {}).queryVector, (msg.payload || {}).entries || []);
+    } else {
+      throw new Error('未知的 Worker 任务：' + String(msg.kind));
+    }
+    self.postMessage({ id: msg.id, ok: true, result: result });
+  } catch (err) {
+    self.postMessage({ id: msg.id, ok: false, error: String((err && err.message) || err) });
+  }
+};
+`;
+
+/* ---------------- 主线程纯函数（与 Worker 同算法，回退用） ---------------- */
+
+const WORKER_STOPWORDS = new Set([
+  '的', '了', '是', '在', '和', '与', '或', '但', '就', '也', '都', '还', '很', '最',
+  '呢', '吗', '吧', '啊', '哦', '嗯', '这', '那', '着', '过', '之', '我', '你', '他', '她', '它',
+  'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'is', 'are', 'was', 'were', 'be',
+]);
+
+const CJK_RE_MAIN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+const ALNUM_RE_MAIN = /[A-Za-z0-9]/;
+
+/** 分词（与 keywordSearch.tokenize 同算法；Worker 源码里是同一份逻辑的 ES5 版）。 */
+function tokenizeText(text) {
+  const s = String(text || '');
+  const terms = [];
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (CJK_RE_MAIN.test(ch)) {
+      let j = i;
+      while (j < s.length && CJK_RE_MAIN.test(s[j])) j++;
+      const run = s.slice(i, j);
+      if (run.length > 1) terms.push(run);
+      // 单个汉字不当 term：单字几乎没有区分度（与 keywordSearch.tokenize 同算法）。
+      for (let k = 0; k + 1 < run.length; k++) terms.push(run.slice(k, k + 2));
+      i = j;
+    } else if (ALNUM_RE_MAIN.test(ch)) {
+      let j = i;
+      while (j < s.length && ALNUM_RE_MAIN.test(s[j])) j++;
+      terms.push(s.slice(i, j).toLowerCase());
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return terms.filter((t) => t && !WORKER_STOPWORDS.has(t));
+}
+
+/**
+ * 关键词倒排构建（与 keywordSearch.buildKeywordIndex 同算法、与 Worker
+ * 源码同一份逻辑）：docs [{docId, docKind, text}] → {postings:[{term, postings:
+ * [{docId, docKind, tf, docLen}]}], docs}。写库由调用方做（Worker 只算不写）。
+ */
+function buildKeywordPostings(docs) {
+  const byTerm = new Map();
+  for (const doc of docs || []) {
+    const terms = tokenizeText(doc?.text || '');
+    if (!terms.length) continue;
+    const tf = new Map();
+    for (const t of terms) tf.set(t, (tf.get(t) || 0) + 1);
+    for (const [term, count] of tf) {
+      if (!byTerm.has(term)) byTerm.set(term, []);
+      byTerm.get(term).push({
+        docId: doc.docId, docKind: doc.docKind || 'journal', tf: count, docLen: terms.length,
+      });
+    }
+  }
+  const postings = [...byTerm.entries()]
+    .map(([term, list]) => ({ term, postings: list }))
+    .sort((a, b) => (a.term < b.term ? -1 : a.term > b.term ? 1 : 0));
+  return { postings, docs: (docs || []).length };
+}
+
+/** 余弦相似度（与 vectorMemory.cosineSimilarity 同公式）。 */
+function cosineSimilarityLocal(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (!na || !nb) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+/** 余弦打分并降序：entries [{id, vector}] → [{id, score}]（不过滤阈值，由调用方定）。 */
+function scoreCosineEntries(queryVector, entries) {
+  const out = [];
+  for (const e of entries || []) {
+    if (!e?.vector) continue;
+    out.push({ id: e.id, score: cosineSimilarityLocal(queryVector, e.vector) });
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
+
+/* ---------------- Worker 创建与任务执行（含主线程分片回退） ---------------- */
+
+/** 当前环境能不能建 Worker（Blob URL 方式；预览单文件 artifact 里同样走这条路）。 */
+function isWorkerSupported() {
+  try {
+    return typeof Worker === 'function'
+      && typeof Blob === 'function'
+      && typeof URL !== 'undefined'
+      && typeof URL.createObjectURL === 'function';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 创建 Worker：成功返回 {worker, url}，失败（Blob URL 被禁、无 Worker 支持等）
+ * 返回 null，由调用方走主线程分片回退。绝不抛错。
+ */
+function createRetrievalWorker() {
+  if (!isWorkerSupported()) return null;
+  try {
+    const url = URL.createObjectURL(
+      new Blob([RETRIEVAL_WORKER_SOURCE], { type: 'text/javascript' }),
+    );
+    return { worker: new Worker(url), url };
+  } catch {
+    return null;
+  }
+}
+
+function terminateRetrievalWorker(handle) {
+  if (!handle) return;
+  try { handle.worker?.terminate(); } catch { /* 已停用 */ }
+  try { if (handle.url) URL.revokeObjectURL(handle.url); } catch { /* 已释放 */ }
+}
+
+let workerTaskSeq = 0;
+
+/** 一次 Worker 调用：按 id 配对回包；超时或 Worker 报错都 reject（调用方回退主线程）。 */
+function runWorkerTask(handle, kind, payload, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const id = `wt_${++workerTaskSeq}_${Date.now()}`;
+    let timer = null;
+    const done = (fn, arg) => {
+      if (timer) clearTimeout(timer);
+      handle.worker.onmessage = null;
+      handle.worker.onerror = null;
+      fn(arg);
+    };
+    timer = setTimeout(() => done(reject, new Error('Worker 任务超时')), timeoutMs);
+    handle.worker.onerror = (e) => done(reject, new Error(`Worker 出错：${e?.message || '未知错误'}`));
+    handle.worker.onmessage = (e) => {
+      const msg = e?.data || {};
+      if (msg.id !== id) return;
+      if (msg.ok) done(resolve, msg.result);
+      else done(reject, new Error(msg.error || 'Worker 任务失败'));
+    };
+    try {
+      handle.worker.postMessage({ id, kind, payload });
+    } catch (e) {
+      done(reject, e);
+    }
+  });
+}
+
+/** 让出主线程一片（分片执行的片间让步，手机不卡）。 */
+function yieldToMain() {
+  return new Promise((r) => setTimeout(r, 0));
+}
+
+/**
+ * 执行一次检索计算任务：优先 Worker，建不出 Worker 或 Worker 失败时回退到
+ * 主线程分片让步执行（每片限时：build-keyword-postings 每片 50 篇文档、
+ * cosine-scores 每片 200 条向量，片间 await 让步）。
+ * kind: 'build-keyword-postings' | 'cosine-scores'。
+ * options: {createWorker（可注入 fake，默认 createRetrievalWorker）,
+ *   onProgress({done, total, mode}), timeoutMs}。
+ * 返回 {result, mode:'worker'|'main'}；mode 会写进任务记录，进度里注明“主线程模式”。
+ */
+async function executeRetrievalTask(kind, payload, {
+  createWorker = createRetrievalWorker, onProgress, timeoutMs = 30000,
+} = {}) {
+  if (kind !== 'build-keyword-postings' && kind !== 'cosine-scores') {
+    throw new Error(`未知的检索计算任务：${kind}`);
+  }
+  const handle = (() => {
+    try { return createWorker(); } catch { return null; }
+  })();
+  if (handle) {
+    try {
+      const result = await runWorkerTask(handle, kind, payload, timeoutMs);
+      return { result, mode: 'worker' };
+    } catch (e) {
+      // Worker 失败：落到主线程分片回退，不抛错阻断任务。
+      try { console.warn('Worker 任务失败，已回退主线程分片执行：', e); } catch { /* Node 下 console 一定在 */ }
+    } finally {
+      terminateRetrievalWorker(handle);
+    }
+  }
+  // 主线程分片回退。
+  if (kind === 'build-keyword-postings') {
+    const docs = payload?.docs || [];
+    const total = docs.length;
+    const all = { postings: [], docs: total };
+    const byTerm = new Map();
+    for (let i = 0; i < docs.length; i += 50) {
+      const slice = docs.slice(i, i + 50);
+      const part = buildKeywordPostings(slice);
+      for (const row of part.postings) {
+        if (!byTerm.has(row.term)) byTerm.set(row.term, []);
+        byTerm.get(row.term).push(...row.postings);
+      }
+      onProgress?.({ done: Math.min(i + 50, total), total, mode: 'main' });
+      if (i + 50 < docs.length) await yieldToMain();
+    }
+    all.postings = [...byTerm.entries()]
+      .map(([term, list]) => ({ term, postings: list }))
+      .sort((a, b) => (a.term < b.term ? -1 : a.term > b.term ? 1 : 0));
+    return { result: all, mode: 'main' };
+  }
+  const entries = payload?.entries || [];
+  const total = entries.length;
+  const scored = [];
+  for (let i = 0; i < entries.length; i += 200) {
+    const slice = entries.slice(i, i + 200);
+    scored.push(...scoreCosineEntries(payload?.queryVector, slice));
+    onProgress?.({ done: Math.min(i + 200, total), total, mode: 'main' });
+    if (i + 200 < entries.length) await yieldToMain();
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return { result: scored, mode: 'main' };
+}
+
+/* ---------------- 批量任务队列（记忆页） ---------------- */
+
+const MEMORY_JOBS_KEY = 'memoryJobs';
+const MEMORY_JOB_KINDS = ['extract-all', 'backfill-clues', 'rebuild-keyword', 'rebuild-vector'];
+const MEMORY_JOB_LABELS = {
+  'extract-all': '为全部历史提取经历',
+  'backfill-clues': '为旧经历补线索',
+  'rebuild-keyword': '重建关键词索引',
+  'rebuild-vector': '重建向量索引',
+};
+const MEMORY_JOB_SLICE_SIZE = 10;
+
+function jobUid() {
+  return `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 新建任务记录。status: 'pending' | 'running' | 'paused' | 'done' | 'error'；
+ * done/total 是进度（已处理/总数）；phase 是当前阶段文案；mode 是
+ * 'worker' | 'main' | null（main 即主线程模式）；error 是出错信息。
+ * 任务不开机自动跑：只有用户点开始/继续才进入 running。
+ */
+function createMemoryJob(kind, charId, total = 0) {
+  if (!MEMORY_JOB_KINDS.includes(kind)) throw new Error(`未知的批量任务：${kind}`);
+  const now = Date.now();
+  return {
+    id: jobUid(), kind, charId, status: 'pending',
+    done: 0, total, failed: 0, skipped: 0,
+    phase: '', mode: null, error: null, note: '',
+    createdAt: now, updatedAt: now,
+  };
+}
+
+/** 读全部任务记录（settings 'memoryJobs'，{jobId: job}；无记录返回 {}）。 */
+async function loadMemoryJobs(backend) {
+  const row = await backend.get('settings', MEMORY_JOBS_KEY);
+  const v = row?.value;
+  return v && typeof v === 'object' ? { ...v } : {};
+}
+
+/** 写全部任务记录。 */
+async function saveMemoryJobs(backend, jobs) {
+  await backend.put('settings', { key: MEMORY_JOBS_KEY, value: { ...jobs } });
+  return jobs;
+}
+
+/** 单条任务记录写回（读-改-写；队列一次只跑一个任务，不竞态）。 */
+async function persistMemoryJob(backend, job) {
+  const jobs = await loadMemoryJobs(backend);
+  jobs[job.id] = { ...job, updatedAt: Date.now() };
+  await saveMemoryJobs(backend, jobs);
+  return jobs[job.id];
+}
+
+/**
+ * 页面重新打开时：上次还是 running 的任务一定是页面关闭时中断的——绝不假装
+ * 它仍在后台持续运行，改成 paused 并注明“页面关闭时中断”，等用户点继续。
+ * 返回 {jobs, changed}。
+ */
+function markInterruptedJobsPaused(jobs) {
+  const next = { ...(jobs || {}) };
+  let changed = false;
+  for (const job of Object.values(next)) {
+    if (job?.status === 'running') {
+      next[job.id] = {
+        ...job, status: 'paused',
+        note: '页面关闭时中断，未继续运行；点“继续”可接着做。',
+        updatedAt: Date.now(),
+      };
+      changed = true;
+    }
+  }
+  return { jobs: next, changed };
+}
+
+/** 任务给记忆页看的状态文案（含进度与模式）。 */
+function memoryJobStatusText(job) {
+  if (!job) return '';
+  const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+  const state = {
+    pending: '待开始', running: '进行中', paused: '已暂停',
+    done: '已完成', error: '出错',
+  }[job.status] || job.status;
+  const mode = job.mode === 'main' ? '（主线程模式）' : job.mode === 'worker' ? '（Worker 模式）' : '';
+  const tail = job.status === 'done'
+    ? `，失败 ${job.failed || 0} 件，跳过 ${job.skipped || 0} 件`
+    : job.error ? `：${job.error}` : '';
+  return `${state} ${job.done}/${job.total}（${pct}%）${mode}${job.phase ? ` · ${job.phase}` : ''}${tail}`;
+}
+
+/**
+ * 分片跑一个批量任务：items 逐片处理（默认每片 10 件），片间检查 signal、
+ * 写进度、让出主线程。单件失败只计 failed，不阻断整批；processItem 返回
+ * 'skip' 计 skipped。暂停时 status='paused'，已写进度保留；恢复时从
+ * job.done 继续，不重复处理已完成的件。
+ * options: {backend（默认写进度用）, job, items, processItem(item, index),
+ *   onProgress(job), signal {cancelled}, sliceSize=10, saveProgress(job)}。
+ * 返回 {...job, cancelled, failed, skipped}。
+ */
+async function runMemoryJob({
+  backend, job, items, processItem,
+  onProgress, signal, sliceSize = MEMORY_JOB_SLICE_SIZE, saveProgress,
+} = {}) {
+  if (!job) throw new Error('跑批量任务需要任务记录。');
+  const list = items || [];
+  job.total = list.length;
+  job.status = 'running';
+  job.error = null;
+  job.updatedAt = Date.now();
+  const save = saveProgress
+    || (backend ? (j) => persistMemoryJob(backend, j) : null);
+  let failed = job.failed || 0;
+  let skipped = job.skipped || 0;
+  await save?.({ ...job });
+  onProgress?.({ ...job });
+  try {
+    for (let i = job.done; i < list.length;) {
+      if (signal?.cancelled) {
+        job.status = 'paused';
+        job.updatedAt = Date.now();
+        await save?.({ ...job });
+        onProgress?.({ ...job });
+        return { ...job, cancelled: true, failed, skipped };
+      }
+      const slice = list.slice(i, i + Math.max(1, sliceSize));
+      for (const item of slice) {
+        try {
+          const r = await processItem(item, i);
+          if (r === 'skip') skipped++;
+        } catch {
+          failed++;
+        }
+        i++;
+        job.done = i;
+        job.failed = failed;
+        job.skipped = skipped;
+        job.updatedAt = Date.now();
+      }
+      await save?.({ ...job });
+      onProgress?.({ ...job });
+      await yieldToMain();
+    }
+  } catch (e) {
+    job.status = 'error';
+    job.error = e?.message || String(e);
+    job.updatedAt = Date.now();
+    await save?.({ ...job });
+    onProgress?.({ ...job });
+    throw e;
+  }
+  job.status = 'done';
+  job.failed = failed;
+  job.skipped = skipped;
+  job.updatedAt = Date.now();
+  await save?.({ ...job });
+  onProgress?.({ ...job });
+  return { ...job, cancelled: false, failed, skipped };
+}
+
+/** 这件经历是否需要补线索：无线索，或线索的 evidenceVersion 已过期（version 不符）。 */
+function experienceNeedsClues(exp) {
+  if (!exp) return false;
+  const version = exp?.version;
+  const valid = (exp?.clues || []).filter((c) => c && c.evidenceVersion === version);
+  return valid.length === 0;
+}
+
+/**
+ * 整角色删除时的检索残留清理：该角色的 experiences、keywordIndex 记录与
+ * vectorChunks 一起清掉（复用 deleteSpaceIndex / deleteJournalIndex 的模式：
+ * 按 charId 过滤、逐条删）。返回各路清掉的数量。
+ */
+async function cleanupCharacterRetrievalData(backend, charId) {
+  if (!charId) return { experiences: 0, keywordIndex: 0, vectorChunks: 0 };
+  const counts = { experiences: 0, keywordIndex: 0, vectorChunks: 0 };
+  for (const e of (await backend.getAll('experiences')).filter((x) => x?.charId === charId)) {
+    await backend.delete('experiences', e.id);
+    counts.experiences++;
+  }
+  for (const r of (await backend.getAll('keywordIndex')).filter((x) => x?.charId === charId)) {
+    await backend.delete('keywordIndex', r.id);
+    counts.keywordIndex++;
+  }
+  for (const c of (await backend.getAll('vectorChunks')).filter((x) => x?.charId === charId)) {
+    await backend.delete('vectorChunks', c.id);
+    counts.vectorChunks++;
+  }
+  return counts;
+}
+
 /* ===== js/storage.js ===== */
 // storage.js — 持久化（storageAdapter）。
 // IndexedDB 分表保存：characters / worldBooks / stickers / journals / messages /
-// attachments / statusTemplates / settings / unknown。消息按记录增量写入，
-// 绝不每发一条就全量 JSON 覆写；localStorage 只放很小的偏好。
+// attachments / statusTemplates / settings / unknown / experiences / keywordIndex /
+// wakeScenes / wakeAlarms / wakeReceipts。
+// 消息按记录增量写入，绝不每发一条就全量 JSON 覆写；localStorage 只放很小的偏好。
 // schema 升级不清空数据库。Node 测试用 MemoryBackend 实现同一接口。
 
 const DB_NAME = 'uwu-chat-db';
-const DB_VERSION = 1;
+const DB_VERSION = 4;
+
+/** B 组设置键（settings 表的 key）：通知 / 音频保活 / 推送 / 自定义图标 / 唤醒。 */
+const B_GROUP_SETTINGS_KEYS = ['notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings'];
+/** B 组未读计数键（settings 表的 key，值 { charId: count }，见 inAppNotify.js）。 */
+const NOTIFY_UNREAD_SETTINGS_KEY = 'notifyUnread';
 const PAGE_SIZE = 50;
 
 /** 内存后端：与 IDB 后端同一接口，供 Node 测试与 3 万条合成验证使用。 */
@@ -1461,12 +5383,14 @@ class MemoryBackend {
       characters: new Map(), worldBooks: new Map(), stickers: new Map(),
       journals: new Map(), messages: new Map(), attachments: new Map(),
       statusTemplates: new Map(), settings: new Map(), unknown: new Map(),
+      vectorChunks: new Map(), experiences: new Map(), keywordIndex: new Map(),
+      wakeScenes: new Map(), wakeAlarms: new Map(), wakeReceipts: new Map(),
     };
     this.msgOrder = []; // {id, charId, timestamp} 按写入顺序
   }
   async init() { return this; }
   async put(table, value) {
-    const key = value.id ?? value.key;
+    const key = value.id ?? value.key ?? value.wakeId; // wakeReceipts 以 wakeId 为键
     this.tables[table].set(key, structuredClone(value));
     if (table === 'messages') this.msgOrder.push({ id: value.id, charId: value.charId, timestamp: value.timestamp });
     return key;
@@ -1508,6 +5432,74 @@ class MemoryBackend {
     const { messages } = await this.getMessagesPage(charId, { before: Infinity, limit: Number.MAX_SAFE_INTEGER });
     return messages;
   }
+  /** 只取当前角色 + 当前索引空间的向量段（不加载全库）。 */
+  async getVectorChunks(charId, spaceKey) {
+    return [...this.tables.vectorChunks.values()]
+      .filter((c) => c.charId === charId && c.spaceKey === spaceKey)
+      .map((v) => structuredClone(v));
+  }
+}
+
+/**
+ * v1→v2 迁移：只新增 vectorChunks 表（keyPath id，索引 byCharSpace / byJournal），
+ * 绝不重建、不清空已有表；老库（只有 journals 等旧表）升级后旧数据原样保留。
+ * 导出供测试用假 db 验证迁移逻辑；IDBBackend.open 的 onupgradeneeded 也走它。
+ */
+function ensureVectorStores(db) {
+  if (!db.objectStoreNames.contains('vectorChunks')) {
+    const s = db.createObjectStore('vectorChunks', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byCharSpace', ['charId', 'spaceKey'], { unique: false });
+      s.createIndex('byJournal', 'journalId', { unique: false });
+    }
+  }
+  return db;
+}
+
+/**
+ * v2→v3 迁移：只新增 experiences 表（keyPath id，索引 byChar [charId, timestamp]）
+ * 与 keywordIndex 空表（keyPath id，索引 byChar [charId, term]），绝不重建、
+ * 不清空已有表；老库升级后旧数据原样保留。本波只建表不写数据：
+ * experiences 由经历提取写入，keywordIndex 的倒排数据由第 2 波写入。
+ * 导出供测试用假 db 验证迁移逻辑；IDBBackend.open 的 onupgradeneeded 也走它。
+ */
+function ensureExperienceStores(db) {
+  if (!db.objectStoreNames.contains('experiences')) {
+    const s = db.createObjectStore('experiences', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byChar', ['charId', 'timestamp'], { unique: false });
+    }
+  }
+  if (!db.objectStoreNames.contains('keywordIndex')) {
+    const s = db.createObjectStore('keywordIndex', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byChar', ['charId', 'term'], { unique: false });
+    }
+  }
+  return db;
+}
+
+/**
+ * v3→v4 迁移：只新增 wakeScenes / wakeAlarms / wakeReceipts 三张表（与
+ * js/wakeEngine.js 的 ensureWakeStores 同一建表逻辑，本函数是 storage.js
+ * 内的独立实现，不 import wakeEngine，避免循环依赖），绝不重建、不清空
+ * 已有表；老库升级后旧数据原样保留。wakeReceipts 以 wakeId 为 keyPath。
+ * 导出供测试用假 db 验证迁移逻辑；IDBBackend.open 的 onupgradeneeded 也走它。
+ */
+function ensureWakeStores(db) {
+  if (!db.objectStoreNames.contains('wakeScenes')) {
+    const s = db.createObjectStore('wakeScenes', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byChar', ['charId', 'nextAt'], { unique: false });
+      s.createIndex('byStatus', ['status', 'nextAt'], { unique: false });
+    }
+  }
+  if (!db.objectStoreNames.contains('wakeAlarms')) {
+    const s = db.createObjectStore('wakeAlarms', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') s.createIndex('byChar', ['charId', 'at'], { unique: false });
+  }
+  if (!db.objectStoreNames.contains('wakeReceipts')) db.createObjectStore('wakeReceipts', { keyPath: 'wakeId' });
+  return db;
 }
 
 /** 浏览器 IndexedDB 后端。 */
@@ -1532,6 +5524,9 @@ class IDBBackend {
         if (!db.objectStoreNames.contains('statusTemplates')) db.createObjectStore('statusTemplates', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'key' });
         if (!db.objectStoreNames.contains('unknown')) db.createObjectStore('unknown', { keyPath: 'key' });
+        ensureVectorStores(db);
+        ensureExperienceStores(db);
+        ensureWakeStores(db);
       };
       req.onsuccess = () => { this.db = req.result; resolve(this.db); };
       req.onerror = () => reject(req.error);
@@ -1547,7 +5542,7 @@ class IDBBackend {
       t.onabort = () => reject(t.error || new Error('transaction aborted'));
     }));
   }
-  async put(table, value) { await this.tx(table, 'readwrite', (s) => s.put(structuredClone(value))); return value.id ?? value.key; }
+  async put(table, value) { await this.tx(table, 'readwrite', (s) => s.put(structuredClone(value))); return value.id ?? value.key ?? value.wakeId; }
   async putMany(table, values) {
     await this.tx(table, 'readwrite', (s) => { for (const v of values) s.put(structuredClone(v)); });
   }
@@ -1567,6 +5562,16 @@ class IDBBackend {
   }
   async delete(table, key) { await this.tx(table, 'readwrite', (s) => s.delete(key)); }
   async clear(table) { await this.tx(table, 'readwrite', (s) => s.clear()); }
+  /** 只取当前角色 + 当前索引空间的向量段（走 byCharSpace 索引，不加载全库）。 */
+  async getVectorChunks(charId, spaceKey) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const idx = db.transaction('vectorChunks', 'readonly').objectStore('vectorChunks').index('byCharSpace');
+      const req = idx.getAll(IDBKeyRange.only([charId, spaceKey]));
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
   async countMessages(charId) {
     const db = await this.open();
     return new Promise((resolve, reject) => {
@@ -1634,6 +5639,2413 @@ async function saveStatusTemplate(backend, panel) {
   return { id, version };
 }
 
+/* ===== js/chatCenter.js ===== */
+// chatCenter.js — 聊天记录中心（B 组）：搜索 / 消息收藏 / 按日期查看的
+// 纯逻辑与渲染字符串。
+// 只依赖 utils，不 import A 组模块；A 组函数（searchChatMessages /
+// listFavoriteMessages / getMessageText / getChatDates / messagesForDay）
+// 由 app.js 在调用点传入——A 模块未落盘时本模块在 Node 测试里仍可解析。
+// 渲染只产 HTML 字符串，事件接线在 app.js 里做委托；样式见 styles.css
+// 的「B 组：聊天记录中心」一段，黑白灰，沿用 .subpage / .setting-row。
+
+/** 搜索与收藏列表的每页条数（与 A 组契约默认值一致）。 */
+const SEARCH_PAGE_SIZE = 30;
+const FAVORITES_PAGE_SIZE = 30;
+
+/** 消息类型筛选选项（value 与 A 组契约的 kind 一致）。 */
+const CHAT_CENTER_TYPES = [
+  { value: 'text', label: '文本' },
+  { value: 'sticker', label: '表情包' },
+  { value: 'image', label: '图片' },
+  { value: 'voice', label: '语音' },
+  { value: 'transfer', label: '转账' },
+  { value: 'gift', label: '礼物' },
+  { value: 'quote', label: '引用' },
+  { value: 'status', label: '状态' },
+];
+
+const KIND_LABELS = Object.fromEntries(CHAT_CENTER_TYPES.map((t) => [t.value, t.label]));
+
+/** 'YYYY-MM-DD'（本机时区）→ 当天起止时间戳，与 A 组 dayBounds 同口径。
+ *  非法日期返回 null（调用方当作不过滤这一项，不抛错）。
+ *  转换必须在这里做：A 组契约要求 dateFrom/dateTo 是时间戳，UI 日期输入
+ *  给的是字符串，直接透传会在 messageMatchesFilters 里与 NaN 比较、
+ *  把全部消息滤掉（集成验证 2c 实测：11-18 当天 28 条 → 0 条）。 */
+function dateStrToDayStart(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0);
+  if (d.getFullYear() !== Number(m[1]) || d.getMonth() !== Number(m[2]) - 1 || d.getDate() !== Number(m[3])) return null;
+  return d.getTime();
+}
+function dateStrToDayEnd(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999);
+  if (d.getFullYear() !== Number(m[1]) || d.getMonth() !== Number(m[2]) - 1 || d.getDate() !== Number(m[3])) return null;
+  return d.getTime();
+}
+
+/** UI 筛选状态 → 传给 A 组 searchChatMessages 的 filters。
+ *  sender 'all'、空日期、空类型都不传（不等于不过滤，等于不过滤这一项）；
+ *  keyword 始终传（去首尾空白后，空串表示不限关键词）。
+ *  日期输入是 'YYYY-MM-DD' 字符串，这里转成本机时区当天起止时间戳再传，
+ *  与 A 组 messageMatchesFilters 的时间戳比较口径一致。 */
+function buildSearchFilters(state) {
+  const keyword = String(state?.keyword ?? '').trim();
+  const sender = state?.sender === 'me' || state?.sender === 'ai' ? state.sender : null;
+  const dateFrom = dateStrToDayStart(state?.dateFrom);
+  const dateTo = dateStrToDayEnd(state?.dateTo);
+  const types = [...new Set(state?.types || [])]
+    .filter((t) => KIND_LABELS[t]);
+  const out = { keyword };
+  if (sender) out.sender = sender;
+  if (dateFrom != null) out.dateFrom = dateFrom;
+  if (dateTo != null) out.dateTo = dateTo;
+  if (types.length) out.types = types;
+  return out;
+}
+
+/** 防抖（搜索框默认 300ms）：只执行最后一次调用。 */
+function debounce(fn, ms = 300) {
+  let timer = null;
+  return (...args) => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; fn(...args); }, ms);
+  };
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+/** 本机时区日期时间：YYYY-MM-DD HH:mm。 */
+function formatChatCenterDate(timestamp) {
+  const d = new Date(timestamp);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** 本机时区日期：YYYY-MM-DD（与 A 组 getChatDates 的口径一致）。 */
+function localDateStr(timestamp) {
+  const d = new Date(timestamp);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function senderLabel(sender, myName, charName) {
+  if (sender === 'me') return myName || '我';
+  if (sender === 'ai') return charName || '对方';
+  return sender || '';
+}
+
+/** 片段高亮：按 matchRanges 把命中区间包进 <mark>。
+ *  matchRanges 接受 [{start,end}] 或 [[start,end]] 两种写法；
+ *  区间先排序、夹到片段长度内、重叠的合并；片段本身先转义，绝不原样插 HTML。 */
+function highlightSnippet(snippet, matchRanges) {
+  const text = String(snippet ?? '');
+  const ranges = (matchRanges || [])
+    .map((r) => (Array.isArray(r) ? { start: r[0], end: r[1] } : { start: r.start, end: r.end }))
+    .map((r) => ({ start: Math.max(0, Math.min(text.length, r.start | 0)), end: Math.max(0, Math.min(text.length, r.end | 0)) }))
+    .filter((r) => r.end > r.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    else merged.push({ ...r });
+  }
+  if (!merged.length) return escapeHtml(text);
+  let out = '';
+  let pos = 0;
+  for (const r of merged) {
+    out += escapeHtml(text.slice(pos, r.start));
+    out += `<mark>${escapeHtml(text.slice(r.start, r.end))}</mark>`;
+    pos = r.end;
+  }
+  out += escapeHtml(text.slice(pos));
+  return out;
+}
+
+function resultMetaHTML(r, myName, charName) {
+  return `<div class="cc-result-meta"><span>${escapeHtml(formatChatCenterDate(r.timestamp))}</span>`
+    + `<span>${escapeHtml(senderLabel(r.sender, myName, charName))}</span>`
+    + (r.kind ? `<span>${escapeHtml(KIND_LABELS[r.kind] || r.kind)}</span>` : '')
+    + `</div>`;
+}
+
+/** 一条搜索结果（相同文案分条列出：每条按真实消息 id 渲染，绝不按文案去重）。 */
+function searchResultItemHTML(r, myName, charName) {
+  return `<div class="cc-result" data-id="${escapeHtml(String(r.id))}" data-kind="${escapeHtml(String(r.kind || ''))}">`
+    + resultMetaHTML(r, myName, charName)
+    + `<div class="cc-result-snippet">${highlightSnippet(r.snippet || '', r.matchRanges || [])}</div></div>`;
+}
+
+/** 一条收藏消息：查看上下文 / 取消收藏 / 保存为记忆三个操作。 */
+function favoriteItemHTML(r, myName, charName) {
+  return `<div class="cc-result cc-fav" data-id="${escapeHtml(String(r.id))}" data-kind="${escapeHtml(String(r.kind || ''))}">`
+    + resultMetaHTML(r, myName, charName)
+    + `<div class="cc-result-snippet">${escapeHtml(r.snippet || '')}</div>`
+    + `<div class="cc-actions-row"><button data-cc-act="view" data-id="${escapeHtml(String(r.id))}">查看上下文</button>`
+    + `<button data-cc-act="unfav" data-id="${escapeHtml(String(r.id))}">取消收藏</button>`
+    + `<button data-cc-act="save-memory" data-id="${escapeHtml(String(r.id))}">保存为记忆</button></div></div>`;
+}
+
+/** 月份平移（month 为 0-11），返回 { year, month }。 */
+function shiftMonth(year, month, delta) {
+  const d = new Date(year, month + delta, 1);
+  return { year: d.getFullYear(), month: d.getMonth() };
+}
+
+/** 某月的日历格（周一起始）：weeks 是 7 列的行数组，格子为 null（空白）
+ *  或 { dateStr: 'YYYY-MM-DD', day, hasRecords }；只有真实有记录的
+ *  日期 hasRecords 为 true，其余日期渲染时置灰不可点。 */
+function buildCalendarMonth(year, month, dateSet) {
+  const first = new Date(year, month, 1);
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const lead = (first.getDay() + 6) % 7; // 周一为每周第一列
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dateStr = `${year}-${pad2(month + 1)}-${pad2(d)}`;
+    cells.push({ dateStr, day: d, hasRecords: dateSet.has(dateStr) });
+  }
+  while (cells.length % 7 !== 0) cells.push(null);
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  return { year, month, weeks };
+}
+
+/** 日历 HTML：有记录的日期是可点按钮，无记录的置灰 disabled。 */
+function calendarMonthHTML(cal) {
+  const head = ['一', '二', '三', '四', '五', '六', '日']
+    .map((w) => `<span class="cc-cal-weekday">${w}</span>`).join('');
+  const body = cal.weeks.map((week) => week.map((cell) => {
+    if (!cell) return '<span class="cc-cal-day cc-cal-blank"></span>';
+    if (!cell.hasRecords) return `<span class="cc-cal-day" aria-disabled="true">${cell.day}</span>`;
+    return `<button class="cc-cal-day cc-cal-has" data-date="${escapeHtml(cell.dateStr)}">${cell.day}</button>`;
+  }).join('')).join('');
+  return `<div class="cc-cal-grid"><div class="cc-cal-row cc-cal-head">${head}</div>${body}</div>`;
+}
+
+/** 取消一条消息的收藏（只改消息的 isFavorite，不动记忆收藏的 isFavorited）。 */
+async function unfavoriteMessage(backend, messageId) {
+  const m = await backend.get('messages', messageId);
+  if (!m) return null;
+  m.isFavorite = false;
+  await backend.put('messages', m);
+  return m;
+}
+
+/** 手动把一条消息存为记忆：只在用户点「保存为记忆」时调用，绝不自动建。
+ *  content 为消息文本（A 组 getMessageText），并带 sourceMessageId；
+ *  isFavorited 保持 false——消息收藏与记忆收藏是两套，互不混淆。
+ *  调用方随后走 attachJournals + scheduleReindexDocument（与手动建记忆同链路）。 */
+async function saveMessageAsMemory(backend, charId, msg, getText) {
+  const raw = typeof getText === 'function' ? await getText(msg) : (msg?.content || '');
+  const text = String(raw || '').trim();
+  const journal = {
+    id: uid('journal'),
+    charId,
+    title: text ? text.slice(0, 24) : '聊天消息',
+    content: text,
+    source: '聊天记录',
+    sourceMessageId: msg.id,
+    isFavorited: false,
+    retrievalEnabled: true,
+    timestamp: Date.now(),
+  };
+  await backend.put('journals', journal);
+  return journal;
+}
+
+/** 按日期跳当天首条：messagesForDay 每页取当天最新的 limit 条再翻成页内正序，
+ *  所以首条不在第一页——要顺着 nextCursor 往更旧翻到最后一页，取其第一条。
+ *  pageSize 默认 500，减少长日期的翻页次数；游标重复或 200 页封顶时停下。
+ *  当天无消息返回 null。 */
+async function findFirstMessageOfDay(messagesForDayFn, backend, charId, dateStr, { pageSize = 500, maxPages = 200 } = {}) {
+  let cursor = null;
+  let first = null;
+  const seenCursors = new Set();
+  for (let page = 0; page < maxPages; page++) {
+    const res = await messagesForDayFn(backend, charId, dateStr, { limit: pageSize, cursor });
+    const list = res?.results || (Array.isArray(res) ? res : []);
+    if (list.length) first = list[0]; // 越往后的页越旧，首条以最后一页为准
+    const next = res?.nextCursor ?? null;
+    if (!next || seenCursors.has(next)) break;
+    seenCursors.add(next);
+    cursor = next;
+  }
+  return first;
+}
+
+/** 消息定位的核心循环（app.js jumpToMessage 与 openChatForBanner 共用，
+ *  不另写第二套定位逻辑）。
+ *  deps：backend/charId/messageId；findTarget(id) 在已渲染 DOM 里找气泡；
+ *  renderLatest() 全量渲染最新一页（renderMessages(false)）；
+ *  renderOlder() 再往前翻一页，返回 { hasMore, oldest }；
+ *  scrollTo/highlight/onMissing 由调用方接 DOM。
+ *  找不到消息记录时直接报 missing；翻页到 oldest 不再变小（同时间戳分页
+ *  边界）或 hasMore 为 false 时停下，不死循环。 */
+async function runJumpToMessage({
+  backend, charId, messageId,
+  findTarget, renderLatest, renderOlder, scrollTo, highlight, onMissing,
+  maxPages = 200,
+}) {
+  const msg = await backend.get('messages', messageId);
+  if (!msg) { onMissing?.(); return { ok: false, reason: 'missing' }; }
+  let target = findTarget(messageId);
+  if (!target) {
+    await renderLatest();
+    target = findTarget(messageId);
+  }
+  let pagesLoaded = 0;
+  const seenOldest = new Set();
+  while (!target && pagesLoaded < maxPages) {
+    const { hasMore, oldest } = await renderOlder();
+    pagesLoaded++;
+    target = findTarget(messageId); // 先查目标：最后一页（hasMore 为 false）也可能正好含目标
+    if (target || !hasMore) break;
+    if (oldest !== null && oldest !== undefined) {
+      if (seenOldest.has(oldest)) break; // 分页边界不再前进
+      seenOldest.add(oldest);
+    }
+  }
+  if (!target) { onMissing?.(); return { ok: false, reason: 'not-rendered' }; }
+  scrollTo(target);
+  highlight(target);
+  return { ok: true, timestamp: msg.timestamp, pagesLoaded };
+}
+
+/* ===== js/chatSearch.js ===== */
+// chatSearch.js — 聊天记录中心：数据层（A 组）。
+// 纯函数 + backend 注入，不 import app.js；聊天搜索不建倒排索引，
+// 用 backend.getMessagesPage 按 byChar 索引分批扫 + 文本匹配。
+// 中文分词复用 js/keywordSearch.js 的 tokenize（CJK bigram + 全词），
+// 只用来辅助定位命中位置，是否命中以子串匹配为准（单字中文也能命中）。
+// 每次调用都重新扫库，不做跨调用的结果缓存（编辑/删除后重查即更新）。
+
+/** 搜索每批扫的消息条数（getMessagesPage 一次取的上限）。 */
+const SEARCH_BATCH_SIZE = 100;
+/** 收藏列表每批扫的消息条数。 */
+const FAVORITES_BATCH_SIZE = 100;
+/** 日期枚举每批扫的消息条数。 */
+const CHAT_DATES_BATCH_SIZE = 200;
+
+/** 被撤回消息的可见占位文本（界面显示“你撤回了一则讯息”，原文不参与搜索）。 */
+const WITHDRAWN_PLACEHOLDER = '你撤回了一则讯息';
+
+/** snippet 命中前后各截的字数；无关键词时 snippet 取正文前 80 字。 */
+const SNIPPET_CONTEXT = 40;
+const SNIPPET_HEAD = 80;
+
+// ---------- 发送者 / 类型归一化 ----------
+
+/** role/sender 归一化为 'me' | 'ai'。消息记录以 role 为主（user/assistant），sender 字段为辅。 */
+function normalizeSender(msg) {
+  const s = String(msg?.sender || '').toLowerCase();
+  if (s === 'me' || s === 'user' || s === 'user_me') return 'me';
+  if (s === 'ai' || s === 'assistant' || s === 'model') return 'ai';
+  return msg?.role === 'user' ? 'me' : 'ai';
+}
+
+const KIND_ALIASES = {
+  photo: 'image',
+  stickerunknown: 'sticker',
+  withdraw: 'text',
+  bilingual: 'text',
+  mixed: 'text',
+  html: 'status',
+  forward: 'text',
+  transferresponse: 'transfer',
+  giftresponse: 'gift',
+};
+
+/** 内容里的协议壳（不需要角色名即可判定，供 kind 推断与文本抽取共用）。 */
+const PROTOCOL_RE = {
+  sticker: /的表情包[：:]/,
+  photo: /发来的照片\/视频[：:]/,
+  voice: /的语音[：:]/,
+  transfer: /的转账[：:]/,
+  gift: /送来的礼物[：:]/,
+  status: /更新状态为[：:]/,
+  giftResponse: /已接收礼物/,
+  transferResponse: /(?:接收|退回).{0,20}的转账/,
+  quote: /引用["“][\s\S]*?["”]并回复[：:]/,
+  withdraw: /撤回了一条消息[：:]/,
+  message: /的消息[：:]/,
+};
+
+/**
+ * kind 归一化：优先用记录自带的 kind / parsedKind（parsedKind 在现有源码里
+ * 尚未出现，仍按契约当作候补字段支持）；没有时按 parts 与协议内容推断；
+ * photo 统一成 image，withdraw / bilingual / mixed 统一成 text。
+ */
+function normalizeKind(msg) {
+  if (!msg || typeof msg !== 'object') return 'text';
+  const raw = msg.kind ?? msg.parsedKind;
+  if (typeof raw === 'string' && raw.trim()) {
+    const key = raw.trim().toLowerCase();
+    return KIND_ALIASES[key] || raw.trim();
+  }
+  if (msg.isWithdrawn) return 'text'; // 可见的只是撤回占位文本
+  if (msg.isStatusUpdate) return 'status';
+  const parts = Array.isArray(msg.parts) ? msg.parts : [];
+  if (parts.some((p) => p?.type === 'image')) return 'image';
+  const content = typeof msg.content === 'string' ? msg.content : '';
+  if (PROTOCOL_RE.sticker.test(content)) return 'sticker';
+  if (PROTOCOL_RE.photo.test(content)) return 'image';
+  if (PROTOCOL_RE.voice.test(content)) return 'voice';
+  if (PROTOCOL_RE.transfer.test(content) || PROTOCOL_RE.transferResponse.test(content)) return 'transfer';
+  if (PROTOCOL_RE.gift.test(content) || PROTOCOL_RE.giftResponse.test(content)) return 'gift';
+  if (PROTOCOL_RE.status.test(content)) return 'status';
+  if (PROTOCOL_RE.quote.test(content) || msg.quote) return 'quote';
+  return 'text';
+}
+
+// ---------- 可搜索纯文本 ----------
+
+/** 去掉 data: URI（base64 图片数据绝不进搜索文本）。 */
+const DATA_URI_RE = /data:[a-zA-Z]+\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g;
+/** 非文本协议段：表情包 / 照片 / 语音 / 转账 / 礼物 / 状态更新，整段剔除。 */
+const NON_TEXT_PROTOCOL_RE = /\[[^\]\n]*?(?:的表情包|发来的照片\/视频|的语音|的转账|送来的礼物|更新状态为)[：:][^\]\n]*?\]/g;
+const RECEIPT_PROTOCOL_RE = /\[[^\]\n]*?(?:已接收礼物|接收[^\]\n]*?的转账|退回[^\]\n]*?的转账)\]/g;
+/** 引用协议只留回复正文；普通消息协议只留冒号后的正文。 */
+const QUOTE_PROTOCOL_RE = /\[[^\]\n]*?引用["“][\s\S]*?["”]并回复[：:]([\s\S]*?)\]/g;
+const MESSAGE_PROTOCOL_RE = /\[[^\]\n]*?的消息[：:]([\s\S]*?)\]/g;
+
+/**
+ * 从一条消息记录抽可搜索纯文本。
+ * 只取文本类内容（parts[].text / content）；排除 base64 图片数据、HTML/CSS
+ * 状态模板、系统提示词、<thinking> 推理内容、协议壳本身；被撤回消息只按
+ * 可见占位文本算（原文存在 originalContent / content 里也不算）。
+ * 无文本的消息返回 ''，这类消息只能靠类型/日期筛选命中，不能靠关键词命中。
+ */
+function getMessageText(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+  if (msg.isWithdrawn) return WITHDRAWN_PLACEHOLDER;
+  if (msg.isStatusUpdate || msg.isThinking) return '';
+  let raw = '';
+  if (Array.isArray(msg.parts) && msg.parts.length) {
+    // 只取 type==='text' 的 parts：image part 的 base64、html part 的状态模板都不取。
+    raw = msg.parts
+      .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+      .map((p) => p.text).join('');
+  }
+  if (!raw && typeof msg.content === 'string') raw = msg.content;
+  if (!raw) return '';
+  let t = String(raw);
+  t = t.replace(DATA_URI_RE, '');
+  t = t.replace(/<thinking>[\s\S]*?<\/thinking>/gi, ''); // 推理内容不参与搜索
+  t = t.replace(/\[\/?inner_voice\]/gi, ''); // 只去标签本身，心声正文保留
+  t = t.replace(/\[system:[^\]\n]*\]/gi, ''); // 系统提示词不参与搜索
+  const trimmed = t.trim();
+  // 无 isWithdrawn 标记、但内容本身就是撤回协议的旧数据：同样只按占位算。
+  if (/^\[[^\]\n]*?撤回了一条消息[：:][\s\S]*\]$/.test(trimmed)) return WITHDRAWN_PLACEHOLDER;
+  t = t.replace(NON_TEXT_PROTOCOL_RE, '');
+  t = t.replace(RECEIPT_PROTOCOL_RE, '');
+  t = t.replace(QUOTE_PROTOCOL_RE, '$1');
+  t = t.replace(MESSAGE_PROTOCOL_RE, '$1');
+  const tt = t.trim();
+  // 整段就是 HTML 文档/状态模板（<div>/<style>/<html> 开头且含闭合标签）：不算文本。
+  if (/^<(?:html|div|style|span|template)\b/i.test(tt) && /<\/[a-zA-Z][^<>]*>/.test(tt)) return '';
+  t = t.replace(/<\/?[a-zA-Z][^<>\n]{0,80}>/g, ''); // 残留的 HTML 标签碎片
+  return t.replace(/\s+/g, ' ').trim();
+}
+
+// ---------- 关键词命中位置 ----------
+
+function allOccurrences(lowerText, lowerNeedle) {
+  const out = [];
+  if (!lowerNeedle) return out;
+  let i = 0;
+  for (;;) {
+    const j = lowerText.indexOf(lowerNeedle, i);
+    if (j === -1) return out;
+    out.push([j, j + lowerNeedle.length]);
+    i = j + Math.max(1, lowerNeedle.length);
+  }
+}
+
+/** 去掉被别的 term 包含的子 term（全词串留，bigram 去），只留“最大词”。 */
+function maximalTerms(terms) {
+  const uniq = [...new Set((terms || []).filter((t) => typeof t === 'string' && t.length >= 2))];
+  return uniq.filter((t) => !uniq.some((u) => u !== t && u.includes(t)));
+}
+
+function mergeRanges(ranges) {
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const out = [];
+  for (const [s, e] of sorted) {
+    const last = out[out.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else out.push([s, e]);
+  }
+  return out;
+}
+
+/**
+ * 关键词在文本中的命中区间（相对文本本身的 [start, end) 字符偏移）。
+ * 命中规则：① 原关键词子串（英文大小写不敏感，中文子串，单字也命中）；
+ * ② 原子串没命中时，tokenize 的全部“最大词”都出现才算命中（多词 AND，
+ * 如“海边 日落”；bigram 不单独算命中，避免“我们”这类词误召回）。
+ * 返回 [] 表示不命中。
+ */
+function findKeywordRanges(text, keyword) {
+  const t = String(text || '');
+  const kw = String(keyword ?? '').trim();
+  if (!t || !kw) return [];
+  const lower = t.toLowerCase();
+  const lowerKw = kw.toLowerCase();
+  const raw = allOccurrences(lower, lowerKw);
+  if (raw.length) {
+    // 原子串命中：再把 token 命中位置并进来，方便高亮覆盖分词切出的词。
+    return mergeRanges([...raw, ...tokenize(kw).flatMap((term) => allOccurrences(lower, term.toLowerCase()))]);
+  }
+  const terms = maximalTerms(tokenize(kw));
+  if (!terms.length) return [];
+  if (!terms.every((term) => lower.includes(term.toLowerCase()))) return [];
+  return mergeRanges(terms.flatMap((term) => allOccurrences(lower, term.toLowerCase())));
+}
+
+/** 按第一处命中前后各截约 40 字；无命中区间时取正文前 80 字。matchRanges 相对 snippet。 */
+function buildSnippet(text, ranges) {
+  const t = String(text || '');
+  if (!ranges?.length) return { snippet: t.slice(0, SNIPPET_HEAD), matchRanges: [] };
+  const first = ranges[0];
+  const start = Math.max(0, first[0] - SNIPPET_CONTEXT);
+  const end = Math.min(t.length, first[1] + SNIPPET_CONTEXT);
+  const snippet = t.slice(start, end);
+  const matchRanges = ranges
+    .map(([s, e]) => [Math.max(s, start) - start, Math.min(e, end) - start])
+    .filter(([s, e]) => e > s);
+  return { snippet, matchRanges };
+}
+
+// ---------- 过滤器（纯函数） ----------
+
+/**
+ * 纯函数：一条消息是否命中 filters。
+ * filters = { keyword, sender, dateFrom, dateTo, types }。
+ * sender 为 'me' | 'ai' | 'all'（'all'/空 = 不筛选）；dateFrom/dateTo 为
+ * 时间戳（含端点）；types 为 kind 数组（空 = 全部）。
+ */
+function messageMatchesFilters(msg, filters = {}) {
+  if (!msg || typeof msg !== 'object') return false;
+  const f = filters || {};
+  const ts = Number(msg.timestamp);
+  if (f.dateFrom != null && !(ts >= f.dateFrom)) return false;
+  if (f.dateTo != null && !(ts <= f.dateTo)) return false;
+  if (f.sender && f.sender !== 'all' && normalizeSender(msg) !== f.sender) return false;
+  if (Array.isArray(f.types) && f.types.length && !f.types.includes(normalizeKind(msg))) return false;
+  if (typeof f.keyword === 'string' && f.keyword.trim() !== '') {
+    if (!findKeywordRanges(getMessageText(msg), f.keyword).length) return false;
+  }
+  return true;
+}
+
+function toResult(msg, charId, keyword) {
+  const text = getMessageText(msg);
+  const { snippet, matchRanges } = typeof keyword === 'string' && keyword.trim() !== ''
+    ? buildSnippet(text, findKeywordRanges(text, keyword))
+    : { snippet: text.slice(0, SNIPPET_HEAD), matchRanges: [] };
+  return {
+    id: msg.id,
+    charId: msg.charId || charId,
+    timestamp: msg.timestamp,
+    sender: normalizeSender(msg),
+    kind: normalizeKind(msg),
+    snippet,
+    matchRanges,
+  };
+}
+
+// ---------- 分批扫描器 ----------
+// 用 backend.getMessagesPage（两后端都有）按 byChar 索引倒序分批扫。
+// 游标是 opaque 字符串：JSON { v:1, before, overlap }，before = 下次取的
+// 时间戳上界（boundaryTs + 1），overlap = 已扫过的、时间戳等于 boundaryTs
+// 的消息条数（同一毫秒的多条消息靠它不断不漏；调用方原样回传即可）。
+// MemoryBackend 同 id 多次 put 会在 msgOrder 留重复行：扫描器按 id 去重，
+// 若一页全是重复行就加大 limit 重取，直到露出新行或取尽。
+
+function decodeCursor(cursor) {
+  if (cursor == null || cursor === '') return { before: Infinity, overlap: 0 };
+  let obj;
+  try { obj = JSON.parse(String(cursor)); } catch { throw new Error('无效的聊天搜索游标。'); }
+  if (!obj || obj.v !== 1
+    || !(obj.before === null || Number.isFinite(obj.before))
+    || !Number.isInteger(obj.overlap) || obj.overlap < 0) {
+    throw new Error('无效的聊天搜索游标。');
+  }
+  return { before: obj.before === null ? Infinity : obj.before, overlap: obj.overlap };
+}
+
+/**
+ * 新建一个倒序（时间新 → 旧，(timestamp, id) 排序）扫描器。
+ * next() 每次吐一条消息（已按 id 去重），扫完返回 null；
+ * cursor() 返回当前可原样回传的游标，扫完返回 null。
+ * batchSize 是每次向 backend 取的页大小（不含 overlap 补偿）。
+ * 后端若没有 getMessagesPage，退化为 getAllMessages 一次读入本角色消息、
+ * 内存内分页（两现有后端都有 getMessagesPage，此分支只是兜底）。
+ */
+function createChatScanner(backend, charId, batchSize = SEARCH_BATCH_SIZE, cursor = null) {
+  if (!backend) throw new Error('聊天扫描需要 backend。');
+  if (!charId) throw new Error('聊天扫描需要 charId。');
+  const size = Math.max(1, Math.floor(batchSize) || SEARCH_BATCH_SIZE);
+  const start = decodeCursor(cursor);
+  // 已吐出的最后一条消息的时间戳（null = 还没吐出任何一条）；countAtBoundary
+  // 是已吐出的、时间戳等于 boundaryTs 的条数（即该毫秒里已扫的最大 id 之前缀）。
+  let boundaryTs = start.before === Infinity ? null : start.before - 1;
+  let countAtBoundary = start.overlap;
+  let buffer = []; // 倒序、未吐出的本批消息
+  let exhausted = false;
+  const seenIds = new Set();
+  let fallbackRows = null; // 兜底分支：本角色消息全量（倒序、按 id 去重后）
+  let fallbackIdx = 0;
+  let fallbackResumed = false;
+
+  function cursorString() {
+    if (exhausted && buffer.length === 0) return null;
+    if (boundaryTs === null) return cursor ?? null;
+    return JSON.stringify({ v: 1, before: boundaryTs + 1, overlap: countAtBoundary });
+  }
+
+  function computeFresh(rows) {
+    let drop = null;
+    if (boundaryTs !== null && countAtBoundary > 0) {
+      // 该毫秒里已扫的 overlap 条是 id 最大的那几条：按 id 倒序取前 overlap 个。
+      const ids = [...new Set(rows.filter((r) => r && r.timestamp === boundaryTs).map((r) => r.id))]
+        .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+      drop = new Set(ids.slice(0, countAtBoundary));
+    }
+    const fresh = [];
+    let seenRowCount = 0;
+    const inPage = new Set(); // 同一页里同 id 的重复行（MemoryBackend 多次 put 留下的）只留一条
+    for (const r of rows) {
+      if (!r || r.id == null || inPage.has(r.id) || (drop && drop.has(r.id)) || seenIds.has(r.id)) { seenRowCount++; continue; }
+      inPage.add(r.id);
+      fresh.push(r);
+    }
+    return { fresh, seenRowCount };
+  }
+
+  async function fetchBatch() {
+    if (exhausted) return;
+    if (typeof backend.getMessagesPage === 'function') {
+      let limit = size + countAtBoundary;
+      for (;;) {
+        const before = boundaryTs === null ? Infinity : boundaryTs + 1;
+        const res = await backend.getMessagesPage(charId, { before, limit });
+        const rows = Array.isArray(res?.messages) ? res.messages : [];
+        const hasMore = !!res?.hasMore;
+        const { fresh, seenRowCount } = computeFresh(rows);
+        if (fresh.length > 0 || !hasMore || rows.length === 0) {
+          for (const m of fresh) seenIds.add(m.id);
+          buffer = fresh.slice().reverse(); // 后端返回正序，扫描器倒序吐出
+          if (!hasMore) exhausted = true;
+          return;
+        }
+        // 一页全是已扫过的重复行：加大 limit 重取，直到露出新行或取尽。
+        limit += Math.max(1, seenRowCount);
+      }
+    }
+    // 兜底：后端没有 getMessagesPage 时，一次读入本角色消息，内存内分页。
+    if (fallbackRows === null) {
+      const all = typeof backend.getAllMessages === 'function'
+        ? await backend.getAllMessages(charId)
+        : await backend.getAll('messages');
+      const deduped = new Map();
+      for (const m of (all || []).filter((x) => x && x.charId === charId)) {
+        if (!deduped.has(m.id)) deduped.set(m.id, m);
+      }
+      fallbackRows = [...deduped.values()]
+        .sort((a, b) => (b.timestamp - a.timestamp) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    }
+    if (!fallbackResumed) {
+      fallbackResumed = true;
+      let skippedAtBoundary = 0;
+      while (fallbackIdx < fallbackRows.length) {
+        const r = fallbackRows[fallbackIdx];
+        if (boundaryTs === null) break;
+        if (r.timestamp > boundaryTs) { fallbackIdx++; continue; }
+        if (r.timestamp === boundaryTs && skippedAtBoundary < countAtBoundary) {
+          skippedAtBoundary++; fallbackIdx++; continue;
+        }
+        break;
+      }
+    }
+    buffer = fallbackRows.slice(fallbackIdx, fallbackIdx + size);
+    fallbackIdx += buffer.length;
+    if (fallbackIdx >= fallbackRows.length) exhausted = true;
+  }
+
+  async function next() {
+    while (buffer.length === 0 && !exhausted) await fetchBatch();
+    const msg = buffer.shift();
+    if (!msg) return null;
+    const ts = Number.isFinite(msg.timestamp) ? msg.timestamp : 0;
+    if (boundaryTs === null || ts < boundaryTs) { boundaryTs = ts; countAtBoundary = 1; }
+    else countAtBoundary += 1; // 同一毫秒：倒序保证不会大于 boundaryTs
+    return msg;
+  }
+
+  return { next, cursor: cursorString };
+}
+
+// ---------- 对外接口 ----------
+
+/**
+ * 搜索当前角色的聊天记录（时间倒序，最新在前）。
+ * opts = { keyword, sender, dateFrom, dateTo, types, limit = 30, cursor = null }。
+ * 返回 { results, nextCursor, scanned }；results 每项为
+ * { id, charId, timestamp, sender, kind, snippet, matchRanges }
+ * （matchRanges 相对 snippet 的字符偏移，供 B 组渲染 <mark> 高亮）。
+ * scanned 为本次调用实际扫过的消息条数。一次调用内部分批循环直到凑满
+ * limit 或扫完；不缓存结果快照，每次调用都重新扫库。
+ */
+async function searchChatMessages(backend, charId, opts = {}) {
+  if (!charId) throw new Error('搜索聊天记录需要 charId。');
+  const {
+    keyword = '', sender, dateFrom, dateTo, types,
+    limit = 30, cursor = null,
+  } = opts || {};
+  const take = Math.max(0, Math.floor(limit) || 0);
+  const filters = { keyword, sender, dateFrom, dateTo, types };
+  const scanner = createChatScanner(backend, charId, SEARCH_BATCH_SIZE, cursor);
+  const results = [];
+  let scanned = 0;
+  for (;;) {
+    if (results.length >= take) break;
+    const msg = await scanner.next();
+    if (!msg) break;
+    scanned += 1;
+    if (messageMatchesFilters(msg, filters)) results.push(toResult(msg, charId, keyword));
+  }
+  return { results, nextCursor: scanner.cursor(), scanned };
+}
+
+/**
+ * 收藏消息列表（时间倒序，最新在前），只含 isFavorite 为真的消息。
+ * journals 的 isFavorited（固定注入提示词的记忆收藏）是另一套，绝不混入。
+ * 返回 { results, nextCursor }；snippet 为正文前 80 字，matchRanges 为 []。
+ */
+async function listFavoriteMessages(backend, charId, { limit = 30, cursor = null } = {}) {
+  if (!charId) throw new Error('查看消息收藏需要 charId。');
+  const take = Math.max(0, Math.floor(limit) || 0);
+  const scanner = createChatScanner(backend, charId, FAVORITES_BATCH_SIZE, cursor);
+  const results = [];
+  for (;;) {
+    if (results.length >= take) break;
+    const msg = await scanner.next();
+    if (!msg) break;
+    if (msg.isFavorite) {
+      const text = getMessageText(msg);
+      results.push({
+        id: msg.id,
+        charId: msg.charId || charId,
+        timestamp: msg.timestamp,
+        sender: normalizeSender(msg),
+        kind: normalizeKind(msg),
+        snippet: text.slice(0, SNIPPET_HEAD),
+        matchRanges: [],
+      });
+    }
+  }
+  return { results, nextCursor: scanner.cursor() };
+}
+
+/* ===== js/chatDates.js ===== */
+// chatDates.js — 聊天记录中心：日期层（A 组）。
+// 纯函数 + backend 注入；日期一律按本机时区划分（本地 getFullYear /
+// getMonth / getDate），不用 UTC。扫描复用 js/chatSearch.js 的分批扫描器。
+
+
+/** 按日取消息时每批扫的消息条数（与搜索同一游标机制）。 */
+const DAY_MESSAGES_BATCH_SIZE = 100;
+/** 无关键词的 snippet 取正文前 80 字。 */
+const DAY_SNIPPET_HEAD = 80;
+
+/** 时间戳 → 本地时区 'YYYY-MM-DD'。 */
+function localDateString(timestamp) {
+  const d = new Date(timestamp);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/**
+ * 返回 ['YYYY-MM-DD', ...] 升序，只含实际存在聊天记录的日期。
+ * 分批扫 messages 表（每批 200 条，只取时间戳做日期归集）。
+ */
+async function getChatDates(backend, charId) {
+  if (!charId) throw new Error('取聊天日期需要 charId。');
+  const scanner = createChatScanner(backend, charId, CHAT_DATES_BATCH_SIZE);
+  const dates = new Set();
+  for (;;) {
+    const msg = await scanner.next();
+    if (!msg) break;
+    if (Number.isFinite(msg.timestamp)) dates.add(localDateString(msg.timestamp));
+  }
+  return [...dates].sort();
+}
+
+/**
+ * 输入 'YYYY-MM-DD'，返回 { start, end } 时间戳：
+ * 本地时区当天 00:00:00.000 到 23:59:59.999。非法日期抛错。
+ */
+function dayBounds(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
+  if (!m) throw new Error('日期格式应为 YYYY-MM-DD。');
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const startDate = new Date(y, mo - 1, d, 0, 0, 0, 0);
+  if (startDate.getFullYear() !== y || startDate.getMonth() !== mo - 1 || startDate.getDate() !== d) {
+    throw new Error('不存在的日期。');
+  }
+  const start = startDate.getTime();
+  const end = new Date(y, mo - 1, d + 1, 0, 0, 0, 0).getTime() - 1;
+  return { start, end };
+}
+
+/**
+ * 返回当天消息（时间正序），每项为轻字段 + snippet
+ * { id, charId, timestamp, sender, kind, snippet, matchRanges }。
+ * 分页：先取当天最新的 limit 条再翻成正序，游标与搜索同一机制，
+ * 原样回传即可接着往更旧的消息翻；扫完 nextCursor 为 null。
+ */
+async function messagesForDay(backend, charId, dateStr, { limit = 50, cursor = null } = {}) {
+  if (!charId) throw new Error('按日取消息需要 charId。');
+  const { start, end } = dayBounds(dateStr);
+  const take = Math.max(0, Math.floor(limit) || 0);
+  const scanner = createChatScanner(backend, charId, DAY_MESSAGES_BATCH_SIZE, cursor);
+  const desc = [];
+  for (;;) {
+    if (desc.length >= take) break;
+    const msg = await scanner.next();
+    if (!msg) break;
+    if (msg.timestamp >= start && msg.timestamp <= end) {
+      desc.push({
+        id: msg.id,
+        charId: msg.charId || charId,
+        timestamp: msg.timestamp,
+        sender: normalizeSender(msg),
+        kind: normalizeKind(msg),
+        snippet: getMessageText(msg).slice(0, DAY_SNIPPET_HEAD),
+        matchRanges: [],
+      });
+    }
+  }
+  return { results: desc.reverse(), nextCursor: scanner.cursor() };
+}
+
+/* ===== js/inAppNotify.js ===== */
+// inAppNotify.js — 站内通知（横幅 + 未读标记）。
+// 纯逻辑 + 描述子（不直接操作 DOM）：集成方（app.js）按返回的 banner
+// 描述子渲染横幅、绑定点击。Node 测试用注入的 env 验证降级逻辑。
+// 规则：仅在用户不在该聊天页时显示；提示音/振动/摘要隐私可设置；
+// 能力不支持时静默跳过并返回降级说明，不假装已提醒。
+
+const NOTIFY_SETTINGS_KEY = 'notifySettings';
+const DEFAULT_NOTIFY_SETTINGS = {
+  bannerEnabled: true,
+  soundEnabled: true,
+  vibrationEnabled: true,
+  hideSummary: false, // 为 true 时摘要只显示“有新消息”
+  unreadBadgeEnabled: true,
+};
+
+/** 仅在用户不在该聊天页时显示（纯函数）。 */
+function shouldShow(currentCharId, msgCharId) {
+  if (!msgCharId) return false;
+  return currentCharId !== msgCharId;
+}
+
+/** 摘要：隐藏模式只显示“有新消息”，不泄露内容。 */
+function formatSummary(msg, settings = {}) {
+  if (settings.hideSummary) return '有新消息';
+  const text = String(msg?.content || msg?.text || '').trim();
+  if (!text) return msg?.type === 'image' ? '[图片]' : msg?.type === 'sticker' ? '[贴纸]' : '有新消息';
+  return text.length > 40 ? `${text.slice(0, 40)}…` : text;
+}
+
+/**
+ * 能力检测（注入 env，便于测试与诚实降级）：
+ * env = { supportsVibration, supportsSound, playSound(), vibrate(pattern) }
+ * 返回 { sound, vibration, degraded: string[] }。
+ */
+function detectNotifyCapabilities(env = {}) {
+  const degraded = [];
+  const sound = env.supportsSound !== false;
+  const vibration = env.supportsVibration === true;
+  if (!sound) degraded.push('当前设备/浏览器不支持提示音，已跳过声音。');
+  if (!vibration) degraded.push('当前设备/浏览器不支持振动，已跳过振动。');
+  return { sound, vibration, degraded };
+}
+
+class InAppNotifier {
+  constructor(opts = {}) {
+    this.settings = { ...DEFAULT_NOTIFY_SETTINGS, ...(opts.settings || {}) };
+    this.env = opts.env || {};
+    this.unread = new Map(); // charId -> count
+    this.banners = []; // 未关闭的 banner 描述子
+    this.onBanner = opts.onBanner || null; // (banner) => void，集成方渲染
+    this.onOpenChat = opts.onOpenChat || null;
+  }
+
+  getUnread(charId) { return this.unread.get(charId) || 0; }
+  getTotalUnread() { let n = 0; for (const v of this.unread.values()) n += v; return n; }
+  markRead(charId) { this.unread.delete(charId); }
+  markAllRead() { this.unread.clear(); }
+
+  /**
+   * 新消息到达时调用。msg = { id, charId, avatar, nickname, content, type }。
+   * 返回 { shown, banner|null, degraded[] }。
+   * 不在该聊天页才显示横幅；未读计数照常累加。
+   */
+  notify(msg, currentCharId) {
+    const degraded = [];
+    if (!msg?.charId) return { shown: false, banner: null, degraded: ['消息缺少角色 id，未显示通知。'] };
+    this.unread.set(msg.charId, this.getUnread(msg.charId) + 1);
+    if (!this.settings.bannerEnabled) return { shown: false, banner: null, degraded: ['站内横幅已关闭，只计未读。'] };
+    if (!shouldShow(currentCharId, msg.charId)) return { shown: false, banner: null, degraded: [] };
+    const caps = detectNotifyCapabilities(this.env);
+    degraded.push(...caps.degraded);
+    if (this.settings.soundEnabled && caps.sound) {
+      try { this.env.playSound?.(); } catch { degraded.push('提示音播放失败，已跳过。'); }
+    }
+    if (this.settings.vibrationEnabled && caps.vibration) {
+      try { this.env.vibrate?.(100); } catch { degraded.push('振动调用失败，已跳过。'); }
+    }
+    const banner = {
+      id: `banner_${msg.id || Date.now()}`,
+      messageId: msg.id || null,
+      charId: msg.charId,
+      avatar: msg.avatar || '',
+      nickname: msg.nickname || '对方',
+      summary: formatSummary(msg, this.settings),
+      createdAt: Date.now(),
+    };
+    this.banners.push(banner);
+    this.onBanner?.(banner);
+    return { shown: true, banner, degraded };
+  }
+
+  /** 点击横幅：进对应聊天，并清掉该角色未读。返回目标。 */
+  openBanner(bannerId) {
+    const i = this.banners.findIndex((b) => b.id === bannerId);
+    if (i === -1) return { ok: false, reason: '横幅不存在或已关闭' };
+    const [banner] = this.banners.splice(i, 1);
+    this.markRead(banner.charId);
+    this.onOpenChat?.(banner.charId, banner.messageId);
+    return { ok: true, charId: banner.charId, messageId: banner.messageId };
+  }
+
+  dismissBanner(bannerId) {
+    const i = this.banners.findIndex((b) => b.id === bannerId);
+    if (i === -1) return { ok: false, reason: '横幅不存在或已关闭' };
+    this.banners.splice(i, 1);
+    return { ok: true };
+  }
+
+  /**
+   * 接线入口（任务 5 指定形状）：notifyInApp({ charId, avatar, name, summary, messageId })。
+   * name → nickname，summary 有则直接用作摘要（无则按 content 规则生成）。
+   * currentCharId 为当前正在看的聊天角色 id（可空 = 不在任何聊天页）。
+   */
+  notifyInApp(input, currentCharId) {
+    const msg = {
+      id: input?.messageId || input?.id || null,
+      charId: input?.charId || null,
+      avatar: input?.avatar || '',
+      nickname: input?.name || input?.nickname || '对方',
+      content: input?.summary ?? input?.content ?? '',
+      type: input?.type || 'text',
+    };
+    const r = this.notify(msg, currentCharId);
+    if (input?.summary != null && r.banner) r.banner.summary = String(input.summary);
+    return r;
+  }
+
+  /** 未读计数快照（纯对象，可直接存 settings）。 */
+  unreadSnapshot() { return Object.fromEntries(this.unread); }
+  /** 从快照恢复未读计数（只接受非负整数）。 */
+  restoreUnread(snapshot) {
+    this.unread.clear();
+    for (const [k, v] of Object.entries(snapshot || {})) {
+      const n = Number(v);
+      if (k && Number.isFinite(n) && n > 0) this.unread.set(k, Math.floor(n));
+    }
+    return this.getTotalUnread();
+  }
+}
+
+/** 未读计数持久化：settings 表 key 'notifyUnread'，值 { charId: count }。 */
+const NOTIFY_UNREAD_KEY = 'notifyUnread';
+async function saveUnread(backend, notifier) {
+  await backend.put('settings', { key: NOTIFY_UNREAD_KEY, value: notifier.unreadSnapshot() });
+}
+async function loadUnread(backend, notifier) {
+  const saved = await backend.get('settings', NOTIFY_UNREAD_KEY).catch(() => null);
+  if (saved?.value) notifier.restoreUnread(saved.value);
+  return notifier.getTotalUnread();
+}
+
+/**
+ * 设置区渲染（由总协调员接进 app.js 设置页，不直接改 app.js）。
+ * container：设置分组容器元素；deps：{ settings, onSave(settings), toast? }。
+ * 无 DOM 时（Node 测试用假 container）只写 innerHTML 并返回 html，不绑定事件。
+ */
+function renderNotifySettingsSection(container, deps = {}) {
+  const s = { ...DEFAULT_NOTIFY_SETTINGS, ...(deps.settings || {}) };
+  const html = `
+      <h3>站内通知</h3>
+      <p class="muted">其他聊天收到新消息时，在顶部显示轻量横幅（头像、昵称、内容摘要），点横幅进入对应聊天；正在看的聊天不重复弹窗。</p>
+      <div class="setting-row"><span class="setting-label">显示站内横幅</span><label class="switch"><input type="checkbox" id="notify-banner" ${s.bannerEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div>
+      <div class="setting-row"><span class="setting-label">提示音<small>设备不支持时自动跳过</small></span><label class="switch"><input type="checkbox" id="notify-sound" ${s.soundEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div>
+      <div class="setting-row"><span class="setting-label">振动<small>设备不支持时自动跳过</small></span><label class="switch"><input type="checkbox" id="notify-vibration" ${s.vibrationEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div>
+      <div class="setting-row"><span class="setting-label">隐藏消息摘要<small>只显示“有新消息”，不泄露内容</small></span><label class="switch"><input type="checkbox" id="notify-hide-summary" ${s.hideSummary ? 'checked' : ''}><span class="switch-track"></span></label></div>
+      <div class="setting-row"><span class="setting-label">显示未读标记</span><label class="switch"><input type="checkbox" id="notify-badge" ${s.unreadBadgeEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div>
+      <div class="actions-row"><button class="primary" id="notify-save">保存通知设置</button></div>`;
+  if (container) container.innerHTML = html;
+  const q = (id) => container?.querySelector?.(`#${id}`);
+  q('notify-save')?.addEventListener?.('click', async () => {
+    const next = {
+      bannerEnabled: q('notify-banner')?.checked ?? s.bannerEnabled,
+      soundEnabled: q('notify-sound')?.checked ?? s.soundEnabled,
+      vibrationEnabled: q('notify-vibration')?.checked ?? s.vibrationEnabled,
+      hideSummary: q('notify-hide-summary')?.checked ?? s.hideSummary,
+      unreadBadgeEnabled: q('notify-badge')?.checked ?? s.unreadBadgeEnabled,
+    };
+    await deps.onSave?.(next);
+    deps.toast?.('通知设置已保存');
+  });
+  return html;
+}
+
+/* ===== js/audioKeepAlive.js ===== */
+// audioKeepAlive.js — 音频保活（默认关闭）。
+// 目的：用一段静音音频 + 心跳计时器，尽量让页面在前台/短暂切后台时
+// 不被立即挂起。模块内单例，只有一个音频实例。
+// 诚实边界（见 AUDIO_KEEPALIVE_HONESTY）：
+// - 播放成功 ≠ 保活成功；iOS 锁屏 / 后台的实际效果未验证，真机待测。
+// - 必须用户手势后启动；autoplay 被拒时返回明确错误，不静默假装成功。
+// - 中断后状态如实变为 interrupted，恢复时不自动偷偷重建生成、不重复生成消息。
+// - 音频保活、Service Worker、本地定时器都不能充当后台常驻服务。
+// - 不上传录音；与普通语音播放互斥时先停保活。
+
+const AUDIO_KEEPALIVE_HONESTY =
+  '播放成功 ≠ 保活成功：这段静音音频只是在播，iOS 锁屏/后台是否真能保活未验证，需真机实测。音频保活不能充当后台常驻服务，页面关闭后即失效。';
+
+const KEEPALIVE_SETTINGS_KEY = 'audioKeepAlive';
+const DEFAULT_KEEPALIVE_SETTINGS = { enabled: false, heartbeatSec: 30 };
+
+// 一段 1 秒静音 WAV（44.1kHz 16-bit 单声道），base64 data URL；不依赖外部文件。
+const SILENT_WAV_DATA_URL =
+  'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+
+const KEEPALIVE_STATES = ['idle', 'starting', 'playing', 'paused', 'interrupted', 'denied'];
+
+/**
+ * 依赖注入（便于 Node 测试与浏览器复用）：
+ * - createAudio(): 返回 { play(): Promise, pause(), src, loop }（通常是 new Audio()）
+ * - timers: { setInterval, clearInterval }（默认全局）
+ * - channelFactory: () => BroadcastChannel（多标签页选主用；不给则不协调）
+ * - now: () => ms
+ * - onStateChange(state, prev)
+ */
+class AudioKeepAlive {
+  constructor(deps = {}) {
+    this.createAudio = deps.createAudio || (() => {
+      if (typeof Audio === 'undefined') throw new Error('当前环境没有 Audio');
+      const a = new Audio(SILENT_WAV_DATA_URL);
+      a.loop = true;
+      return a;
+    });
+    this.timers = deps.timers || { setInterval: globalThis.setInterval.bind(globalThis), clearInterval: globalThis.clearInterval.bind(globalThis) };
+    this.channelFactory = deps.channelFactory || null;
+    this.now = deps.now || (() => Date.now());
+    this.onStateChange = deps.onStateChange || null;
+    this.heartbeatSec = deps.heartbeatSec || DEFAULT_KEEPALIVE_SETTINGS.heartbeatSec;
+    this.state = 'idle';
+    this.lastHeartbeatAt = null;
+    this.heartbeatCount = 0;
+    this.error = null;
+    this.audio = null;
+    this.timerId = null;
+    this.isLeader = true;
+    this.tabId = deps.tabId || `tab_${Math.random().toString(36).slice(2, 9)}`;
+    this.channel = null;
+    this._stoppedByVoice = false;
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      lastHeartbeatAt: this.lastHeartbeatAt,
+      heartbeatCount: this.heartbeatCount,
+      error: this.error,
+      isLeader: this.isLeader,
+    };
+  }
+
+  _setState(next, error = null) {
+    const prev = this.state;
+    this.state = next;
+    this.error = error;
+    if (prev !== next) this.onStateChange?.(next, prev);
+  }
+
+  _electLeader() {
+    if (!this.channelFactory) { this.isLeader = true; return true; }
+    try {
+      this.channel = this.channelFactory('verweile-keepalive');
+      this.channel.onmessage = (e) => {
+        if (e?.data?.type === 'keepalive-claim' && e.data.tabId !== this.tabId) {
+          // 已有主标签页在播：后来者让位
+          if (this.state === 'playing' || this.state === 'starting') this.stop('yield-to-leader');
+          this.isLeader = false;
+        }
+        if (e?.data?.type === 'keepalive-released' && e.data.tabId !== this.tabId) this.isLeader = true;
+      };
+      this.channel.postMessage({ type: 'keepalive-claim', tabId: this.tabId });
+    } catch { this.isLeader = true; }
+    return this.isLeader;
+  }
+
+  /**
+   * 启动保活。必须在用户手势里调用：opts.userGesture 为 false 时直接拒绝，
+   * 不尝试播放、不假装成功。返回 { ok, state } 或 { ok:false, reason, state }。
+   */
+  async start(opts = {}) {
+    if (this.state === 'playing' || this.state === 'starting') return { ok: true, state: this.state };
+    if (!opts.userGesture) {
+      this._setState('denied', '需要用户手势后启动：请点一下“开启保活”按钮再试。');
+      return { ok: false, reason: this.error, state: this.state };
+    }
+    if (!this._electLeader() && !opts.force) {
+      return { ok: false, reason: '已有另一标签页在保活，本页让位。', state: this.state };
+    }
+    this._setState('starting');
+    try {
+      if (!this.audio) {
+        this.audio = this.createAudio();
+        this.audio.src = SILENT_WAV_DATA_URL;
+        this.audio.loop = true;
+      }
+      await this.audio.play();
+    } catch (e) {
+      const name = e?.name || '';
+      const reason = name === 'NotAllowedError'
+        ? '浏览器拒绝自动播放：请在点击手势里再点一次“开启保活”。'
+        : `音频启动失败：${e?.message || String(e)}`;
+      this._setState('denied', reason);
+      return { ok: false, reason, state: this.state };
+    }
+    this._setState('playing');
+    this.lastHeartbeatAt = this.now();
+    this.heartbeatCount = 0;
+    this.timerId = this.timers.setInterval(() => this._heartbeat(), this.heartbeatSec * 1000);
+    return { ok: true, state: this.state };
+  }
+
+  _heartbeat() {
+    if (this.state !== 'playing') return;
+    this.lastHeartbeatAt = this.now();
+    this.heartbeatCount += 1;
+  }
+
+  /** 供测试 / 集成手动触发一次心跳（与定时器同一逻辑）。 */
+  tickHeartbeat() { this._heartbeat(); return this.getState(); }
+
+  /** 手动恢复（中断/暂停后由用户点按钮恢复，不自动重建）。与 start 同一路径。 */
+  async resume(opts = {}) {
+    if (this.state === 'playing') return { ok: true, state: this.state };
+    this._stoppedByVoice = false;
+    return this.start(opts);
+  }
+
+  stop(reason) {
+    if (this.timerId !== null) { this.timers.clearInterval(this.timerId); this.timerId = null; }
+    try { this.audio?.pause(); } catch { /* ignore */ }
+    try { this.channel?.postMessage({ type: 'keepalive-released', tabId: this.tabId }); } catch { /* ignore */ }
+    this._setState('idle');
+    return { ok: true, state: this.state, reason: reason || '已停止' };
+  }
+
+  pause(reason) {
+    if (this.state !== 'playing') return this.getState();
+    try { this.audio?.pause(); } catch { /* ignore */ }
+    if (this.timerId !== null) { this.timers.clearInterval(this.timerId); this.timerId = null; }
+    this._setState('paused', reason || '已暂停');
+    return this.getState();
+  }
+
+  /** 页面隐藏 / 音频被系统中断：状态如实变为 interrupted，不自动重建。 */
+  handleInterruption(reason) {
+    if (this.state === 'playing' || this.state === 'starting') {
+      if (this.timerId !== null) { this.timers.clearInterval(this.timerId); this.timerId = null; }
+      try { this.audio?.pause(); } catch { /* ignore */ }
+      this._setState('interrupted', reason || '音频被系统中断，需用户手动恢复。');
+    }
+    return this.getState();
+  }
+
+  /** visibilitychange 的处理入口：hidden 时记中断，visible 时不自动恢复。 */
+  handleVisibility(hidden) {
+    if (hidden) return this.handleInterruption('页面切到后台，音频中断。');
+    return this.getState(); // 恢复前台不自动重建，需用户手动点恢复
+  }
+
+  /**
+   * 与普通语音播放互斥：播语音前先停保活；语音播完后由调用方决定
+   * 是否手动恢复保活（本模块不自动恢复）。
+   */
+  yieldToVoice() {
+    if (this.state === 'playing') {
+      this._stoppedByVoice = true;
+      this.pause('让位于语音播放');
+    }
+    return this.getState();
+  }
+  wasStoppedByVoice() { return this._stoppedByVoice; }
+}
+
+/** 模块内单例（浏览器用）；Node 测试请直接 new AudioKeepAlive(注入)。 */
+let singleton = null;
+function getAudioKeepAlive(deps) {
+  if (!singleton) singleton = new AudioKeepAlive(deps);
+  return singleton;
+}
+
+/**
+ * 设置区渲染（由总协调员接进 app.js 设置页）。
+ * deps：{ settings, onSave(settings), keepAlive (AudioKeepAlive 实例), toast? }。
+ * 状态行由调用方在 start/stop 后重渲染本区（或直接读 keepAlive.getState()）。
+ */
+function renderKeepAliveSettingsSection(container, deps = {}) {
+  const s = { ...DEFAULT_KEEPALIVE_SETTINGS, ...(deps.settings || {}) };
+  const k = deps.keepAlive || null;
+  const st = k?.getState() || { state: 'idle', heartbeatCount: 0, lastHeartbeatAt: null, error: null, isLeader: true };
+  const stateText = { idle: '未开启', starting: '启动中…', playing: '播放中（不等于保活成功）', paused: '已暂停', interrupted: '已中断，需手动恢复', denied: '启动被拒绝' }[st.state] || st.state;
+  const html = `
+      <h3>音频保活</h3>
+      <p class="muted b-honesty">${AUDIO_KEEPALIVE_HONESTY}</p>
+      <div class="setting-row"><span class="setting-label">开启音频保活<small>默认关闭，需点“启动保活”并在手势里完成</small></span><label class="switch"><input type="checkbox" id="keepalive-enabled" ${s.enabled ? 'checked' : ''}><span class="switch-track"></span></label></div>
+      <div class="kv"><span>当前状态</span><b id="keepalive-state">${stateText}</b></div>
+      <div class="kv"><span>心跳次数</span><b>${st.heartbeatCount}</b></div>
+      ${st.error ? `<p class="muted">上次错误：${String(st.error)}</p>` : ''}
+      ${st.isLeader === false ? '<p class="muted">另一标签页正在保活，本页已让位。</p>' : ''}
+      <div class="actions-row">
+        <button class="primary" id="keepalive-start">启动保活</button>
+        <button id="keepalive-resume">手动恢复</button>
+        <button id="keepalive-stop">停止</button>
+        <button id="keepalive-save">保存设置</button>
+      </div>`;
+  if (container) container.innerHTML = html;
+  const q = (id) => container?.querySelector?.(`#${id}`);
+  q('keepalive-save')?.addEventListener?.('click', async () => {
+    await deps.onSave?.({ enabled: q('keepalive-enabled')?.checked ?? s.enabled, heartbeatSec: s.heartbeatSec });
+    deps.toast?.('音频保活设置已保存');
+  });
+  q('keepalive-start')?.addEventListener?.('click', async () => {
+    if (!k) return;
+    const r = await k.start({ userGesture: true });
+    deps.toast?.(r.ok ? '保活已启动（播放中）' : (r.reason || '启动失败'));
+    deps.onStateChange?.(k.getState());
+  });
+  q('keepalive-resume')?.addEventListener?.('click', async () => {
+    if (!k) return;
+    const r = await k.resume({ userGesture: true });
+    deps.toast?.(r.ok ? '保活已恢复' : (r.reason || '恢复失败'));
+    deps.onStateChange?.(k.getState());
+  });
+  q('keepalive-stop')?.addEventListener?.('click', () => {
+    k?.stop('用户手动停止');
+    deps.toast?.('保活已停止');
+    deps.onStateChange?.(k?.getState());
+  });
+  return html;
+}
+
+/* ===== js/pushNotify.js ===== */
+// pushNotify.js — 系统推送（Service Worker + Web Push 前端侧）。
+// 能力诚实原则：仅已实际配置并测试的能力返回“可用”，其余返回
+// “未配置/不支持”并附原因。未配置后台推送服务时返回前端运行模式说明，
+// 不假装能后台推送。
+// 规则：
+// - requestPermission() 只在用户点击时调用，不反复请求；拒绝后展示说明。
+// - notifyAfterPersist(msg)：消息先持久化再通知；调用方保证已保存，
+//   本函数校验 msg.persisted（或 msg.id + 已保存标记），未保存拒绝通知。
+// - 通知点击跳转只定位已有消息 id，不生成新消息。
+
+const PUSH_SETTINGS_KEY = 'pushSettings';
+const DEFAULT_PUSH_SETTINGS = {
+  enabled: false,
+  vapidPublicKey: '', // 由用户在部署时填入（见 server/wake-push-service/README.md）
+  pushServiceUrl: '', // 可选后台推送服务地址；为空 = 未配置
+};
+
+const FRONTEND_PUSH_MODE_TEXT =
+  '当前是前端运行模式：未配置后台推送服务，页面关闭后收不到系统推送；站内横幅只在页面打开时显示。配置可选的 wake-push-service 并部署后，系统推送才可用。';
+
+/**
+ * 能力标签（注入 env，便于测试）：
+ * env = { hasServiceWorker, hasPushManager, hasNotification, permission,
+ *         configured (是否已填 VAPID + 服务地址), tested (是否部署后实测通过) }
+ * 只有 configured && tested 才算“可用”。
+ */
+function capabilityStatus(env = {}) {
+  const caps = {
+    serviceWorker: env.hasServiceWorker ? '可用' : '不支持',
+    pushManager: env.hasPushManager ? '可用' : '不支持',
+    notification: env.hasNotification ? '可用' : '不支持',
+    permission: env.permission || 'default',
+    push: '未配置',
+  };
+  const reasons = [];
+  if (!env.hasServiceWorker) reasons.push('当前浏览器不支持 Service Worker。');
+  if (!env.hasPushManager) reasons.push('当前浏览器不支持 PushManager。');
+  if (!env.hasNotification) reasons.push('当前浏览器不支持 Notification。');
+  if (env.permission === 'denied') reasons.push('通知权限已被拒绝，需在浏览器设置里手动开启。');
+  if (!env.configured) {
+    reasons.push('未配置后台推送服务（VAPID 公钥 / 推送服务地址为空）。');
+  } else if (!env.tested) {
+    caps.push = '未验证';
+    reasons.push('已配置但未在部署后实测，暂按不可用处理。');
+  } else {
+    caps.push = '可用';
+  }
+  return { ...caps, configured: !!env.configured, tested: !!env.tested, mode: env.configured && env.tested ? 'backend' : 'frontend', reasons };
+}
+
+/** 注册 Service Worker（注入 navigatorLike，便于测试）。 */
+async function registerServiceWorker(navigatorLike, url = '/sw.js') {
+  const nav = navigatorLike || (typeof navigator !== 'undefined' ? navigator : null);
+  if (!nav?.serviceWorker?.register) {
+    return { ok: false, reason: '当前浏览器不支持 Service Worker 注册。' };
+  }
+  try {
+    const reg = await nav.serviceWorker.register(url);
+    return { ok: true, registration: reg, scope: reg?.scope || url };
+  } catch (e) {
+    return { ok: false, reason: `Service Worker 注册失败：${e?.message || String(e)}` };
+  }
+}
+
+/** 查询订阅状态（注入 registration）。 */
+async function getSubscriptionState(registration) {
+  if (!registration?.pushManager?.getSubscription) return { subscribed: false, reason: 'PushManager 不可用。' };
+  try {
+    const sub = await registration.pushManager.getSubscription();
+    return { subscribed: !!sub, subscription: sub || null };
+  } catch (e) {
+    return { subscribed: false, reason: `查询订阅失败：${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * 用户主动授权入口：只在用户点击时调用。
+ * NotificationLike 注入（默认全局 Notification）。
+ * 拒绝后返回说明，不反复请求。
+ */
+async function requestPermission(NotificationLike) {
+  const N = NotificationLike || (typeof Notification !== 'undefined' ? Notification : null);
+  if (!N?.requestPermission) return { ok: false, permission: 'unsupported', reason: '当前浏览器不支持通知权限申请。' };
+  if (N.permission === 'granted') return { ok: true, permission: 'granted' };
+  if (N.permission === 'denied') {
+    return { ok: false, permission: 'denied', reason: '通知权限已被拒绝，请在浏览器设置里手动开启后重试。本次不会再弹出申请。' };
+  }
+  try {
+    const result = await N.requestPermission();
+    if (result === 'granted') return { ok: true, permission: 'granted' };
+    return { ok: false, permission: result, reason: result === 'denied' ? '你拒绝了通知权限，可在浏览器设置里重新开启。' : '通知权限申请未完成。' };
+  } catch (e) {
+    return { ok: false, permission: 'default', reason: `申请通知权限失败：${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * 订阅推送（需已授权 + 已配置 VAPID）。subscription 须发给后台服务保存；
+ * 本函数只做订阅动作，不上传聊天正文与 API 密钥。
+ */
+async function subscribePush(registration, vapidPublicKey) {
+  if (!vapidPublicKey) return { ok: false, reason: '未配置 VAPID 公钥，无法订阅推送。' };
+  if (!registration?.pushManager?.subscribe) return { ok: false, reason: 'PushManager 不可用。' };
+  try {
+    const sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: vapidPublicKey });
+    return { ok: true, subscription: sub };
+  } catch (e) {
+    return { ok: false, reason: `订阅推送失败：${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * 消息先持久化再通知：msg 须带 persisted: true（调用方保证已保存）。
+ * 未保存直接拒绝，不先通知后补存。
+ */
+async function notifyAfterPersist(msg, registration) {
+  if (!msg?.persisted) return { ok: false, reason: '消息尚未持久化，拒绝先通知。请先保存消息再调用 notifyAfterPersist。' };
+  if (!registration?.showNotification) return { ok: false, reason: 'Service Worker 注册不可用，无法显示系统通知。' };
+  const title = msg.nickname || 'verweile';
+  const body = msg.hideSummary ? '有新消息' : String(msg.content || '有新消息').slice(0, 80);
+  try {
+    await registration.showNotification(title, {
+      body,
+      tag: `msg-${msg.id || ''}`,
+      data: { messageId: msg.id || null, charId: msg.charId || null, url: msg.charId ? `/?char=${encodeURIComponent(msg.charId)}&msg=${encodeURIComponent(msg.id || '')}` : '/' },
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: `显示通知失败：${e?.message || String(e)}` };
+  }
+}
+
+/**
+ * iOS 主屏幕 Web App 推送能力检测（纯函数，env 可注入测试）：
+ * env = { isIOS, isStandalone, hasPushManager, hasServiceWorker, permission, iosVersion }
+ * iOS 16.4+ 且以“添加到主屏幕”的 Web App 方式打开时才支持 Web Push；
+ * Safari 里直接打开不支持；iOS 16.4 以下不支持。
+ */
+function detectIOSPush(env = {}) {
+  if (!env.isIOS) return { supported: null, reason: '非 iOS 设备，本检测不适用。' };
+  if (env.iosVersion != null && Number(env.iosVersion) < 16.4) {
+    return { supported: false, reason: `当前 iOS ${env.iosVersion} 不支持 Web Push，需要 iOS 16.4 或更高版本。` };
+  }
+  if (!env.isStandalone) {
+    return { supported: false, reason: 'iOS 上只有“添加到主屏幕”后打开的 Web App 才能收系统推送，在 Safari 里直接打开不支持。' };
+  }
+  if (!env.hasServiceWorker || !env.hasPushManager) {
+    return { supported: false, reason: '当前环境不支持 Service Worker / PushManager。' };
+  }
+  if (env.permission === 'denied') {
+    return { supported: false, reason: '通知权限已被拒绝，需在系统设置里手动开启。' };
+  }
+  return { supported: true, reason: 'iOS 主屏幕 Web App，支持系统推送（仍需配置后台推送服务并实测）。' };
+}
+
+/**
+ * 通知点击跳转（纯函数，供 sw.js 与测试共用）：
+ * 定位已有消息 id，不生成新消息。
+ */
+function resolveNotificationClick(data, clients = []) {
+  const url = data?.url || '/';
+  const existing = clients.find((c) => c.url && String(c.url).includes(new URL(url, 'http://x').pathname));
+  if (existing) return { action: 'focus', url, clientId: existing.id || null };
+  return { action: 'open', url };
+}
+
+/**
+ * 设置区渲染（由总协调员接进 app.js 设置页）。
+ * deps：{ settings, onSave(settings), env（能力检测入参）, onRequestPermission(),
+ *         onSubscribe(), onTestPush?(), toast? }。能力文案来自 capabilityStatus，
+ * 未配置/未实测时只显示“未配置/未验证”，不写“可用”。
+ */
+function renderPushSettingsSection(container, deps = {}) {
+  const s = { ...DEFAULT_PUSH_SETTINGS, ...(deps.settings || {}) };
+  const caps = capabilityStatus(deps.env || {});
+  const ios = deps.env?.isIOS ? detectIOSPush(deps.env) : null;
+  const html = `
+      <h3>系统推送</h3>
+      <p class="muted">${FRONTEND_PUSH_MODE_TEXT}</p>
+      <div class="kv"><span>Service Worker</span><b>${caps.serviceWorker}</b></div>
+      <div class="kv"><span>PushManager</span><b>${caps.pushManager}</b></div>
+      <div class="kv"><span>通知权限</span><b>${caps.permission}</b></div>
+      <div class="kv"><span>系统推送</span><b>${caps.push}</b></div>
+      ${ios ? `<p class="muted">iOS：${ios.reason}</p>` : ''}
+      ${caps.reasons.map((r) => `<p class="muted">· ${r}</p>`).join('')}
+      <div class="setting-row"><span class="setting-label">开启系统推送<small>需先授权并配置后台服务</small></span><label class="switch"><input type="checkbox" id="push-enabled" ${s.enabled ? 'checked' : ''}><span class="switch-track"></span></label></div>
+      <div class="field"><label>VAPID 公钥</label><input type="text" id="push-vapid" value="${String(s.vapidPublicKey || '').replace(/"/g, '&quot;')}" placeholder="部署 wake-push-service 后填入公钥"><div class="hint">只填公钥；私钥只放服务器 .env，绝不填到这里。</div></div>
+      <div class="field"><label>推送服务地址</label><input type="text" id="push-service-url" value="${String(s.pushServiceUrl || '').replace(/"/g, '&quot;')}" placeholder="例如 https://你的域名"><div class="hint">为空 = 未配置后台推送服务，当前为前端运行模式。</div></div>
+      <div class="actions-row">
+        <button class="primary" id="push-save">保存推送设置</button>
+        <button id="push-permission">申请通知权限</button>
+        <button id="push-subscribe">订阅推送</button>
+      </div>`;
+  if (container) container.innerHTML = html;
+  const q = (id) => container?.querySelector?.(`#${id}`);
+  q('push-save')?.addEventListener?.('click', async () => {
+    const next = {
+      enabled: q('push-enabled')?.checked ?? s.enabled,
+      vapidPublicKey: q('push-vapid')?.value?.trim() ?? s.vapidPublicKey,
+      pushServiceUrl: q('push-service-url')?.value?.trim() ?? s.pushServiceUrl,
+    };
+    await deps.onSave?.(next);
+    deps.toast?.('推送设置已保存');
+  });
+  q('push-permission')?.addEventListener?.('click', async () => {
+    const r = await (deps.onRequestPermission?.() ?? requestPermission());
+    deps.toast?.(r.ok ? '通知权限已授权' : (r.reason || '未授权'));
+    deps.onStateChange?.(r);
+  });
+  q('push-subscribe')?.addEventListener?.('click', async () => {
+    const r = await deps.onSubscribe?.();
+    deps.toast?.(r?.ok ? '推送已订阅' : (r?.reason || '订阅失败'));
+  });
+  return html;
+}
+
+/* ===== js/customIcon.js ===== */
+// customIcon.js — 自定义主屏幕图标。
+// 上传 → canvas 正方形裁切 → 180/192/512 三档预览 → 应用名称 →
+// “下载图标包”导出 PNG（180 apple-touch-icon、192、512、512 maskable）。
+// 源图与名称存 IndexedDB settings（键见 CUSTOM_ICON_SETTINGS_KEY，
+// 图为 data URL 小图）；大图不进 settings，避免撑爆存储。
+// 诚实说明（见 CUSTOM_ICON_HONESTY，界面必须原样展示）：
+// 纯前端改不了已安装 PWA 图标；安装图标必须走部署文件；
+// 设置后需重新部署并重新添加到主屏幕，已安装图标不会自动替换；
+// Safari 与主屏幕 Web App 存储分开（图标文件走部署文件两边共用，
+// 偏好设置存在各自存储里）。
+
+const CUSTOM_ICON_SETTINGS_KEY = 'customIcon';
+const DEFAULT_APP_NAME = 'verweile';
+const MAX_ICON_FILE_BYTES = 5 * 1024 * 1024;
+const ACCEPTED_ICON_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+const ICON_SIZES = [
+  { size: 180, purpose: 'apple-touch-icon', file: 'apple-touch-icon.png' },
+  { size: 192, purpose: 'any', file: 'icon-192.png' },
+  { size: 512, purpose: 'any', file: 'icon-512.png' },
+  { size: 512, purpose: 'maskable', file: 'icon-512-maskable.png' },
+];
+
+const CUSTOM_ICON_HONESTY = [
+  '纯前端改不了已安装的 PWA 图标：主屏幕图标来自部署时的 manifest 与 apple-touch-icon 文件。',
+  '设置新图标后，需要重新部署，并从主屏幕删除旧图标、重新“添加到主屏幕”，已安装的图标不会自动替换。',
+  'Safari 与主屏幕 Web App 的存储是分开的：图标文件走部署文件两边共用，但偏好设置存在各自的存储里，',
+  '在 Safari 里改的设置不会自动同步到主屏幕版，反之亦然。',
+].join('');
+
+const ICON_REDEPLOY_TEXT =
+  '图标已保存到设置。要让它成为主屏幕图标：1）重新部署；2）删除主屏幕旧图标；3）重新添加到主屏幕。';
+
+/** 校验上传文件：类型 + 大小。返回 { ok } 或 { ok:false, reason }。 */
+function validateIconFile(file) {
+  if (!file) return { ok: false, reason: '没有选择图片文件。' };
+  if (!ACCEPTED_ICON_TYPES.includes(file.type)) {
+    return { ok: false, reason: `不支持的图片类型：${file.type || '未知'}（支持 PNG / JPEG / WebP）。` };
+  }
+  if (file.size > MAX_ICON_FILE_BYTES) {
+    return { ok: false, reason: `图片超过 5MB（实际 ${(file.size / 1024 / 1024).toFixed(1)}MB），请换一张小图。` };
+  }
+  return { ok: true };
+}
+
+/** 正方形居中裁切区域（纯函数）：取短边居中裁，不拉伸、不留白。 */
+function computeCropRect(width, height) {
+  const side = Math.min(width, height);
+  return { x: Math.round((width - side) / 2), y: Math.round((height - side) / 2), size: side };
+}
+
+/** 校验应用名称：1–30 字，去首尾空格。 */
+function validateAppName(name) {
+  const n = String(name || '').trim();
+  if (!n) return { ok: false, reason: '应用名称不能为空。' };
+  if (n.length > 30) return { ok: false, reason: '应用名称最多 30 字。' };
+  return { ok: true, name: n };
+}
+
+/**
+ * 读 PNG 尺寸（纯函数，无依赖）：解析 PNG 文件头 IHDR（第 16–23 字节为
+ * 大端宽/高）。bytes 为 Uint8Array/ArrayBuffer/普通数组均可。
+ * 返回 { ok, width, height } 或 { ok:false, reason }。
+ */
+function readPngSize(bytes) {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (b.length < 24 || !PNG_SIG.every((v, i) => b[i] === v)) {
+    return { ok: false, reason: '不是有效的 PNG 文件。' };
+  }
+  const width = (b[16] << 24) | (b[17] << 16) | (b[18] << 8) | b[19];
+  const height = (b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23];
+  if (!width || !height) return { ok: false, reason: 'PNG 尺寸读取失败。' };
+  return { ok: true, width, height };
+}
+
+/**
+ * 校验一张导出的图标 PNG：须为正方形、边长达到要求。
+ * 返回 { ok } 或 { ok:false, reason }。
+ */
+function validateIconPng(bytes, { minSize = 180 } = {}) {
+  const size = readPngSize(bytes);
+  if (!size.ok) return size;
+  if (size.width !== size.height) {
+    return { ok: false, reason: `图标须为正方形（实际 ${size.width}×${size.height}）。` };
+  }
+  if (size.width < minSize) {
+    return { ok: false, reason: `图标边长至少 ${minSize}px（实际 ${size.width}px）。` };
+  }
+  return { ok: true, width: size.width, height: size.height };
+}
+
+/** 校验整套图标包（{ file: bytes }）：每档按 ICON_SIZES 的边长校验。 */
+function validateIconPackFiles(filesByName) {
+  const errors = [];
+  for (const { file, size } of ICON_SIZES) {
+    const bytes = filesByName?.[file];
+    if (!bytes) { errors.push(`缺少 ${file}`); continue; }
+    const r = validateIconPng(bytes, { minSize: size });
+    if (!r.ok) errors.push(`${file}：${r.reason}`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * 导出图标包。canvasFactory(size) 须返回 { canvas, ctx, toDataURL(type) }，
+ * 其中 ctx.drawImage(source, sx, sy, s, s, 0, 0, size, size) 由调用方
+ * 的 canvas 实现提供；source 为已加载的 Image/位图（{ width, height }）。
+ * 返回 [{ size, purpose, file, dataUrl }]。Node 测试用 stub canvas。
+ */
+function exportIconPack(canvasFactory, sourceImage, appName = DEFAULT_APP_NAME) {
+  if (!sourceImage || !Number.isFinite(sourceImage.width) || !Number.isFinite(sourceImage.height)) {
+    return { ok: false, reason: '没有可用的源图。' };
+  }
+  const nameCheck = validateAppName(appName);
+  if (!nameCheck.ok) return nameCheck;
+  const crop = computeCropRect(sourceImage.width, sourceImage.height);
+  const files = ICON_SIZES.map(({ size, purpose, file }) => {
+    const { canvas, ctx } = canvasFactory(size);
+    ctx.drawImage(sourceImage, crop.x, crop.y, crop.size, crop.size, 0, 0, size, size);
+    return { size, purpose, file, dataUrl: canvas.toDataURL('image/png') };
+  });
+  return { ok: true, appName: nameCheck.name, files };
+}
+
+/** 三档预览用的裁切描述子（集成方按此画 <canvas> 预览）。 */
+function previewSpecs(sourceImage) {
+  if (!sourceImage) return [];
+  const crop = computeCropRect(sourceImage.width, sourceImage.height);
+  return [180, 192, 512].map((size) => ({ size, crop }));
+}
+
+/** settings 里存的自定义图标记录形状。 */
+function buildCustomIconRecord({ dataUrl, appName, updatedAt = Date.now() }) {
+  return { key: CUSTOM_ICON_SETTINGS_KEY, appName: validateAppName(appName).name || DEFAULT_APP_NAME, dataUrl, updatedAt };
+}
+
+function restoreDefaultIcon() {
+  return { key: CUSTOM_ICON_SETTINGS_KEY, appName: DEFAULT_APP_NAME, dataUrl: null, updatedAt: Date.now() };
+}
+
+/**
+ * 设置区渲染（由总协调员接进 app.js 设置页）。
+ * deps：{ settings（{ appName, dataUrl }）, onSave(record), onExportPack(),
+ *         onRestore(), toast? }。文件选择与 canvas 裁切由集成方按
+ * exportIconPack / previewSpecs 实现，本函数只渲染界面与按钮。
+ */
+function renderIconSettingsSection(container, deps = {}) {
+  const s = deps.settings || {};
+  const appName = s.appName || DEFAULT_APP_NAME;
+  const html = `
+      <h3>主屏幕图标</h3>
+      <p class="muted b-honesty">${CUSTOM_ICON_HONESTY}</p>
+      <div class="field"><label>上传图标图片</label><input type="file" id="icon-file" accept="image/png,image/jpeg,image/webp"><div class="hint">支持 PNG / JPEG / WebP，5MB 以内；自动居中正方形裁切，不拉伸。</div></div>
+      <div id="icon-preview" class="icon-preview-row">${s.dataUrl ? `<img src="${s.dataUrl}" alt="当前图标预览" width="72" height="72">` : '<p class="muted">未上传自定义图标，当前使用默认图标。</p>'}</div>
+      <div class="field"><label>应用名称（主屏幕下显示的名字）</label><input type="text" id="icon-appname" value="${String(appName).replace(/"/g, '&quot;')}" maxlength="30"><div class="hint">1–30 字。</div></div>
+      <div class="actions-row">
+        <button class="primary" id="icon-save">保存图标设置</button>
+        <button id="icon-export">下载图标包（180 / 192 / 512 / maskable）</button>
+        <button id="icon-restore">恢复默认</button>
+      </div>
+      <p class="muted">${ICON_REDEPLOY_TEXT}</p>`;
+  if (container) container.innerHTML = html;
+  const q = (id) => container?.querySelector?.(`#${id}`);
+  q('icon-save')?.addEventListener?.('click', async () => {
+    const nameCheck = validateAppName(q('icon-appname')?.value ?? appName);
+    if (!nameCheck.ok) { deps.toast?.(nameCheck.reason); return; }
+    await deps.onSave?.(buildCustomIconRecord({ dataUrl: s.dataUrl || null, appName: nameCheck.name }));
+    deps.toast?.(ICON_REDEPLOY_TEXT);
+  });
+  q('icon-export')?.addEventListener?.('click', async () => {
+    const r = await deps.onExportPack?.();
+    if (r && !r.ok) deps.toast?.(r.reason || '导出失败');
+  });
+  q('icon-restore')?.addEventListener?.('click', async () => {
+    await deps.onSave?.(restoreDefaultIcon());
+    deps.toast?.('已恢复默认图标（已安装的图标仍需重新部署并重新添加才会变）');
+  });
+  return html;
+}
+
+/* ===== js/wakeEngine.js ===== */
+// wakeEngine.js — 主动唤醒引擎（前端运行版）。
+// 机制来源：KKarsyline/wake_UP（PolyForm Noncommercial 1.0.0），
+// 本文件为用自有 JS 重写的实现，未复制原项目的 Python 代码。
+// 原项目只作机制参考：情境 scene（cadence/lifetime/priority 默认值）、
+// 闹钟、短期字条（最多成功读三次、版本核对）、回执三分
+// （accepted/completed/notified 分开记）、用户发言时唤醒回合让位。
+// 明确不做：wake_when 的位置 / App / 健康条件——网页拿不到这些数据，
+// 不能假装知道；相关字段一律拒绝，见 validateWakeWhen()。
+// 存储：新 store 名 wakeScenes / wakeAlarms / wakeReceipts，schema 见
+// WAKE_STORE_SCHEMA；建表迁移在 js/storage.js 的 ensureWakeStores（v3→v4，
+// 本文件不重复定义，避免 build-preview.mjs 拼接后同名顶层函数冲突），本文件接受任何实现
+// get/put/getAll/delete 的 store，默认用内存 store（createMemoryWakeStore），便于 Node 测试。
+// 时间：持久化时间戳用 UTC 毫秒；自然日、免打扰时段按固定 UTC+08:00 计，
+// 不跟随机器本地时区。
+
+const WAKE_STORE_SCHEMA = {
+wakeScenes: {
+keyPath: 'id',
+indexes: { byChar: ['charId', 'nextAt'], byStatus: ['status', 'nextAt']},
+fields: {
+id: 'string', charId: 'string', type: 'scene 类型', title: 'string',
+facts: 'string[]', cadenceMin: 'number（分钟）', durationMin: 'number（分钟）',
+startedAt: 'number UTC ms', expiresAt: 'number UTC ms', nextAt: 'number UTC ms',
+status: "'active' | 'snoozed' | 'ended' | 'expired'",
+snoozeUntil: 'number|null UTC ms',
+note: '{ text, version, reads} | null（字条）',
+wakeWhen: 'null（第一阶段不支持，恒为 null）',
+},
+},
+wakeAlarms: {
+keyPath: 'id',
+indexes: { byChar: ['charId', 'at']},
+fields: {
+id: 'string', charId: 'string', at: 'number UTC ms（未来时间）',
+note: 'string', status: "'pending' | 'fired' | 'expired' | 'cancelled'",
+createdAt: 'number UTC ms',
+},
+},
+wakeReceipts: {
+keyPath: 'wakeId',
+indexes: {},
+fields: {
+wakeId: 'string', trigger: 'string', charId: 'string',
+acceptedAt: 'number|null', completedAt: 'number|null', notifiedAt: 'number|null',
+accepted: 'boolean|null（未知为 null）', completed: 'boolean',
+notified: 'boolean', error: 'string|null',
+claim: '{ holder, expiresAt} | null',
+},
+},
+};
+
+/** 供 settings store（settings 表，key='wakeSettings'）保存的设置形状。 */
+const WAKE_SETTINGS_KEY = 'wakeSettings';
+const DEFAULT_WAKE_SETTINGS = {
+enabled: false, // 总开关，默认关闭
+perChar: {}, // charId -> boolean，角色独立开关（未写明时视为开启）
+dnd: { enabled: false, start: '23:00', end: '08:00'}, // 免打扰，按 UTC+8
+cooldownMin: 10, // 两次唤醒之间最短间隔
+maxWakesPerDay: 50, // 每日唤醒上限，按 UTC+8 自然日计
+maxMessagesPerDay: 50, // 每日主动消息上限，按 UTC+8 自然日计
+patrolIntervalMin: 15, // 巡检间隔（前端运行版仅在页面可见时检查）
+};
+
+const CADENCE_MIN = 5;
+const CADENCE_MAX = 240;
+const DURATION_MIN = 10;
+const DURATION_MAX = 1440;
+const SNOOZE_MIN = 5;
+const SNOOZE_MAX = 720;
+const NOTE_MAX_READS = 3;
+const ALARM_GRACE_MS = 30 * 60 * 1000; // 闹钟过期宽限：超过 30 分钟不再补发
+const SCENE_GRACE_MS = 30 * 60 * 1000;
+const CLAIM_TTL_MS = 5 * 60 * 1000;
+const MAX_DELTAS_PER_MESSAGE = 3;
+
+/** 情境类型与默认节奏/有效期/优先级（源自 wake_UP 文档默认值）。 */
+const SCENE_DEFAULTS = {
+outing: { cadenceMin: 30, durationMin: 480, priority: 50, label: '外出'},
+work: { cadenceMin: 60, durationMin: 600, priority: 40, label: '工作'},
+bedtime: { cadenceMin: 45, durationMin: 600, priority: 55, label: '睡前'},
+morning: { cadenceMin: 20, durationMin: 180, priority: 60, label: '早晨'},
+active_without_chat: { cadenceMin: 30, durationMin: 240, priority: 45, label: '设备活跃未回聊'},
+silence_escalation: { cadenceMin: 15, durationMin: 240, priority: 65, label: '约定未回复跟进'},
+repeat: { cadenceMin: 10, durationMin: 180, priority: 70, label: '重复唤醒'},
+private_play: { cadenceMin: 10, durationMin: 60, priority: 100, label: '私密游玩'},
+sulking: { cadenceMin: 20, durationMin: 480, priority: 75, label: '闹别扭'},
+custom: { cadenceMin: 45, durationMin: 360, priority: 35, label: '自定义'},
+};
+const SCENE_TYPES = Object.keys(SCENE_DEFAULTS);
+
+const WAKE_EXPLAIN_TEXT = [
+'主动唤醒开启后，我会在以下情况回来找你：你让我设的闹钟到了；',
+'你说过正在做的事（比如出门、工作、睡前）到了该看看的时间；',
+'或者你让我每隔一段时间来一次。',
+'我只在你打开这个页面、它在前台时检查时间；关掉页面、锁屏或切到后台后，',
+'我不会在后台一直跑，也不会补发你错过的大量旧消息。',
+'你可以随时说“先别发”“晚安”“我回来了”让我暂停或结束。',
+].join('');
+
+const WAKE_MODE_TEXT = [
+'当前是前端运行模式：唤醒只在页面打开且可见时检查。',
+'音频保活、Service Worker、本地定时器都不能充当后台常驻服务，',
+'页面关闭或进入后台后唤醒不会继续；需要真后台请配置可选的 wake-push-service，',
+'未配置时本说明保持不变，不假装有后台能力。',
+].join('');
+
+const WAKE_HONESTY_TEXT = '唤醒检查只在前台运行；过期安排按有效期直接标记过期，绝不补发大量旧消息。位置、App 打开、健康数据本阶段一律不采集、不推断。';
+
+function wakeUid(prefix = 'wake') {
+return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+/** UTC+8 自然日键，如 '2026-11-21'。 */
+function cstDayKey(ms) {
+const d = new Date(ms + 8 * 3600 * 1000);
+return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+/** UTC+8 当天分钟数（用于免打扰时段判断）。 */
+function cstMinutesOfDay(ms) {
+const d = new Date(ms + 8 * 3600 * 1000);
+return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+
+function parseHHMM(s) {
+const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || ''));
+if (!m) return null;
+const h = Number(m[1]); const min = Number(m[2]);
+if (h > 23 || min > 59) return null;
+return h * 60 + min;
+}
+
+/** 免打扰判断（纯函数）：时段可跨午夜。 */
+function isInDnd(dnd, nowMs) {
+if (!dnd?.enabled) return false;
+const start = parseHHMM(dnd.start); const end = parseHHMM(dnd.end);
+if (start === null || end === null) return false;
+const cur = cstMinutesOfDay(nowMs);
+if (start === end) return false;
+return start < end? (cur >= start && cur < end): (cur >= start || cur < end);
+}
+
+/** 校验节奏/有效期。返回 { ok, errors[]}。 */
+function validateSceneTiming({ cadenceMin, durationMin}) {
+const errors = [];
+if (cadenceMin!== undefined && cadenceMin!== null) {
+if (!Number.isFinite(cadenceMin) || cadenceMin < CADENCE_MIN || cadenceMin > CADENCE_MAX) {
+errors.push(`cadence_min 须在 ${CADENCE_MIN}–${CADENCE_MAX} 分钟之间`);
+}
+}
+if (durationMin!== undefined && durationMin!== null) {
+if (!Number.isFinite(durationMin) || durationMin < DURATION_MIN || durationMin > DURATION_MAX) {
+errors.push(`duration_min 须在 ${DURATION_MIN}–${DURATION_MAX} 分钟之间`);
+}
+}
+return { ok: errors.length === 0, errors};
+}
+
+/**
+* wake_when 第一阶段一律拒绝：网页拿不到位置 / App / 健康数据，
+* 收到任何非空 wake_when 都返回拒绝，不静默忽略、不假装支持。
+*/
+function validateWakeWhen(value) {
+if (value === undefined || value === null || value === '') return { ok: true};
+return {
+ok: false,
+reason: 'wake_when（位置/App/健康条件）第一阶段不支持：网页拿不到这些数据，不能假装知道。请改用闹钟或固定间隔。',
+};
+}
+
+/**
+* 解析模型在回复里用结构化字段提出的安排。
+* 接受对象或含 JSON 的文本（支持 ```json 代码块或裸 JSON）。
+* 动作：set_alarm / set_repeat / snooze / end_scene / update_scene /
+* set_note / clear_note。返回 { ok, action, params} 或 { ok:false, reason}。
+* 无效安排一律拒绝并给出原因，不执行。
+*/
+function parseWakeToolCall(input, nowMs = Date.now()) {
+let obj = input;
+if (typeof input === 'string') {
+const m = input.match(/```(?:json)?\s*([\s\S]*?)```/) || input.match(/(\{[\s\S]*\})/);
+if (!m) return { ok: false, reason: '没有找到结构化的唤醒安排（需要一个 JSON 对象，含 action 字段）。'};
+try { obj = JSON.parse(m[1]);} catch { return { ok: false, reason: '唤醒安排不是合法 JSON，拒绝执行。'};}
+}
+if (!obj || typeof obj!== 'object' || Array.isArray(obj)) {
+return { ok: false, reason: '唤醒安排须为对象。'};
+}
+const action = obj.action;
+const fail = (reason) => ({ ok: false, reason});
+const needSceneRef = () => {
+if (obj.sceneId) return { sceneId: String(obj.sceneId)};
+if (obj.sceneType) {
+if (!SCENE_TYPES.includes(obj.sceneType)) return null;
+return { sceneType: obj.sceneType};
+}
+return null;
+};
+switch (action) {
+case 'set_alarm': {
+const at = Date.parse(obj.at);
+if (!Number.isFinite(at)) return fail('set_alarm 需要合法的未来 ISO 时间 at。');
+if (at <= nowMs) return fail('set_alarm 的时间必须是未来时间，过期闹钟拒绝。');
+return { ok: true, action, params: { at, note: String(obj.note || ''), charId: obj.charId? String(obj.charId): undefined}};
+}
+case 'set_repeat': {
+if (!SCENE_TYPES.includes(obj.sceneType)) return fail(`set_repeat 的 sceneType 不合法：${obj.sceneType}`);
+const v = validateSceneTiming({ cadenceMin: obj.cadence_min, durationMin: obj.duration_min});
+if (!v.ok) return fail(v.errors.join('；'));
+return { ok: true, action, params: { sceneType: obj.sceneType, cadenceMin: obj.cadence_min, durationMin: obj.duration_min, title: obj.title? String(obj.title): undefined, charId: obj.charId? String(obj.charId): undefined}};
+}
+case 'snooze': {
+const minutes = Number(obj.minutes);
+if (!Number.isFinite(minutes) || minutes < SNOOZE_MIN || minutes > SNOOZE_MAX) {
+return fail(`snooze 时长须在 ${SNOOZE_MIN}–${SNOOZE_MAX} 分钟之间`);
+}
+return { ok: true, action, params: { minutes, sceneId: obj.sceneId? String(obj.sceneId): undefined}};
+}
+case 'end_scene': {
+const ref = needSceneRef();
+if (!ref) return fail('end_scene 需要 sceneId 或合法的 sceneType。');
+return { ok: true, action, params: {...ref, recreateAfterMinutes: obj.recreate_after_minutes!== undefined? Number(obj.recreate_after_minutes): undefined}};
+}
+case 'update_scene': {
+const ref = needSceneRef();
+if (!ref) return fail('update_scene 需要 sceneId 或合法的 sceneType。');
+const v = validateSceneTiming({ cadenceMin: obj.cadence_min, durationMin: obj.duration_min});
+if (!v.ok) return fail(v.errors.join('；'));
+const ww = validateWakeWhen(obj.wake_when);
+if (!ww.ok) return fail(ww.reason);
+return { ok: true, action, params: {...ref, cadenceMin: obj.cadence_min, durationMin: obj.duration_min, title: obj.title? String(obj.title): undefined, facts: Array.isArray(obj.facts)? obj.facts.map(String): undefined}};
+}
+case 'set_note': {
+if (!obj.sceneId || typeof obj.note!== 'string' ||!obj.note.trim()) return fail('set_note 需要 sceneId 与非空 note。');
+return { ok: true, action, params: { sceneId: String(obj.sceneId), note: obj.note}};
+}
+case 'clear_note': {
+if (!obj.sceneId) return fail('clear_note 需要 sceneId。');
+return { ok: true, action, params: { sceneId: String(obj.sceneId)}};
+}
+default:
+return fail(`未知的唤醒动作：${String(action)}。支持 set_alarm / set_repeat / snooze / end_scene / update_scene / set_note / clear_note。`);
+}
+}
+
+// ---- 明确表达：关键词快路径 ----
+const KEYWORD_RULES = [
+{ re: /晚安|去睡|睡觉|睡了|我要睡/, deltas: [{ action: 'start', sceneType: 'bedtime'}]},
+{ re: /出门|出去一趟|外出|出趟门/, deltas: [{ action: 'start', sceneType: 'outing'}]},
+{ re: /上班|工作|学习|要忙|开会/, deltas: [{ action: 'start', sceneType: 'work'}]},
+{ re: /我回来了|回来了|到家了|做完了|忙完了|下班了/, deltas: [{ action: 'end', sceneType: 'outing'}, { action: 'end', sceneType: 'work'}]},
+{ re: /先别发|别来找我|别打扰|安静一会|安静会儿|别烦我/, deltas: [{ action: 'snooze', minutes: 60}]},
+{ re: /每隔|隔.*分钟|每.*分钟.*一次/, deltas: [{ action: 'start', sceneType: 'repeat'}]},
+];
+
+function keywordDeltas(text) {
+const out = [];
+for (const rule of KEYWORD_RULES) {
+if (rule.re.test(text)) out.push(...rule.deltas);
+if (out.length >= MAX_DELTAS_PER_MESSAGE) break;
+}
+return out.slice(0, MAX_DELTAS_PER_MESSAGE);
+}
+
+function sanitizeDeltas(raw) {
+if (!Array.isArray(raw)) return [];
+const out = [];
+for (const d of raw.slice(0, MAX_DELTAS_PER_MESSAGE)) {
+if (!d || typeof d!== 'object') continue;
+if (!['start', 'update', 'end', 'snooze'].includes(d.action)) continue;
+if (d.action === 'snooze') {
+const minutes = Number(d.minutes);
+if (Number.isFinite(minutes) && minutes >= SNOOZE_MIN && minutes <= SNOOZE_MAX) out.push({ action: 'snooze', minutes});
+continue;
+}
+if (!SCENE_TYPES.includes(d.scene_type)) continue;
+const v = validateSceneTiming({ cadenceMin: d.cadence_min, durationMin: d.duration_min});
+if (!v.ok) continue;
+out.push({
+action: d.action, sceneType: d.scene_type,
+facts: Array.isArray(d.facts)? d.facts.map(String).slice(0, 10): undefined,
+cadenceMin: d.cadence_min, durationMin: d.duration_min,
+});
+}
+return out;
+}
+
+/**
+* 用户消息分类：先走关键词快路径；无命中且给了 slmClient 时再调
+* 总结副 API 的 SLM 分类。slmClient 须是 async ({ system, userContent}) =>
+* 已解析的 JSON 对象（集成时用 auxApi.callSummaryChat 包装）。
+* 分类失败时返回空 deltas，不建/不改情境。
+*/
+async function classifyUserMessage(text, slmClient) {
+const t = String(text || '');
+const kw = keywordDeltas(t);
+if (kw.length) return { deltas: kw, source: 'keyword'};
+if (typeof slmClient!== 'function') return { deltas: [], source: 'none'};
+try {
+const res = await slmClient({
+system: '你是情境分类器。只输出 JSON：{"deltas":[{"action":"start|update|end","scene_type":"outing|work|bedtime|morning|active_without_chat|silence_escalation|repeat|private_play|sulking|custom","facts":[],"cadence_min":null,"duration_min":null}],"reason":"..."}。没有明确情境变化时 deltas 为空数组。',
+userContent: t,
+});
+return { deltas: sanitizeDeltas(res?.deltas), source: 'slm'};
+} catch {
+return { deltas: [], source: 'slm-failed'};
+}
+}
+
+/**
+* 到期检查（纯函数，可测试）。
+* scenes: [{id,type,nextAt,expiresAt,status,snoozeUntil,...}]
+* alarms: [{id,at,status,...}]
+* 返回 { dueAlarms, dueScenes, expiredAlarms, expiredScenes}。
+* 过期安排（闹钟超宽限、情境超有效期）直接进 expired，绝不补发。
+*/
+function checkDue(scenes, alarms, nowMs, opts = {}) {
+const alarmGrace = opts.alarmGraceMs?? ALARM_GRACE_MS;
+const sceneGrace = opts.sceneGraceMs?? SCENE_GRACE_MS;
+const dueAlarms = []; const expiredAlarms = [];
+for (const a of alarms || []) {
+if (a.status!== 'pending') continue;
+if (nowMs < a.at) continue;
+if (nowMs - a.at <= alarmGrace) dueAlarms.push(a);
+else expiredAlarms.push(a);
+}
+const dueScenes = []; const expiredScenes = [];
+for (const s of scenes || []) {
+if (s.status!== 'active') continue;
+if (s.snoozeUntil && nowMs < s.snoozeUntil) continue;
+if (nowMs >= s.expiresAt) { expiredScenes.push(s); continue;}
+if (nowMs >= s.nextAt && nowMs - s.nextAt <= sceneGrace) dueScenes.push(s);
+else if (nowMs >= s.nextAt) {
+// 超过宽限但未到有效期：跳过本轮，不补发，下次时间顺延到现在+节奏
+// （调用方据此更新 nextAt；这里不把它算进 due，也不算 expired）
+}
+}
+return { dueAlarms, dueScenes, expiredAlarms, expiredScenes};
+}
+
+/**
+* 组装唤醒报告：触发原因 + 有效情境 + 字条，不含任何位置/App/健康推断。
+* wakeCount 从 1 开始：第 1、6、11……次用完整报告，其余精简。
+*/
+function buildWakeReport({ trigger, scenes = [], notes = [], wakeCount = 1, charId} = {}) {
+const full = ((wakeCount - 1) % 5) === 0;
+const sceneLines = [...scenes]
+.sort((a, b) => (SCENE_DEFAULTS[b.type]?.priority || 0) - (SCENE_DEFAULTS[a.type]?.priority || 0))
+.map((s) => `- ${SCENE_DEFAULTS[s.type]?.label || s.type}${s.title? `「${s.title}」`: ''}${(s.facts || []).length? `：${s.facts.join('；')}`: ''}`);
+const noteLines = notes
+.filter((n) => n && n.text)
+.map((n) => `- （字条 v${n.version}，第 ${n.reads + 1}/${NOTE_MAX_READS} 次读）${n.text}`);
+const lines = [
+full? '': '',
+`触发原因：${trigger || '到时检查'}`,
+charId? `角色：${charId}`: null,
+sceneLines.length? `有效情境：\n${sceneLines.join('\n')}`: '有效情境：无',
+noteLines.length? `短期字条：\n${noteLines.join('\n')}`: '短期字条：无',
+'说明：本报告不含位置、App 使用、健康数据（本阶段不采集）。',
+].filter(Boolean);
+return {
+text: lines.join('\n'),
+full,
+trigger: trigger || '到时检查',
+scenes: scenes.map((s) => ({ id: s.id, type: s.type, title: s.title || null})),
+notes: notes.filter((n) => n && n.text).map((n) => ({ sceneId: n.sceneId, version: n.version, reads: n.reads})),
+};
+}
+
+/** 内存 store：与 storage.js 后端同接口（get/put/getAll/delete），供测试与未建表时使用。 */
+function createMemoryWakeStore() {
+const tables = { wakeScenes: new Map(), wakeAlarms: new Map(), wakeReceipts: new Map(), settings: new Map()};
+return {
+async get(table, key) { const v = tables[table]?.get(key); return v === undefined? null: structuredClone(v);},
+async put(table, value) { const key = value.id?? value.key?? value.wakeId; tables[table].set(key, structuredClone(value)); return key;},
+async getAll(table) { return [...(tables[table]?.values() || [])].map((v) => structuredClone(v));},
+async delete(table, key) { return tables[table]?.delete(key);},
+};
+}
+
+// 建表迁移见 js/storage.js 的 ensureWakeStores（v3→v4，本文件不再重复定义，
+// 避免 build-preview.mjs 拼接后出现同名顶层函数）。
+
+/** 多标签页认领锁：lockStore 须实现 getItem/setItem/removeItem（默认用 localStorage）。 */
+function tryClaimLock(lockStore, key, holderId, nowMs, ttlMs = CLAIM_TTL_MS) {
+if (!lockStore) return { ok: true, holder: holderId};
+let raw = null;
+try { raw = lockStore.getItem(key);} catch { raw = null;}
+if (raw) {
+try {
+const prev = JSON.parse(raw);
+if (prev.holder!== holderId && prev.expiresAt > nowMs) return { ok: false, holder: prev.holder};
+} catch { /* 损坏的锁记录视为可覆盖 */}
+}
+try { lockStore.setItem(key, JSON.stringify({ holder: holderId, expiresAt: nowMs + ttlMs}));} catch { /* 写锁失败不阻塞 */}
+return { ok: true, holder: holderId};
+}
+
+class WakeEngine {
+constructor(opts = {}) {
+this.store = opts.store || createMemoryWakeStore();
+this.clock = opts.clock || (() => Date.now());
+this.holderId = opts.holderId || wakeUid('tab');
+this.lockStore = opts.lockStore?? (typeof localStorage!== 'undefined'? localStorage: null);
+this.channelFactory = opts.channelFactory || null; // () => BroadcastChannel 实例
+this.slmClient = opts.slmClient || null;
+this.settings = {...DEFAULT_WAKE_SETTINGS,...(opts.settings || {})};
+this.userTyping = false;
+this.cancelled = new Set();
+this.channel = null;
+if (this.channelFactory) {
+try {
+this.channel = this.channelFactory('verweile-wake');
+this.channel.onmessage = (e) => {
+if (e?.data?.type === 'wake-claimed') this.cancelled.add(e.data.wakeId);
+};
+} catch { this.channel = null;}
+}
+}
+
+async loadSettings() {
+const saved = await this.store.get('settings', WAKE_SETTINGS_KEY).catch(() => null);
+if (saved?.value) this.settings = {...DEFAULT_WAKE_SETTINGS,...saved.value};
+return this.settings;
+}
+async saveSettings(patch) {
+this.settings = {...this.settings,...patch};
+await this.store.put('settings', { key: WAKE_SETTINGS_KEY, value: this.settings});
+return this.settings;
+}
+isEnabledFor(charId) {
+if (!this.settings.enabled) return false;
+if (charId && this.settings.perChar[charId] === false) return false;
+return true;
+}
+isBackendConfigured() { return false;} // 真后台版预留：未配置前恒为 false
+getModeText() { return WAKE_MODE_TEXT;}
+
+setUserTyping(v) { this.userTyping =!!v;}
+isUserTyping() { return this.userTyping;}
+cancelWake(wakeId, reason) {
+this.cancelled.add(wakeId);
+return { wakeId, cancelled: true, reason: reason || '用户正在发言，唤醒回合让位'};
+}
+
+async _dayCounts(nowMs) {
+const day = cstDayKey(nowMs);
+const receipts = await this.store.getAll('wakeReceipts');
+const today = receipts.filter((r) => r.day === day);
+return {
+wakes: today.length,
+messages: today.filter((r) => r.notified).length,
+};
+}
+
+/** 当日上限 + 冷却 + 免打扰 + 总开关的统一门禁。 */
+async canWake(charId, nowMs = this.clock()) {
+if (!this.isEnabledFor(charId)) return { ok: false, reason: '主动唤醒未开启'};
+if (isInDnd(this.settings.dnd, nowMs)) return { ok: false, reason: '免打扰时段内，不唤醒'};
+const counts = await this._dayCounts(nowMs);
+if (counts.wakes >= this.settings.maxWakesPerDay) return { ok: false, reason: `今日唤醒已达上限（${this.settings.maxWakesPerDay} 次）`};
+if (counts.messages >= this.settings.maxMessagesPerDay) return { ok: false, reason: `今日主动消息已达上限（${this.settings.maxMessagesPerDay} 条）`};
+const receipts = await this.store.getAll('wakeReceipts');
+const last = receipts.map((r) => r.completedAt || r.acceptedAt || 0).filter(Boolean);
+const lastAt = last.length? Math.max(...last): 0;
+if (lastAt && nowMs - lastAt < this.settings.cooldownMin * 60 * 1000) {
+return { ok: false, reason: `冷却期内（${this.settings.cooldownMin} 分钟），暂不唤醒`};
+}
+return { ok: true, counts};
+}
+
+async startScene({ charId, sceneType, title, facts, cadenceMin, durationMin, nowMs = this.clock()}) {
+const def = SCENE_DEFAULTS[sceneType];
+if (!def) return { ok: false, reason: `未知情境类型：${sceneType}`};
+const v = validateSceneTiming({ cadenceMin, durationMin});
+if (!v.ok) return { ok: false, reason: v.errors.join('；')};
+const cad = cadenceMin?? def.cadenceMin;
+const dur = durationMin?? def.durationMin;
+const scene = {
+id: wakeUid('scene'), charId, type: sceneType, title: title || def.label,
+facts: facts || [], cadenceMin: cad, durationMin: dur,
+startedAt: nowMs, expiresAt: nowMs + dur * 60 * 1000, nextAt: nowMs + cad * 60 * 1000,
+status: 'active', snoozeUntil: null, note: null, wakeWhen: null,
+};
+await this.store.put('wakeScenes', scene);
+return { ok: true, scene};
+}
+
+async endScene(ref, nowMs = this.clock(), charId) {
+const scenes = await this.store.getAll('wakeScenes');
+const target = scenes.find((s) => (ref.sceneId? s.id === ref.sceneId: s.type === ref.sceneType) && s.status === 'active' && (!charId || s.charId === charId));
+if (!target) return { ok: false, reason: '没有找到对应的有效情境'};
+target.status = 'ended'; target.endedAt = nowMs;
+await this.store.put('wakeScenes', target);
+return { ok: true, scene: target};
+}
+
+/** 更新情境（节奏/有效期/标题/事实；wake_when 仍一律拒绝，见 validateWakeWhen）。 */
+async updateScene(ref, patch = {}, nowMs = this.clock(), charId) {
+const scenes = await this.store.getAll('wakeScenes');
+const target = scenes.find((s) => (ref.sceneId? s.id === ref.sceneId: s.type === ref.sceneType) && s.status === 'active' && (!charId || s.charId === charId));
+if (!target) return { ok: false, reason: '没有找到对应的有效情境'};
+const v = validateSceneTiming({ cadenceMin: patch.cadenceMin, durationMin: patch.durationMin});
+if (!v.ok) return { ok: false, reason: v.errors.join('；')};
+if (patch.cadenceMin !== undefined && patch.cadenceMin !== null) target.cadenceMin = patch.cadenceMin;
+if (patch.durationMin !== undefined && patch.durationMin !== null) { target.durationMin = patch.durationMin; target.expiresAt = target.startedAt + patch.durationMin * 60 * 1000; }
+if (patch.title !== undefined) target.title = patch.title;
+if (Array.isArray(patch.facts)) target.facts = patch.facts;
+target.nextAt = nowMs + target.cadenceMin * 60 * 1000;
+await this.store.put('wakeScenes', target);
+return { ok: true, scene: target};
+}
+
+/** 暂缓：把某角色全部有效情境 snooze 指定分钟（用户说“先别发”时用）。 */
+async snoozeScenes(charId, minutes, nowMs = this.clock()) {
+if (!Number.isFinite(minutes) || minutes < SNOOZE_MIN || minutes > SNOOZE_MAX) {
+return { ok: false, reason: `snooze 时长须在 ${SNOOZE_MIN}–${SNOOZE_MAX} 分钟之间`};
+}
+const scenes = await this.store.getAll('wakeScenes');
+let n = 0;
+for (const s of scenes.filter((x) => x.charId === charId && x.status === 'active')) {
+s.snoozeUntil = nowMs + minutes * 60 * 1000;
+await this.store.put('wakeScenes', s);
+n += 1;
+}
+return { ok: true, snoozed: n, until: nowMs + minutes * 60 * 1000 };
+}
+
+async setAlarm({ charId, at, note, nowMs = this.clock()}) {
+if (!Number.isFinite(at) || at <= nowMs) return { ok: false, reason: '闹钟必须是未来时间，过期闹钟拒绝。'};
+const alarm = { id: wakeUid('alarm'), charId, at, note: note || '', status: 'pending', createdAt: nowMs};
+await this.store.put('wakeAlarms', alarm);
+return { ok: true, alarm};
+}
+
+/** 字条：写入即版本 +1、已读次数清零；成功读满 3 次后不再提供。 */
+async setNote(sceneId, text) {
+const scene = await this.store.get('wakeScenes', sceneId);
+if (!scene) return { ok: false, reason: '情境不存在'};
+const version = (scene.note?.version || 0) + 1;
+scene.note = { text, version, reads: 0};
+await this.store.put('wakeScenes', scene);
+return { ok: true, note: scene.note};
+}
+async clearNote(sceneId) {
+const scene = await this.store.get('wakeScenes', sceneId);
+if (!scene) return { ok: false, reason: '情境不存在'};
+scene.note = null;
+await this.store.put('wakeScenes', scene);
+return { ok: true};
+}
+/** 读字条（只计数、不消费）：返回 null 表示已读满 3 次或无字条。 */
+readNote(scene) {
+if (!scene?.note?.text) return null;
+if (scene.note.reads >= NOTE_MAX_READS) return null;
+return { sceneId: scene.id, text: scene.note.text, version: scene.note.version, reads: scene.note.reads};
+}
+/** 唤醒成功完成且有实质内容时，按报告引用的版本消费一次。 */
+async consumeNotes(noteRefs) {
+for (const ref of noteRefs || []) {
+const scene = await this.store.get('wakeScenes', ref.sceneId);
+if (!scene?.note || scene.note.version!== ref.version) continue; // 版本不符不扣次数
+scene.note.reads = Math.min(NOTE_MAX_READS, (scene.note.reads || 0) + 1);
+await this.store.put('wakeScenes', scene);
+}
+}
+
+/** 用户消息入口：分类 → 应用增量（每条最多 3 个）。分类失败不建/不改情境。 */
+async userMessage(charId, messageId, text, at = this.clock()) {
+void messageId; void at;
+const { deltas} = await classifyUserMessage(text, this.slmClient);
+const applied = [];
+for (const d of deltas) {
+if (d.action === 'start') {
+const r = await this.startScene({ charId, sceneType: d.sceneType, facts: d.facts, cadenceMin: d.cadenceMin, durationMin: d.durationMin});
+if (r.ok) applied.push({ action: 'start', sceneType: d.sceneType});
+} else if (d.action === 'end') {
+const r = await this.endScene({ sceneType: d.sceneType}, at, charId);
+if (r.ok) applied.push({ action: 'end', sceneType: d.sceneType});
+} else if (d.action === 'snooze') {
+const scenes = await this.store.getAll('wakeScenes');
+for (const s of scenes.filter((x) => x.charId === charId && x.status === 'active')) {
+s.snoozeUntil = at + d.minutes * 60 * 1000;
+await this.store.put('wakeScenes', s);
+}
+applied.push({ action: 'snooze', minutes: d.minutes});
+}
+}
+return { deltas, applied};
+}
+
+/** 领取认领：先写 claim 记录再执行；过期 claim 可回收；多标签页互斥。 */
+async claimWake(wakeId, nowMs = this.clock()) {
+const key = `wake-claim:${wakeId}`;
+const lock = tryClaimLock(this.lockStore, key, this.holderId, nowMs);
+if (!lock.ok) return { ok: false, reason: `已被另一标签页领取（持有者 ${lock.holder}）`};
+let receipt = await this.store.get('wakeReceipts', wakeId);
+if (receipt?.claim && receipt.claim.holder!== this.holderId && receipt.claim.expiresAt > nowMs) {
+return { ok: false, reason: '已被认领（回执锁未过期）'};
+}
+if (!receipt) {
+receipt = { wakeId, trigger: '', charId: '', acceptedAt: null, completedAt: null, notifiedAt: null, accepted: null, completed: false, notified: false, error: null, day: cstDayKey(nowMs), claim: null};
+}
+receipt.claim = { holder: this.holderId, expiresAt: nowMs + CLAIM_TTL_MS};
+await this.store.put('wakeReceipts', receipt);
+try { this.channel?.postMessage({ type: 'wake-claimed', wakeId, holder: this.holderId});} catch { /* ignore */}
+return { ok: true, receipt};
+}
+
+/** 回执三分开记：accepted / completed / notified 各自独立。 */
+async markReceipt(wakeId, field, value, nowMs = this.clock()) {
+const receipt = (await this.store.get('wakeReceipts', wakeId)) || { wakeId, trigger: '', charId: '', acceptedAt: null, completedAt: null, notifiedAt: null, accepted: null, completed: false, notified: false, error: null, day: cstDayKey(nowMs), claim: null};
+if (field === 'accepted') { receipt.accepted = value; receipt.acceptedAt = value === null? null: nowMs;}
+if (field === 'completed') { receipt.completed =!!value; receipt.completedAt = nowMs;}
+if (field === 'notified') { receipt.notified =!!value; receipt.notifiedAt = value? nowMs: null;}
+await this.store.put('wakeReceipts', receipt);
+return receipt;
+}
+
+/**
+* 回执去重发送：同一 wakeId 已 notified 时不再重复发。
+* sendFn(wakeId) 须返回 { delivered: boolean}。
+*/
+async sendOnce(wakeId, sendFn, nowMs = this.clock()) {
+const receipt = await this.store.get('wakeReceipts', wakeId);
+if (receipt?.notified) return { ok: true, delivered: true, deduped: true, reason: '该唤醒已发送过，不重复发'};
+const res = await sendFn(wakeId);
+if (res?.delivered) await this.markReceipt(wakeId, 'notified', true, nowMs);
+return { ok:!!res?.delivered, delivered:!!res?.delivered, deduped: false};
+}
+
+/**
+* 前端运行版检查：页面可见 / 恢复前台时调用。
+* 用户正在发言时让位；过期安排标记过期，绝不补发。
+* 返回 { due: [{ wakeId, trigger, scenes, alarms, report}], expired: [...]}。
+*/
+async checkDueOnForeground(nowMs = this.clock()) {
+if (this.isUserTyping()) return { due: [], expired: [], skipped: 'user-typing'};
+const scenes = await this.store.getAll('wakeScenes');
+const alarms = await this.store.getAll('wakeAlarms');
+const { dueAlarms, dueScenes, expiredAlarms, expiredScenes} = checkDue(scenes, alarms, nowMs);
+const expired = [];
+for (const a of expiredAlarms) { a.status = 'expired'; await this.store.put('wakeAlarms', a); expired.push({ kind: 'alarm', id: a.id});}
+for (const s of expiredScenes) { s.status = 'expired'; await this.store.put('wakeScenes', s); expired.push({ kind: 'scene', id: s.id});}
+// 超宽限未到期情境：下次时间顺延，不补发
+for (const s of scenes) {
+if (s.status === 'active' && nowMs >= s.nextAt && nowMs - s.nextAt > SCENE_GRACE_MS && nowMs < s.expiresAt) {
+s.nextAt = nowMs + s.cadenceMin * 60 * 1000;
+await this.store.put('wakeScenes', s);
+}
+}
+const due = [];
+const groups = new Map(); // 按 charId 合并同一轮到期项
+for (const a of dueAlarms) {
+if (!groups.has(a.charId)) groups.set(a.charId, { alarms: [], scenes: []});
+groups.get(a.charId).alarms.push(a);
+}
+for (const s of dueScenes) {
+if (!groups.has(s.charId)) groups.set(s.charId, { alarms: [], scenes: []});
+groups.get(s.charId).scenes.push(s);
+}
+for (const [charId, g] of groups) {
+const gate = await this.canWake(charId, nowMs);
+if (!gate.ok) continue;
+const wakeId = wakeUid('wake');
+const claim = await this.claimWake(wakeId, nowMs);
+if (!claim.ok) continue;
+const notes = g.scenes.map((s) => this.readNote(s)).filter(Boolean);
+const receipts = await this.store.getAll('wakeReceipts');
+const report = buildWakeReport({
+trigger: g.alarms.length? `闹钟到了：${g.alarms.map((a) => a.note || '闹钟').join('；')}`: `情境到了：${g.scenes.map((s) => s.title).join('、')}`,
+scenes: g.scenes, notes, wakeCount: receipts.length + 1, charId,
+});
+due.push({ wakeId, trigger: report.trigger, charId, scenes: g.scenes, alarms: g.alarms, report});
+for (const a of g.alarms) { a.status = 'fired'; await this.store.put('wakeAlarms', a);}
+for (const s of g.scenes) { s.nextAt = nowMs + s.cadenceMin * 60 * 1000; await this.store.put('wakeScenes', s);}
+}
+return { due, expired};
+}
+
+/**
+* 唤醒回合结果处理，三种分支都要有：
+* - send：模型决定发送一条主动消息（由调用方经 sendOnce 实际发送）
+* - skip：模型决定暂不发消息（只记 completed，不记 notified）
+* - reschedule：模型用工具调用调整安排（经 parseWakeToolCall 校验后执行）
+*/
+async handleWakeOutcome(wakeId, outcome, nowMs = this.clock()) {
+if (this.cancelled.has(wakeId) || this.isUserTyping()) {
+return { ok: false, reason: '用户正在发言，唤醒回合已让位/取消', decision: 'cancelled'};
+}
+const decision = outcome?.decision;
+if (decision === 'send') {
+await this.markReceipt(wakeId, 'completed', true, nowMs);
+return { ok: true, decision: 'send', message: outcome.message || ''};
+}
+if (decision === 'skip') {
+await this.markReceipt(wakeId, 'completed', true, nowMs);
+return { ok: true, decision: 'skip'};
+}
+if (decision === 'reschedule') {
+const parsed = parseWakeToolCall(outcome.toolCall);
+if (!parsed.ok) return { ok: false, decision: 'reschedule', reason: parsed.reason};
+await this.markReceipt(wakeId, 'completed', true, nowMs);
+return { ok: true, decision: 'reschedule', toolCall: parsed};
+}
+return { ok: false, reason: `未知的唤醒结果 decision：${String(decision)}（须为 send / skip / reschedule）`};
+}
+
+/** 唤醒成功完成且有实质内容时，消费报告引用的字条。 */
+async settleWake(wakeId, report, substantive) {
+if (!substantive) return { consumed: false};
+await this.consumeNotes(report?.notes || []);
+return { consumed: true};
+}
+
+/**
+* 执行一条已通过 parseWakeToolCall 校验的工具调用（先校验、后执行；
+* 未校验的原始输入请先走 parseWakeToolCall，不要直接调本函数）。
+* parsed = { ok:true, action, params }；charId 缺省时用 fallbackCharId。
+*/
+async applyWakeToolCall(parsed, fallbackCharId, nowMs = this.clock()) {
+if (!parsed?.ok) return { ok: false, reason: parsed?.reason || '工具调用未通过校验，拒绝执行。'};
+const p = parsed.params || {};
+const charId = p.charId || fallbackCharId;
+switch (parsed.action) {
+case 'set_alarm': return this.setAlarm({ charId, at: p.at, note: p.note, nowMs });
+case 'set_repeat': return this.startScene({ charId, sceneType: p.sceneType, title: p.title, cadenceMin: p.cadenceMin, durationMin: p.durationMin, nowMs });
+case 'snooze': {
+if (p.sceneId) {
+const scene = await this.store.get('wakeScenes', p.sceneId);
+if (!scene) return { ok: false, reason: '情境不存在'};
+scene.snoozeUntil = nowMs + p.minutes * 60 * 1000;
+await this.store.put('wakeScenes', scene);
+return { ok: true, scene };
+}
+return this.snoozeScenes(charId, p.minutes, nowMs);
+}
+case 'end_scene': return this.endScene({ sceneId: p.sceneId, sceneType: p.sceneType }, nowMs, charId);
+case 'update_scene': return this.updateScene({ sceneId: p.sceneId, sceneType: p.sceneType }, { cadenceMin: p.cadenceMin, durationMin: p.durationMin, title: p.title, facts: p.facts }, nowMs, charId);
+case 'set_note': return this.setNote(p.sceneId, p.note);
+case 'clear_note': return this.clearNote(p.sceneId);
+default: return { ok: false, reason: `未知的唤醒动作：${String(parsed.action)}`};
+}
+}
+}
+
+/**
+* 设置区渲染（由总协调员接进 app.js 设置页）。
+* deps：{ settings, onSave(settings), chars（[{id, name}]，用于角色独立开关）,
+*         wakeEngine（本实例，用于读当日计数）, toast? }。
+*/
+function renderWakeSettingsSection(container, deps = {}) {
+const s = { ...DEFAULT_WAKE_SETTINGS, ...(deps.settings || {}) };
+const dnd = s.dnd || {};
+const html = `
+<h3>主动唤醒</h3>
+<p class="muted">${WAKE_EXPLAIN_TEXT}</p>
+<p class="muted b-honesty">${WAKE_MODE_TEXT}</p>
+<div class="setting-row"><span class="setting-label">开启主动唤醒<small>默认关闭</small></span><label class="switch"><input type="checkbox" id="wake-enabled" ${s.enabled ? 'checked' : ''}><span class="switch-track"></span></label></div>
+<div class="field"><label>免打扰时段</label><div class="setting-row"><span class="setting-label">启用<small>按 UTC+8 计，可跨午夜。</small></span><label class="switch"><input type="checkbox" id="wake-dnd-enabled" ${dnd.enabled ? 'checked' : ''}><span class="switch-track"></span></label></div><div class="row"><input type="time" id="wake-dnd-start" value="${dnd.start || '23:00'}"> – <input type="time" id="wake-dnd-end" value="${dnd.end || '08:00'}"></div></div>
+<div class="field"><label>两次唤醒最短间隔（分钟）</label><input type="number" id="wake-cooldown" min="0" max="240" value="${s.cooldownMin ?? 10}"></div>
+<div class="field"><label>每日唤醒上限（次，按 UTC+8 自然日）</label><input type="number" id="wake-max-wakes" min="1" max="500" value="${s.maxWakesPerDay ?? 50}"></div>
+<div class="field"><label>每日主动消息上限（条，按 UTC+8 自然日）</label><input type="number" id="wake-max-msgs" min="1" max="500" value="${s.maxMessagesPerDay ?? 50}"></div>
+<div class="field"><label>巡检间隔（分钟，仅页面可见时检查）</label><input type="number" id="wake-patrol" min="1" max="120" value="${s.patrolIntervalMin ?? 15}"></div>
+${(deps.chars || []).map((c) => `<div class="setting-row"><span class="setting-label">允许 ${c.name || c.id} 主动唤醒</span><label class="switch"><input type="checkbox" data-wake-char="${c.id}" ${s.perChar?.[c.id] === false ? '' : 'checked'}><span class="switch-track"></span></label></div>`).join('')}
+<div class="actions-row"><button class="primary" id="wake-save">保存唤醒设置</button></div>`;
+if (container) container.innerHTML = html;
+const q = (id) => container?.querySelector?.(`#${id}`);
+q('wake-save')?.addEventListener?.('click', async () => {
+const perChar = { ...(s.perChar || {}) };
+container?.querySelectorAll?.('[data-wake-char]')?.forEach?.((cb) => { perChar[cb.dataset.wakeChar] = !!cb.checked; });
+const next = {
+enabled: q('wake-enabled')?.checked ?? s.enabled,
+dnd: { enabled: q('wake-dnd-enabled')?.checked ?? false, start: q('wake-dnd-start')?.value || '23:00', end: q('wake-dnd-end')?.value || '08:00' },
+cooldownMin: Math.max(0, parseInt(q('wake-cooldown')?.value || '10', 10) || 0),
+maxWakesPerDay: Math.max(1, parseInt(q('wake-max-wakes')?.value || '50', 10) || 50),
+maxMessagesPerDay: Math.max(1, parseInt(q('wake-max-msgs')?.value || '50', 10) || 50),
+patrolIntervalMin: Math.max(1, parseInt(q('wake-patrol')?.value || '15', 10) || 15),
+perChar,
+};
+await deps.onSave?.(next);
+deps.toast?.('唤醒设置已保存');
+});
+return html;
+}
+
 /* ===== js/importExport.js ===== */
 // importExport.js — 导入导出（importExport）。
 // 支持普通 JSON 与 gzip / zlib / ZIP / UTF-16 / base64 包装的 .ee，按文件实际内容识别格式，不只看扩展名。
@@ -1643,6 +8055,7 @@ async function saveStatusTemplate(backend, panel) {
 // 不以相同正文/时间戳删消息；重复导入用稳定 ID + 冲突报告判断；
 // 未识别字段（向量 entries、模板绑定、记忆来源等）原样保存，标注“待接入”；
 // 凭据默认不导出，含密钥的私人备份需明确选择。
+
 
 function toUint8(input) {
   if (input instanceof Uint8Array) return input;
@@ -1989,8 +8402,9 @@ const KNOWN_CHAR_FIELDS = new Set(['id', 'realName', 'myName', 'remarkName', 'my
   'isPinned', 'avatarMode', 'showTimestamp', 'timestampPosition', 'customBubbleCss', 'useCustomBubbleCss',
   'showStatusUpdateMsg', 'promptOverride', 'memoryMode', 'isContextDisabled']);
 const KNOWN_TOP_FIELDS = new Set(['characters', 'groups', 'worldBooks', 'myStickers', 'memoryJournals',
-  'apiSettings', 'apiPresets', 'cotSettings', 'cotPresets', 'globalSettings', 'settings',
-  'version', 'appVersion', 'exportedAt', 'backupVersion', 'messages', 'history', 'data', 'formatName', 'formatVersion']);
+  'apiSettings', 'apiPresets', 'summaryApi', 'embeddingApi', 'cotSettings', 'cotPresets', 'globalSettings', 'settings',
+  'version', 'appVersion', 'exportedAt', 'backupVersion', 'messages', 'history', 'data', 'formatName', 'formatVersion', 'experiences',
+  'notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings', 'wakeScenes', 'wakeAlarms', 'wakeReceipts']);
 
 /** Dexie 导出（{ formatName, data: { tables: [{ name, rows }] } }）转回标准备份结构。 */
 function dexieTablesToBackup(tables) {
@@ -2018,6 +8432,7 @@ function dexieTablesToBackup(tables) {
   if (byName.get('myStickers')) out.myStickers = byName.get('myStickers');
   if (byName.get('memoryJournals')) out.memoryJournals = byName.get('memoryJournals');
   if (byName.get('journals')) out.memoryJournals = [...out.memoryJournals, ...byName.get('journals')];
+  if (byName.get('experiences')) out.experiences = byName.get('experiences');
   if (byName.get('groups')) out.groups = byName.get('groups');
   return out;
 }
@@ -2057,8 +8472,10 @@ function normalizeBackup(raw) {
     data = { ...data, characters: groupMessagesIntoCharacters(topMessages) };
   }
   const out = {
-    characters: [], worldBooks: [], stickers: [], journals: [],
-    groups: [], apiSettings: null, apiPresets: [], cotSettings: null,
+    characters: [], worldBooks: [], stickers: [], journals: [], experiences: [],
+    groups: [], apiSettings: null, apiPresets: [], summaryApi: null, embeddingApi: null, cotSettings: null,
+    notifySettings: null, audioKeepAlive: null, pushSettings: null, customIcon: null, wakeSettings: null,
+    wakeScenes: [], wakeAlarms: [], wakeReceipts: [],
     unknown: {}, gaps: [],
   };
   const chars = Array.isArray(data.characters) ? data.characters : [];
@@ -2100,12 +8517,34 @@ function normalizeBackup(raw) {
   if (Array.isArray(data.memoryJournals)) {
     out.journals = data.memoryJournals.map((j) => normalizeJournal(j, null));
   }
+  // 经历是源数据（不是可重建的索引缓存），必须随备份走：顶层 experiences 字段，
+  // 与 journals 同级。向量/关键词索引不导出，恢复后记忆页显示“未建立/缺失 N 条”。
+  if (Array.isArray(data.experiences)) {
+    for (const e of data.experiences) {
+      const n = normalizeExperience(e);
+      if (n) out.experiences.push(n);
+      else out.gaps.push('有 1 条经历缺少角色 ID 或原话来源，已跳过。');
+    }
+  }
   out.groups = Array.isArray(data.groups) ? data.groups : [];
   if (out.groups.length) out.gaps.push(`备份含 ${out.groups.length} 个群聊，本阶段为单人聊天，不展示群聊，但数据已原样保存。`);
   out.apiSettings = data.apiSettings || null;
   out.apiPresets = Array.isArray(data.apiPresets) ? data.apiPresets : [];
+  // 两套独立副 API 配置：与主 API 一样，导入时只留非 Key 字段待确认，Key 永不自动恢复。
+  out.summaryApi = data.summaryApi || null;
+  out.embeddingApi = data.embeddingApi || null;
   // 全局提示词设置：顶层 cotSettings 优先，其次 globalSettings 里的 cotSettings。
   out.cotSettings = data.cotSettings || data.globalSettings?.cotSettings || null;
+  // B 组设置与唤醒表：与 api / assocSettings 同一模式随备份走；
+  // pushSettings.vapidPublicKey 是公钥，私钥只在服务器 .env，绝不进备份。
+  out.notifySettings = data.notifySettings || null;
+  out.audioKeepAlive = data.audioKeepAlive || null;
+  out.pushSettings = data.pushSettings || null;
+  out.customIcon = data.customIcon || null;
+  out.wakeSettings = data.wakeSettings || null;
+  out.wakeScenes = Array.isArray(data.wakeScenes) ? data.wakeScenes : [];
+  out.wakeAlarms = Array.isArray(data.wakeAlarms) ? data.wakeAlarms : [];
+  out.wakeReceipts = Array.isArray(data.wakeReceipts) ? data.wakeReceipts : [];
   for (const k of Object.keys(data)) {
     if (!KNOWN_TOP_FIELDS.has(k)) out.unknown[k] = data[k];
   }
@@ -2124,8 +8563,28 @@ function splitUnknown(obj, known) {
 
 function normalizeJournal(j, charId) {
   if (!j || typeof j !== 'object') return j;
-  const { _unknown, ...rest } = splitUnknown(j, new Set(['id', 'title', 'content', 'isFavorited', 'timestamp', 'createdAt', 'source', 'charId', 'characterId']));
+  const { _unknown, ...rest } = splitUnknown(j, new Set(['id', 'title', 'content', 'isFavorited', 'timestamp', 'createdAt', 'source', 'charId', 'characterId', 'isSummary', 'sourceMessageIds', 'range', 'retrievalEnabled']));
   return { ...rest, charId: charId ?? j.charId ?? j.characterId ?? null, _unknown };
+}
+
+/**
+ * 归一化一条经历：复用 experiences.createExperienceRecord 做形状校验
+ * （原话必须带来源消息 ID、线索最多 4 条、plan/outcome 分离、outcome 须有
+ * 后续原文佐证），非法形状返回 null 由调用方记入 gaps。createdAt/updatedAt
+ * 按备份原值保留，不以导入时间覆盖。
+ */
+function normalizeExperience(e) {
+  if (!e || typeof e !== 'object') return null;
+  const charId = e.charId ?? e.characterId ?? null;
+  if (!charId) return null;
+  try {
+    const n = createExperienceRecord({ ...e, charId });
+    if (Number.isFinite(e.createdAt)) n.createdAt = e.createdAt;
+    if (Number.isFinite(e.updatedAt)) n.updatedAt = e.updatedAt;
+    return n;
+  } catch {
+    return null;
+  }
 }
 
 /** 无 ID 的消息用稳定 ID 识别：charId + timestamp + 内容哈希；绝不按正文/时间去重删除。 */
@@ -2147,14 +8606,25 @@ function normalizeMessage(m, charId) {
 
 function previewCounts(normalized) {
   const messages = normalized.characters.reduce((s, c) => s + (c.history?.length || 0), 0);
+  // 记忆数按导出实际结构算：角色内嵌的 memoryJournals + 顶层 journals，
+  // 同 id 只计一次（导出时两者是同一批记忆的两种写法，不是两批）。
+  const journalIds = new Set();
+  for (const c of normalized.characters) {
+    for (const j of c.memoryJournals || []) journalIds.add(j?.id || `char:${c.id}|${j?.title || ''}|${j?.timestamp || ''}`);
+  }
+  for (const j of normalized.journals || []) journalIds.add(j?.id || `top:${j?.title || ''}|${j?.timestamp || ''}`);
   return {
     characters: normalized.characters.map((c) => ({
-      id: c.id, realName: c.realName, messages: c.history?.length || 0,
+      id: c.id, realName: c.realName, remarkName: c.remarkName, messages: c.history?.length || 0,
       journals: c.memoryJournals?.length || 0, worldBooks: (c.worldBookIds || []).length,
     })),
     worldBooks: normalized.worldBooks.length,
     stickers: normalized.stickers.length,
-    journals: normalized.journals.length,
+    journals: journalIds.size,
+    experiences: (normalized.experiences || []).length,
+    wakeScenes: (normalized.wakeScenes || []).length,
+    wakeAlarms: (normalized.wakeAlarms || []).length,
+    wakeReceipts: (normalized.wakeReceipts || []).length,
     messages,
     groups: normalized.groups.length,
     unknownKeys: Object.keys(normalized.unknown),
@@ -2185,7 +8655,7 @@ async function importNormalized(backend, normalized, { mode = 'merge', mainChara
   const report = { added: {}, updated: {}, skipped: {}, conflicts: [], unknownPreserved: [], keysStripped: true };
   const count = (t, n) => { report.added[t] = (report.added[t] || 0) + n; };
   if (mode === 'replace') {
-    for (const t of ['characters', 'worldBooks', 'stickers', 'journals', 'messages']) await backend.clear(t);
+    for (const t of ['characters', 'worldBooks', 'stickers', 'journals', 'messages', 'experiences', 'wakeScenes', 'wakeAlarms', 'wakeReceipts']) await backend.clear(t);
   }
   const existingChars = new Map((await backend.getAll('characters')).map((c) => [c.id, c]));
   for (const c of normalized.characters) {
@@ -2238,6 +8708,15 @@ async function importNormalized(backend, normalized, { mode = 'merge', mainChara
     const existing = await backend.get('journals', jid);
     if (!existing) { await backend.put('journals', { ...j, id: jid }); count('journals', 1); }
   }
+  // 经历：按 id 去重，与记忆/世界书同一模式；重复导入不覆盖已有经历。
+  for (const e of normalized.experiences || []) {
+    const existing = await backend.get('experiences', e.id);
+    if (!existing) { await backend.put('experiences', e); count('experiences', 1); }
+    else {
+      report.skipped.experiences = (report.skipped.experiences || 0) + 1;
+      report.conflicts.push(`经历「${e.title || e.id}」已存在：保留原有经历，未覆盖。`);
+    }
+  }
   for (const [k, v] of Object.entries(normalized.unknown || {})) {
     await backend.put('unknown', { key: `backup:${k}`, value: v });
     report.unknownPreserved.push(k);
@@ -2250,6 +8729,32 @@ async function importNormalized(backend, normalized, { mode = 'merge', mainChara
   // 之前 normalize 只解析不保存，界面写死了 promptVersion='tt'，导入的设置根本没用上。
   if (normalized.cotSettings) {
     await backend.put('settings', { key: 'cotSettings', value: normalized.cotSettings });
+  }
+  // B 组设置与唤醒表：与 api / assocSettings 同一模式导入。
+  // wakeReceipts.claim 导入时清空，避免把过期认领带到新设备。
+  for (const key of ['notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings']) {
+    if (normalized[key]) {
+      await backend.put('settings', { key, value: normalized[key] });
+      report.added[key] = 1;
+    }
+  }
+  for (const scene of normalized.wakeScenes || []) {
+    if (!scene?.id) continue;
+    const existing = await backend.get('wakeScenes', scene.id);
+    if (!existing) { await backend.put('wakeScenes', scene); count('wakeScenes', 1); }
+    else report.skipped.wakeScenes = (report.skipped.wakeScenes || 0) + 1;
+  }
+  for (const alarm of normalized.wakeAlarms || []) {
+    if (!alarm?.id) continue;
+    const existing = await backend.get('wakeAlarms', alarm.id);
+    if (!existing) { await backend.put('wakeAlarms', alarm); count('wakeAlarms', 1); }
+    else report.skipped.wakeAlarms = (report.skipped.wakeAlarms || 0) + 1;
+  }
+  for (const r of normalized.wakeReceipts || []) {
+    if (!r?.wakeId) continue;
+    const existing = await backend.get('wakeReceipts', r.wakeId);
+    if (!existing) { await backend.put('wakeReceipts', { ...r, claim: null }); count('wakeReceipts', 1); }
+    else report.skipped.wakeReceipts = (report.skipped.wakeReceipts || 0) + 1;
   }
   // 凭据永不随导入落库：apiSettings/apiPresets 仅在用户于 API 页手动填写后保存。
   return report;
@@ -2266,6 +8771,9 @@ async function exportAll(backend, { includeKeys = false } = {}) {
   }
   out.worldBooks = await backend.getAll('worldBooks');
   out.myStickers = await backend.getAll('stickers');
+  // 经历是源数据，随备份导出（含线索、冷却序号、plan/outcome、原话与来源）；
+  // 向量/关键词索引是可重建缓存，不导出。
+  out.experiences = await backend.getAll('experiences');
   const unknowns = await backend.getAll('unknown');
   for (const u of unknowns) {
     if (String(u.key).startsWith('backup:')) out.unknown[u.key.slice(7)] = u.value;
@@ -2274,12 +8782,28 @@ async function exportAll(backend, { includeKeys = false } = {}) {
   if (settings) out.apiSettings = settings.value;
   const presets = await backend.get('settings', 'apiPresets');
   if (presets) out.apiPresets = presets.value;
+  // 两套独立副 API 配置同样进备份；Key 默认剥离，含密钥的私人备份需明确勾选。
+  const summaryApi = await backend.get('settings', 'summaryApi');
+  if (summaryApi) out.summaryApi = summaryApi.value;
+  const embeddingApi = await backend.get('settings', 'embeddingApi');
+  if (embeddingApi) out.embeddingApi = embeddingApi.value;
+  // B 组设置与唤醒表：与 api / assocSettings 同一模式导出；
+  // pushSettings.vapidPublicKey 是公钥可随备份走，私钥只在服务器 .env，不进备份。
+  for (const key of ['notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings']) {
+    const rec = await backend.get('settings', key);
+    if (rec) out[key] = rec.value;
+  }
+  out.wakeScenes = await backend.getAll('wakeScenes');
+  out.wakeAlarms = await backend.getAll('wakeAlarms');
+  out.wakeReceipts = await backend.getAll('wakeReceipts');
   if (!includeKeys) {
     // 显式删除（stripKeys 也会处理，双重保障）：默认导出绝不含密钥。
     if (out.apiSettings) { const { key, ...rest } = out.apiSettings; void key; out.apiSettings = rest; }
     if (Array.isArray(out.apiPresets)) {
       out.apiPresets = out.apiPresets.map((p) => { const { key, ...rest } = p || {}; void key; return rest; });
     }
+    if (out.summaryApi) { const { key, ...rest } = out.summaryApi; void key; out.summaryApi = rest; }
+    if (out.embeddingApi) { const { key, ...rest } = out.embeddingApi; void key; out.embeddingApi = rest; }
   }
   return includeKeys ? out : stripKeys(out);
 }
@@ -2324,12 +8848,11 @@ const MOCK_BADGE = '模拟回复 · 未调用真实 API';
 // liquidGlass.js — 可复用的液态玻璃引擎（WebGL）。
 // 按原型 uwu-liao-tian-ui-yuan-xing 与《液态玻璃技术方案 v3》移植：
 // 单个 WebGL 上下文绘制全部玻璃元素，同一张背景纹理按元素位置采样，
-// 全表面折射 + 内部低频波动 + 轻微色散，边缘高光左上 0.66 / 右下 0.48。
-// 亮度修正后的默认值：光强 55%、白色染色 2%、边缘高光上限 0.45，
-// Shader 末尾有硬性钳制——玻璃输出相对身后壁纸最多 +0.10 / -0.16，
-// 不可能再爆成近白色。WebGL 不可用或上下文丢失时返回 false，
-// 调用方保留 CSS 玻璃（.glass），布局与交互不变。
-// 本模块不碰 DOM 之外的任何应用状态；不依赖 app.js。
+// 折射集中在边缘窄带、中心安静，色散与染色默认均为 0。
+// Clear 材质默认值（2026-11-20 精修）：光强 55%、边缘高光上限 0.18、
+// 输出 alpha 即 mask（不透明，无画布重影）、亮度钳制 +0.06 / -0.16。
+// WebGL 不可用或上下文丢失时返回 false，调用方保留 CSS 玻璃（.glass），
+// 布局与交互不变。本模块不碰 DOM 之外的任何应用状态；不依赖 app.js。
 
 const LiquidGlass = (() => {
   const VERT_SRC = `
@@ -2401,9 +8924,9 @@ void main() {
   vec2 hn = p / (size * 0.5);
   float radial = length(hn);
   vec2 dir = radial > 0.0001 ? hn / radial : vec2(0.0);
-  float field = 0.16 + 0.84 * max(rim, smoothstep(0.2, 1.05, radial) * 0.55);
+  float field = 0.03 + 0.97 * max(rim, smoothstep(0.2, 1.05, radial) * 0.55);
   vec2 refr = dir * u_refract * field;
-  vec2 wave = vec2(sin(p.y * 0.020 + u_time * 1.25), cos(p.x * 0.016 - u_time * 1.05)) * u_wobble * (0.30 + 0.70 * rim);
+  vec2 wave = vec2(sin(p.y * 0.020 + u_time * 1.25), cos(p.x * 0.016 - u_time * 1.05)) * u_wobble * (0.05 + 0.95 * rim);
   vec2 sp = v_px + refr + wave;
   vec4 col;
   if (u_blur > 0.05) {
@@ -2412,34 +8935,82 @@ void main() {
     float ca = (dot(refr, dir) * 0.055 + length(wave) * 0.12) * min(u_dispersion, 1.0);
     col = vec4(tap(sp + dir * ca).r, tap(sp).g, tap(sp - dir * ca).b, 1.0);
   }
-  float luma = dot(col.rgb, vec3(0.299, 0.587, 0.114));
-  col.rgb = mix(vec3(luma), col.rgb, 1.03);
   col.rgb = mix(col.rgb, vec3(1.0), u_tintAmt);
   vec2 dsp = dir * u_dispersion * (0.35 + 0.65 * field);
   col.r = mix(col.r, tap(sp + dsp).r, 0.55);
   col.b = mix(col.b, tap(sp - dsp).b, 0.55);
-  float grad = 1.0 - clamp(q.x * 0.55 + q.y * 0.45, 0.0, 1.0);
-  col.rgb += u_shine * u_light * pow(grad, 1.6) * 0.08;
   float hairline = exp(-pow((edgeDist + 0.55) / 0.62, 2.0));
   float ang = atan(p.y, p.x);
   float dA1 = wrapAngle(ang - u_lightAngle);
   float dA2 = wrapAngle(ang - (u_lightAngle + 3.14159265));
   float upperLeft = exp(-pow(dA1 / 0.60, 2.0));
   float lowerRight = exp(-pow(dA2 / 0.62, 2.0));
+  // 薄高光：只在左上边缘窄带内快速渐隐（rim²），不再铺满整个表面。
+  float wash = upperLeft * rim * rim;
+  col.rgb += u_shine * u_light * wash * 0.02;
   float edgeGlint = hairline * (upperLeft * 0.66 + lowerRight * 0.48) * u_light;
-  col.rgb = mix(col.rgb, vec3(1.0), clamp(edgeGlint, 0.0, 0.45) * u_edge);
+  col.rgb = mix(col.rgb, vec3(1.0), clamp(edgeGlint, 0.0, 0.18) * u_edge);
   float botShade = smoothstep(0.55, 1.0, q.y) * exp(-edgeDist / 7.0);
   col.rgb *= 1.0 - botShade * 0.05;
   vec3 baseCol = tap(v_px).rgb;
-  col.rgb = baseCol + clamp(col.rgb - baseCol, vec3(-0.16), vec3(0.10));
-  gl_FragColor = vec4(col.rgb, mask * 0.52);
+  col.rgb = baseCol + clamp(col.rgb - baseCol, vec3(-0.16), vec3(0.06));
+  gl_FragColor = vec4(col.rgb, mask);
 }`;
 
-  // 原型核实后的默认值（亮度修正版，不是 v3 的 26/0/25/13/15 旧基线）。
+  // Clear 材质默认值（与 theme.js glassParamsFor(THEME_DEFAULTS) 一致）。
   const DEFAULT_PARAMS = {
-    refract: 20, blur: 0, edge: 15, shine: 6, wobble: 8, tint: 2,
-    lightAngle: -2.38, light: 0.55, dispersion: 5, depth: 0.32,
+    refract: 32, blur: 0, edge: 8, shine: 2, wobble: 3, tint: 0,
+    lightAngle: -2.38, light: 0.55, dispersion: 0, depth: 0.42,
   };
+
+  // 按组件分的玻璃强度（与 styles.css 的 class 分类一致）：单行气泡最轻，
+  // 多行气泡次之，顶栏 / 底栏 / 弹窗 / 大卡片各有强度，不再一套固定值走天下。
+  // 数值是相对主题参数的乘子（0–1）。
+  const GLASS_INTENSITY = {
+    'bubble-single': { refract: 0.35, blur: 0.5, edge: 0.5, shine: 0.3, wobble: 0.3, depth: 0.6 },
+    'bubble-multi': { refract: 0.6, blur: 0.7, edge: 0.7, shine: 0.5, wobble: 0.5, depth: 0.8 },
+    chip: { refract: 0.4, blur: 0.5, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.6 },
+    pill: { refract: 0.5, blur: 0.6, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.7 },
+    tabbar: { refract: 0.7, blur: 0.8, edge: 0.8, shine: 0.6, wobble: 0.3, depth: 0.9 },
+    topbar: { refract: 0.8, blur: 0.9, edge: 0.9, shine: 0.7, wobble: 0.4, depth: 1.0 },
+    input: { refract: 0.5, blur: 0.6, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.7 },
+    strip: { refract: 0.5, blur: 0.6, edge: 0.6, shine: 0.4, wobble: 0.2, depth: 0.7 },
+    sheet: { refract: 0.9, blur: 1.0, edge: 1.0, shine: 0.8, wobble: 0.4, depth: 1.0 },
+    card: { refract: 0.7, blur: 0.8, edge: 0.8, shine: 0.6, wobble: 0.3, depth: 0.9 },
+    'sub-head': { refract: 0.7, blur: 0.8, edge: 0.8, shine: 0.6, wobble: 0.3, depth: 0.9 },
+    small: { refract: 0.35, blur: 0.5, edge: 0.5, shine: 0.3, wobble: 0.2, depth: 0.6 },
+    default: { refract: 1, blur: 1, edge: 1, shine: 1, wobble: 1, depth: 1 },
+  };
+
+  /** 按元素 class + 气泡高度定强度分类（纯函数，可单测）。heightPx 为 CSS 像素高度。 */
+  function classifyGlassElement(el, heightPx) {
+    const c = el.classList;
+    const has = (...names) => names.some((n) => c.contains(n));
+    if (has('bubble')) return heightPx < 60 ? 'bubble-single' : 'bubble-multi';
+    if (has('chip')) return 'chip';
+    if (has('pill')) return 'pill';
+    if (has('tabbar')) return 'tabbar';
+    if (has('chat-head')) return 'topbar';
+    if (has('input-shell')) return 'input';
+    if (has('status-strip')) return 'strip';
+    if (has('sheet-card', 'status-sheet', 'modal-card')) return 'sheet';
+    if (has('char-card', 'group', 'post', 'card')) return 'card';
+    if (has('sub-head')) return 'sub-head';
+    if (has('m-ico', 'post-action')) return 'small';
+    return 'default';
+  }
+
+  /** 整画布清除（幽灵块根因修复）：必须先关 scissor（并复位到整块画布），
+   * 再 clear，否则 clear 只清上一帧最后一个元素的 scissor 矩形，
+   * 元素移动 / 尺寸变化 / 被移除 / 切页后旧位置残留永不清掉。 */
+  function clearGlassCanvas(gl, width, height) {
+    gl.disable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.SCISSOR_TEST);
+    if (width && height) gl.scissor(0, 0, width, height);
+    return true;
+  }
 
   const state = {
     canvas: null, gl: null, prog: null, uniforms: {}, texture: null,
@@ -2490,24 +9061,17 @@ void main() {
     const ch = canvas.height;
     if (!cw || !ch) return;
     gl.viewport(0, 0, cw, ch);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    clearGlassCanvas(gl, cw, ch);
     gl.useProgram(state.prog);
     const u = state.uniforms;
     gl.uniform2f(u.u_view, cw, ch);
     gl.uniform2f(u.u_img, state.imgSize[0], state.imgSize[1]);
     gl.uniform1f(u.u_time, state.animTime);
     const p = state.params;
-    gl.uniform1f(u.u_refract, p.refract * dpr * 0.55);
-    gl.uniform1f(u.u_blur, p.blur * dpr * 0.55);
-    gl.uniform1f(u.u_edge, p.edge / 100);
-    gl.uniform1f(u.u_shine, p.shine / 100);
-    gl.uniform1f(u.u_wobble, state.animEnabled ? p.wobble * dpr * 0.10 : 0);
     gl.uniform1f(u.u_tintAmt, p.tint / 100);
     gl.uniform1f(u.u_light, p.light);
     gl.uniform1f(u.u_lightAngle, p.lightAngle);
     gl.uniform1f(u.u_dispersion, p.dispersion * dpr * 0.22);
-    gl.uniform1f(u.u_depth, p.depth);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, state.texture);
     gl.uniform1i(u.u_bg, 0);
@@ -2523,6 +9087,14 @@ void main() {
       const w = r.width * dpr;
       const h = r.height * dpr;
       const radius = Math.min(readRadius(el), Math.min(r.width, r.height) / 2) * dpr;
+      // 按组件强度覆盖：同一帧里不同元素用不同的折射 / 模糊 / 边缘 / 波动。
+      const k = GLASS_INTENSITY[classifyGlassElement(el, r.height)] || GLASS_INTENSITY.default;
+      gl.uniform1f(u.u_refract, p.refract * dpr * 0.55 * k.refract);
+      gl.uniform1f(u.u_blur, p.blur * dpr * 0.55 * k.blur);
+      gl.uniform1f(u.u_edge, (p.edge / 100) * k.edge);
+      gl.uniform1f(u.u_shine, (p.shine / 100) * k.shine);
+      gl.uniform1f(u.u_wobble, (state.animEnabled ? p.wobble * dpr * 0.10 : 0) * k.wobble);
+      gl.uniform1f(u.u_depth, Math.min(1, p.depth * k.depth));
       gl.uniform4f(u.u_rect, x, yTop, w, h);
       gl.uniform1f(u.u_radius, radius);
       // scissor：元素矩形外扩 2px（覆盖抗锯齿边缘），y 轴翻转。
@@ -2598,6 +9170,9 @@ void main() {
     VERT_SRC,
     FRAG_SRC,
     DEFAULT_PARAMS,
+    GLASS_INTENSITY,
+    classifyGlassElement,
+    clearGlassCanvas,
     get supported() { return state.ok; },
 
     /** 初始化。canvas：页面里的 <canvas id="gl-canvas">。失败返回 false（调用方保留 CSS 玻璃）。 */
@@ -2690,9 +9265,13 @@ void main() {
     },
 
     prune() {
+      let removed = false;
       for (const el of state.elements) if (!el.isConnected) {
         state.elements.delete(el); state.io?.unobserve(el); state.ro?.unobserve(el);
+        removed = true;
       }
+      // 集合变化后下一帧整画布重清（clearGlassCanvas 已保证 scissor 安全），旧位置不残留。
+      if (removed) state.needsRender = true;
     },
     attach(el) { attachOne(el); },
     attachAll(root) {
@@ -2743,8 +9322,8 @@ void main() {
 
 /* ===== js/theme.js ===== */
 // theme.js — 外观主题（背景 / 文字与气泡配色 / 玻璃材质参数）。
-// 按原型 uwu-liao-tian-ui-yuan-xing 移植，亮度修正后的默认值：
-// 光源强度 55%、雾化 8px、遮罩 32%、折射 20、深度 32、色散 5、波动 8。
+// 按原型 uwu-liao-tian-ui-yuan-xing 移植，Clear 材质默认值：
+// 光源强度 55%、雾化 6px、遮罩 12%、折射 32、深度 42、色散 0、波动 3。
 // 主题只存在 IndexedDB 的 settings 表（key 'appearance'），是本机偏好，
 // 不进备份导出、不随备份导入；不改动任何聊天数据结构。
 // 预设背景是 Canvas 渐变纹理（原型照片资产不在源码里），上传自己的图走 dataURL。
@@ -2769,6 +9348,52 @@ function hexA(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
+/** hex 颜色的相对亮度（0–1），用于 tone 推导与 ink 翻转判断。 */
+function hexLuminance(hex) {
+  let h = String(hex || '').replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const r = parseInt(h.slice(0, 2), 16) || 0;
+  const g = parseInt(h.slice(2, 4), 16) || 0;
+  const b = parseInt(h.slice(4, 6), 16) || 0;
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+/** data-tone 明暗分界：平均亮度低于 0.5 判暗。实测：深色壁纸 0.094、黑白漫画线稿 0.285、
+ * 浅色壁纸 0.949、预设 none #e9e9e9 约 0.91、night #181818 约 0.09——0.5 能干净分开。 */
+const TONE_LUMA_THRESHOLD = 0.5;
+
+/** 按壁纸实际平均亮度（不要只看调色板）决定 tone；深色配色本身也判暗。 */
+function deriveTone(luma, paletteDark) {
+  return paletteDark || (typeof luma === 'number' && luma < TONE_LUMA_THRESHOLD) ? 'dark' : 'light';
+}
+
+/** RGBA 像素数组的平均亮度（0–1），与 deriveTone / 蒙层烘焙共用同一公式。 */
+function averageLuminanceFromData(data) {
+  if (!data || !data.length) return 0.5;
+  let sum = 0;
+  const n = data.length / 4;
+  for (let i = 0; i < data.length; i += 4) {
+    sum += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+  }
+  return sum / n / 255;
+}
+
+/** 蒙层烘焙后的采样亮度：与可见层 .bg-layer::after 同一条 overlay 公式
+ *（浅 tone 盖 rgba(245,245,245,veil)，深 tone 盖 rgba(0,0,0,veil)）。 */
+function veilBakedLuminance(luma, veil, tone) {
+  const v = Math.min(1, Math.max(0, veil));
+  return tone === 'dark' ? luma * (1 - v) : luma * (1 - v) + (245 / 255) * v;
+}
+
+/** cover 数学（与 liquidGlass.js shader tap() 一致）：背景以 cover 铺满视图时
+ * 的缩放与偏移，用于烘焙画布的绘制与单测。 */
+function coverTransform(viewW, viewH, imgW, imgH) {
+  const scale = Math.max(viewW / imgW, viewH / imgH);
+  const drawW = imgW * scale;
+  const drawH = imgH * scale;
+  return { scale, drawW, drawH, offsetX: (viewW - drawW) / 2, offsetY: (viewH - drawH) / 2 };
+}
+
 const PALETTES = {
   pearl: { name: '冷白', note: 'PEARL', ink: '#292929', me: '#dddddd', ai: '#ffffff', bg: 'none', dark: false },
   mist: { name: '雾灰', note: 'MIST', ink: '#303030', me: '#c6c6c6', ai: '#eeeeee', bg: 'mist', dark: false },
@@ -2776,7 +9401,7 @@ const PALETTES = {
   night: { name: '深黑', note: 'NOIR', ink: '#f0f0f0', me: '#383838', ai: '#242424', bg: 'night', dark: true },
 };
 const THEME_DEFAULTS = {
-  palette: 'pearl', bubbleStyle: 'liquid', bg: 'none', bgCustom: null, veil: 12, glass: 12,
+  palette: 'pearl', bubbleStyle: 'liquid', bubbleGlass: false, bg: 'none', bgCustom: null, veil: 12, glass: 6,
   refract: 32, wobble: 3, depth: 42, dispersion: 0,
   lightAngle: 224, light: 55,
   ink: '#292929', me: '#dddddd', ai: '#ffffff',
@@ -2785,12 +9410,12 @@ const INK_SWATCHES = ['#292929', '#505050', '#777777', '#d6d6d6', '#f2f2f2'];
 const ME_SWATCHES = ['#ffffff', '#e8e8e8', '#cccccc', '#9c9c9c', '#575757', '#292929'];
 const AI_SWATCHES = ['#ffffff', '#f1f1f1', '#e1e1e1', '#a6a6a6', '#555555', '#242424'];
 
-/** 主题 → 引擎参数的映射（原型 applyGlassParams；edge/shine/tint 固定）。 */
+/** 主题 → 引擎参数的映射（原型 applyGlassParams；edge/shine/tint 固定为薄清值）。 */
 function glassParamsFor(t) {
   return {
     refract: t.refract,
     blur: Math.max(0, t.glass - 6) * 0.32,
-    edge: 15, shine: 6, tint: 2,
+    edge: 8, shine: 2, tint: 0,
     lightAngle: ((t.lightAngle + 180) % 360 - 180) * Math.PI / 180,
     light: t.light / 100,
     dispersion: t.dispersion,
@@ -2813,7 +9438,7 @@ const BG_PRESETS = {
 
 const SLIDERS = [
   { key: 'veil', label: '背景柔和', min: 0, max: 85, step: 1, unit: '%' },
-  { key: 'glass', label: '雾化 Frost', min: 6, max: 34, step: 1, unit: 'px' },
+  { key: 'glass', label: '雾化 Frost', min: 0, max: 34, step: 1, unit: 'px' },
   { key: 'refract', label: '折射', min: 0, max: 60, step: 1, unit: '' },
   { key: 'depth', label: '深度 Depth', min: 0, max: 100, step: 1, unit: '' },
   { key: 'dispersion', label: '色散 Dispersion', min: 0, max: 30, step: 1, unit: '' },
@@ -2822,12 +9447,40 @@ const SLIDERS = [
   { key: 'wobble', label: '内部波动', min: 0, max: 40, step: 1, unit: '' },
 ];
 
+/** 旧偏好迁移 + 越界夹取（纯函数，可单测）。
+ * 已存值（glass 12 / veil 12 / refract 32 / depth 42 / wobble 3 等）都在新范围
+ *（Frost 最小值现为 0）内，直接保留、不重置为默认——老用户升级后不回厚白；
+ * 只把越界旧值夹进新范围，并打 themeVersion: 2 标记已迁移。 */
+function clampTheme(t) {
+  const out = { ...THEME_DEFAULTS, ...(t || {}) };
+  if (!PALETTES[out.palette]) out.palette = 'pearl';
+  if (!['liquid', 'soft', 'ink'].includes(out.bubbleStyle)) out.bubbleStyle = 'liquid';
+  // 液态玻璃气泡开关（接线轮新增）：默认关闭 = iMessage 式清晰材质；
+  // 开启时 #app 加 .bubble-glass，气泡改走轻薄玻璃样式（见 styles.css）。
+  out.bubbleGlass = out.bubbleGlass === true;
+  for (const s of SLIDERS) {
+    const v = Number(out[s.key]);
+    out[s.key] = Number.isFinite(v) ? Math.min(s.max, Math.max(s.min, v)) : THEME_DEFAULTS[s.key];
+  }
+  if (!BG_PRESETS[out.bg] && out.bg !== 'custom') out.bg = 'none';
+  if (out.bg === 'custom' && !out.bgCustom) out.bg = 'none';
+  for (const k of ['ink', 'me', 'ai']) {
+    if (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(out[k])) out[k] = THEME_DEFAULTS[k];
+  }
+  out.themeVersion = 2;
+  return out;
+}
+
 const ThemeStore = (() => {
   let theme = { ...THEME_DEFAULTS };
   let backend = null;
   let saveTimer = null;
   const textureCache = new Map();
   let customImage = null;
+  // 已烘焙蒙层的采样纹理缓存（key 含背景 / 自定义图版本 / 蒙层 / tone）；tone 由 applyVars 推导后存这里。
+  const bakedCache = new Map();
+  let customRev = 0;
+  let derivedTone = 'light';
 
   function makeGradientTexture(palette) {
     const canvas = document.createElement('canvas');
@@ -2869,6 +9522,59 @@ const ThemeStore = (() => {
     return textureCache.get(key);
   }
 
+  /** 背景源（预设渐变画布或自定义图）采样到 ≤64px 的平均亮度；读不到返回 null。 */
+  function luminanceOfSource(source) {
+    try {
+      const w = source.naturalWidth || source.width;
+      const h = source.naturalHeight || source.height;
+      if (!w || !h) return null;
+      const tw = 64;
+      const th = Math.max(1, Math.round(64 * h / w));
+      const c = document.createElement('canvas');
+      c.width = tw; c.height = th;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(source, 0, 0, tw, th);
+      return averageLuminanceFromData(ctx.getImageData(0, 0, tw, th).data);
+    } catch {
+      return null;
+    }
+  }
+
+  function currentBackgroundLuminance() {
+    return luminanceOfSource(textureForBackground());
+  }
+
+  /** 把当前蒙层烘进一张 880×1860 画布（cover 绘制 + overlay），供引擎采样；
+   * 可见层仍用未烘焙的原图 + CSS ::after 蒙层，两边亮度一致。 */
+  function bakeVeilCanvas(source, veil, tone) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 880;
+    canvas.height = 1860;
+    const ctx = canvas.getContext('2d');
+    const sw = source.naturalWidth || source.width;
+    const sh = source.naturalHeight || source.height;
+    if (sw && sh) {
+      const t = coverTransform(880, 1860, sw, sh);
+      ctx.drawImage(source, t.offsetX, t.offsetY, t.drawW, t.drawH);
+    }
+    if (veil > 0) {
+      ctx.fillStyle = tone === 'dark' ? `rgba(0, 0, 0, ${veil})` : `rgba(245, 245, 245, ${veil})`;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    return canvas;
+  }
+
+  /** 引擎采样纹理：已烘焙蒙层。背景 / 蒙层 / tone / 自定义图变化时重烘（key 包含四者）。 */
+  function sampleTextureForBackground() {
+    const veil = theme.veil / 100;
+    const key = `${theme.bg}|${theme.bg === 'custom' ? customRev : ''}|${veil}|${derivedTone}`;
+    if (!bakedCache.has(key)) {
+      if (bakedCache.size > 12) bakedCache.clear();
+      bakedCache.set(key, bakeVeilCanvas(textureForBackground(), veil, derivedTone));
+    }
+    return bakedCache.get(key);
+  }
+
   function applyBackground() {
     const app = document.getElementById('app');
     const layer = document.getElementById('bg-layer');
@@ -2879,21 +9585,49 @@ const ThemeStore = (() => {
     } else {
       layer.style.backgroundImage = `url(${textureForBackground().toDataURL()})`;
     }
-    LiquidGlass.setBackground(textureForBackground());
+    LiquidGlass.setBackground(sampleTextureForBackground());
   }
 
   function applyVars() {
     const root = document.documentElement.style;
     root.setProperty('--bg-veil', String(theme.veil / 100));
     root.setProperty('--glass-blur-amt', `${theme.glass}px`);
-    root.setProperty('--ink', theme.ink);
+    // tone 按壁纸实际平均亮度推导（不是只看调色板）：默认 pearl + 深色壁纸时翻转为 dark，
+    // 这样 styles.css 已有的 [data-tone=dark] 规则（--ink-2/--ink-3 等浅色）才会生效。
+    // data-tone 挂在 documentElement 上，正是 styles.css [data-tone=dark] 规则所期望的元素。
+    const paletteDark = !!PALETTES[theme.palette]?.dark;
+    const bgLuma = currentBackgroundLuminance();
+    derivedTone = deriveTone(bgLuma, paletteDark);
+    // --ink 是唯一不在 [data-tone=dark] CSS 规则里的主文字色：dark tone 且 ink 本身深时翻成浅色；
+    // 深色配色自带的浅 ink 不动。--ink-2/--ink-3（.top-status、chip 文字、.char-card-sub、
+    // .m-desc/.m-count、.tab 未选中、placeholder、.auto-row、.toggle-t、.time-divider/.msg-meta、
+    // .brand-caption）走 CSS 的 dark 规则翻转。
+    const inkIsDark = hexLuminance(theme.ink) < 0.5;
+    root.setProperty('--ink', derivedTone === 'dark' && inkIsDark ? '#f0f0f0' : theme.ink);
     document.documentElement.dataset.palette = theme.palette;
     document.documentElement.dataset.bubbleStyle = theme.bubbleStyle;
-    document.documentElement.dataset.tone = PALETTES[theme.palette]?.dark ? 'dark' : 'light';
+    document.documentElement.dataset.tone = derivedTone;
+    document.documentElement.dataset.chatWallpaper = theme.bg === 'none' ? 'plain' : 'image';
+    // Opaque chat colors respect custom swatches; standard palettes use monochrome iMessage values.
+    const preset = PALETTES[theme.palette] || PALETTES.pearl;
+    const chatMe = theme.me !== preset.me ? theme.me : derivedTone === 'dark' ? '#dedee0' : theme.palette === 'mist' ? '#565658' : '#3a3a3c';
+    const chatAi = theme.ai !== preset.ai ? theme.ai : derivedTone === 'dark' ? '#303032' : theme.palette === 'mist' ? '#dedee1' : '#e9e9eb';
+    root.setProperty('--chat-sent', chatMe);
+    root.setProperty('--chat-received', chatAi);
+    root.setProperty('--chat-sent-ink', contrastInk(chatMe));
+    root.setProperty('--chat-received-ink', contrastInk(chatAi));
     root.setProperty('--bubble-me-solid', theme.me);
     root.setProperty('--bubble-ai-solid', theme.ai);
     root.setProperty('--bubble-me', hexA(theme.me, theme.bubbleStyle === 'liquid' ? .35 : .94));
-    const background = PALETTES[theme.palette]?.dark ? '#292929' : '#eeeeee';
+    // blend 的底色是气泡背后实际看到的颜色：深 tone 时按深底算——
+    // 哪怕配色本身是 pearl（浅底 #eeeeee），深色壁纸推导出的 dark tone
+    // 下气泡背后也是深色壁纸，blend 仍按浅底算会把气泡字误判成深字
+    // （pearl + 深色壁纸时 AI 气泡字曾是 #303030，糊在深色壁纸上）。
+    // 只改 blend 的 backdrop 假设，不覆盖 --bubble-*-ink 本身：
+    // soft/ink 样式（alpha .92/.94，blend 几乎不起作用）与用户自定义色
+    // 仍走同一条 contrastInk 路径。
+    const background = derivedTone === 'dark' ? '#292929'
+      : (PALETTES[theme.palette]?.dark ? '#292929' : '#eeeeee');
     const blend = (hex, alpha) => {
       let h = hex.slice(1); if (h.length === 3) h = [...h].map(c => c + c).join('');
       return '#' + [0, 2, 4].map(i => Math.round(parseInt(h.slice(i, i + 2), 16) * alpha + parseInt(background.slice(i + 1, i + 3), 16) * (1 - alpha)).toString(16).padStart(2, '0')).join('');
@@ -2906,6 +9640,9 @@ const ThemeStore = (() => {
   function apply() {
     applyVars();
     applyBackground();
+    // 气泡玻璃开关立即生效，不用刷新：开关状态挂在 #app 的 class 上，
+    // styles.css 里 #app.bubble-glass .bubble 覆盖默认清晰材质。
+    document.getElementById('app')?.classList.toggle('bubble-glass', theme.bubbleGlass === true);
     LiquidGlass.setParams(glassParamsFor(theme));
   }
 
@@ -2915,22 +9652,6 @@ const ThemeStore = (() => {
     saveTimer = setTimeout(() => {
       backend.put('settings', { key: 'appearance', value: { ...theme } }).catch(() => {});
     }, 300);
-  }
-
-  function clampTheme(t) {
-    const out = { ...THEME_DEFAULTS, ...(t || {}) };
-    if (!PALETTES[out.palette]) out.palette = 'pearl';
-    if (!['liquid', 'soft', 'ink'].includes(out.bubbleStyle)) out.bubbleStyle = 'liquid';
-    for (const s of SLIDERS) {
-      const v = Number(out[s.key]);
-      out[s.key] = Number.isFinite(v) ? Math.min(s.max, Math.max(s.min, v)) : THEME_DEFAULTS[s.key];
-    }
-    if (!BG_PRESETS[out.bg] && out.bg !== 'custom') out.bg = 'none';
-    if (out.bg === 'custom' && !out.bgCustom) out.bg = 'none';
-    for (const k of ['ink', 'me', 'ai']) {
-      if (typeof out[k] !== 'string' || !/^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(out[k])) out[k] = THEME_DEFAULTS[k];
-    }
-    return out;
   }
 
   function el(tag, cls, text) {
@@ -3009,12 +9730,24 @@ const ThemeStore = (() => {
     }
     presetsCard.appendChild(palettes);
     const styles = el('div', 'bubble-options');
-    for (const [id, name] of [['liquid', '液态玻璃'], ['soft', '柔雾'], ['ink', '墨色']]) {
+    for (const [id, name] of [['liquid', '轻透'], ['soft', '柔雾'], ['ink', '墨色']]) {
       const b = el('button', theme.bubbleStyle === id ? 'active' : '', name);
       b.setAttribute('aria-pressed', String(theme.bubbleStyle === id));
       b.addEventListener('click', () => { update({ bubbleStyle: id }); renderAppearanceInto(container); }); styles.appendChild(b);
     }
-    presetsCard.append(el('h3', '', '气泡材质'), styles);
+    presetsCard.append(el('h3', '', '玻璃气泡外观'), styles);
+    // 液态玻璃气泡开关（默认关闭 = iMessage 式清晰材质；开启为可选的轻薄玻璃样式）。
+    const glassRow = el('div', 'setting-row');
+    const glassLabel = el('span', 'setting-label', '液态玻璃气泡');
+    glassLabel.appendChild(el('small', '', '可选样式'));
+    const glassToggle = el('label', 'switch');
+    const glassBox = document.createElement('input');
+    glassBox.type = 'checkbox';
+    glassBox.checked = theme.bubbleGlass === true;
+    glassBox.addEventListener('change', () => { update({ bubbleGlass: glassBox.checked }); });
+    glassToggle.append(glassBox, el('span', 'switch-track'));
+    glassRow.append(glassLabel, glassToggle);
+    presetsCard.append(glassRow, el('p', 'muted', '关闭时使用 iMessage 实色气泡；开启后使用轻薄玻璃，上方三种外观随之生效。'));
     const sample = el('div', 'bubble-preview');
     sample.append(el('span', 'preview-in', '在这里，多停留一会儿。'), el('span', 'preview-out', 'Take your time.'));
     presetsCard.appendChild(sample); container.appendChild(presetsCard);
@@ -3046,6 +9779,7 @@ const ThemeStore = (() => {
         const img = new Image();
         img.onload = () => {
           customImage = img;
+          customRev++;
           update({ bg: 'custom', bgCustom: dataUrl });
           renderAppearanceInto(container);
         };
@@ -3101,6 +9835,7 @@ const ThemeStore = (() => {
     getDefaults() { return { ...THEME_DEFAULTS }; },
     BG_PRESETS,
     SLIDERS,
+    clampTheme,
 
     /** backend：IndexedDB 后端（持久化用）；saved：之前存过的 appearance 记录。 */
     init(be, saved) {
@@ -3110,7 +9845,8 @@ const ThemeStore = (() => {
         const img = new Image();
         img.onload = () => {
           customImage = img;
-          LiquidGlass.setBackground(img);
+          customRev++;
+          apply(); // 自定义图到齐后重推 tone 与蒙层烘焙
         };
         img.src = theme.bgCustom;
       }
@@ -3344,6 +10080,7 @@ const ManageView = (() => {
       label: '连接',
       rows: [
         { id: 'api', icon: 'key', name: 'API 设置', desc: '', count: (s) => (s.apiSettings?.key ? (s.apiSettings.model || '已配置') : '模拟模式') },
+        { id: 'notify', icon: 'sun', name: '通知与唤醒', desc: '站内横幅、音频保活、推送、主动唤醒' },
         { id: 'mcp', icon: 'server', name: 'MCP', desc: '', count: () => '未接入' },
       ],
     },
@@ -3484,8 +10221,8 @@ const ManageView = (() => {
         ['弱化文字', get('--ink-3') || '#86868b'],
         ['主题蓝', get('--accent') || '#0071e3'],
         ['深蓝', get('--accent-deep') || '#0060c9'],
-        ['我方气泡', get('--bubble-me') || '#d6ebff'],
-        ['对方气泡', get('--bubble-ai') || 'rgba(255,255,255,.62)'],
+        ['我方气泡', get('--bubble-me') || 'rgba(221, 221, 221, .35)'],
+        ['对方气泡', get('--bubble-ai') || 'rgba(255, 255, 255, .22)'],
         ['在线绿', '#34c759'],
       ]) {
         const cell = el('div', 'token-cell');
@@ -3503,8 +10240,8 @@ const ManageView = (() => {
       const mono = el('pre', 'mono-block', [
         `大卡片 ${get('--r-lg') || '28px'} · 中卡片 ${get('--r-md') || '22px'} · 小圆角 ${get('--r-sm') || '14px'} · 气泡 ${get('--r-bubble') || '22px'}`,
         '页面边距 14 · 卡片内距 16 · 消息间距 3 · 头像 42 / 30 · 触控目标 ≥ 40',
-        '玻璃：填充 rgba(255,255,255,.06) · 雾化 8px · 边缘高光上限 0.45',
-        '亮度钳制：相对壁纸 +0.10 / -0.16 · 光源强度默认 55% · 白色染色 2%',
+        '玻璃：填充 rgba(255,255,255,.05) · 雾化 6px · 边缘高光上限 0.18',
+        '亮度钳制：相对壁纸 +0.06 / -0.16 · 光源强度默认 55% · 白色染色 0%',
         '图标：单色描边 currentColor · 线宽 1.8 · 22px（小 18 / 大 25）',
       ].join('\n'));
       shapeCard.appendChild(mono);
@@ -3512,6 +10249,995 @@ const ManageView = (() => {
     },
   };
 })();
+
+/* ===== js/stickers.js ===== */
+// stickers.js — 表情包取图与筛选的纯函数（与界面、存储分离，可单测）。
+// 原版 UWU 的贴纸记录格式是 { id, name, group, data: <http(s) 图片 URL>, lastUsedTime }，
+// 渲染用 data 作 img src；verweile 自己的记录用 dataUrl / attachmentId。
+// 取图优先级：dataUrl > attachmentId > data，三者都没有返回 null。
+
+const STICKER_PAGE_SIZE = 60;
+const UNCATEGORIZED = '未分类';
+
+/**
+ * 返回表情包的图片来源描述：
+ * - { kind: 'url', src }：可直接作 <img src>（dataUrl 或原版 data 字段，远程 URL / data: URL）
+ * - { kind: 'attachment', id }：需经 attachmentDataURL 解析
+ * - null：没有任何图片来源
+ */
+function stickerImageSrc(st) {
+  if (!st || typeof st !== 'object') return null;
+  if (typeof st.dataUrl === 'string' && st.dataUrl) return { kind: 'url', src: st.dataUrl };
+  if (typeof st.attachmentId === 'string' && st.attachmentId) return { kind: 'attachment', id: st.attachmentId };
+  if (typeof st.data === 'string' && st.data) return { kind: 'url', src: st.data };
+  return null;
+}
+
+/** 归一化分组名：缺 group / 空白都归入「未分类」。 */
+function stickerGroupOf(st) {
+  const g = typeof st?.group === 'string' ? st.group.trim() : '';
+  return g || UNCATEGORIZED;
+}
+
+/** 按首次出现顺序返回全部分组（含未分类组）。 */
+function stickerGroupsOf(stickers = []) {
+  const out = [];
+  for (const st of stickers || []) {
+    const g = stickerGroupOf(st);
+    if (!out.includes(g)) out.push(g);
+  }
+  return out;
+}
+
+/**
+ * 已知表情包名称：原版 UWU 的兜底规则（chat_render.js：先按角色分组找，
+ * 找不到再按名字在全库找）。渲染/解析只认“库里有没有这个名字”——分组只
+ * 决定提示词里列哪些（见 promptBuilder.collectStickerNames），不决定一张
+ * 真实存在的表情包能不能显示。否则角色 stickerGroups 为空时，所有已导入
+ * 的表情包都会被当成未知名称，只能看到协议文字。
+ * 返回顺序：分组内的名字在前（库内顺序），其余库内名字在后，均去重。
+ */
+function knownStickerNames(stickers = [], groups = '') {
+  const names = [];
+  const seen = new Set();
+  const gs = String(groups || '').split(/[,，]/).map((s) => s.trim()).filter((s) => s && s !== UNCATEGORIZED);
+  for (const st of stickers || []) {
+    if (st?.name && gs.includes(stickerGroupOf(st)) && !seen.has(st.name)) { seen.add(st.name); names.push(st.name); }
+  }
+  for (const st of stickers || []) {
+    if (st?.name && !seen.has(st.name)) { seen.add(st.name); names.push(st.name); }
+  }
+  return names;
+}
+
+/**
+ * 按分组 + 名称搜索过滤。group 为 '全部'（或空）时不过滤分组；
+ * query 为空时不过滤名称；名称匹配不区分大小写、去首尾空白。
+ */
+function filterStickers(stickers = [], { group = '', query = '' } = {}) {
+  const q = String(query || '').trim().toLowerCase();
+  return (stickers || []).filter((st) => {
+    if (group && group !== '全部' && stickerGroupOf(st) !== group) return false;
+    if (q && !String(st?.name || '').toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+
+/* ===== js/longPressMenu.js ===== */
+// longPressMenu.js — iOS 风格长按菜单：纯逻辑 + DOM 构建器。
+//
+// 与 js/app.js 的关系：本模块不 import app.js，所有动作都走宿主注入的
+// 回调（new LongPressMenu({ onCopy, onQuote, … })）。集成时 app.js 的
+// attachMsgMenu() / openMsgMenu() 改调本模块，见 docs/chat-audit.md 附表。
+// 视觉对照：iOS 长按菜单参考截图（Copy/Save/Reply/Select/Lock/Delete，
+// 右侧单色图标，Delete 红色；下方独立表情反应条 ❤️👍😂🥹😮🤔）。
+// 本模块只负责逻辑与 DOM 结构，配色/玻璃/圆角由集成轮在 styles.css 里补
+// （顶栏与底栏玻璃走 js/liquidGlass.js 的 LiquidGlass 引擎，不手写假玻璃）。
+
+/** 触屏长按阈值（ms）。app.js 现行值是 480，本模块取约 500ms。 */
+const LONG_PRESS_MS = 500;
+/** 触发长按前手指可移动的最大距离（px），超过即视为滚动/拖动，取消长按。 */
+const LONG_PRESS_MOVE_TOLERANCE_PX = 10;
+/** 删除可撤销的有效期（ms）。token 过期后撤销入口失效。 */
+const DELETE_UNDO_WINDOW_MS = 5000;
+/** 撤回（2 分钟内）窗口，与 app.js withdrawMessage 的规则一致。 */
+const RECALL_WINDOW_MS = 2 * 60 * 1000;
+/** 表情反应条的表情（顺序与 iOS 参考截图一致），“更多”由宿主另行展开。 */
+const REACTION_EMOJIS = ['❤️', '👍', '😂', '🥹', '😮', '🤔'];
+/** 菜单与气泡/反应条之间的最小间距（px）。 */
+const MENU_GAP_PX = 8;
+/** 菜单离视口边缘的最小间距（px）。 */
+const MENU_EDGE_MARGIN_PX = 8;
+
+/** message.reactions 的一条记录：{ emoji, by: 'me' | 'char', ts }。 */
+function reactionEntry(emoji, by = 'me', ts = Date.now()) {
+  return { emoji, by, ts };
+}
+
+/** 从消息推断种类：供菜单项过滤用。kind 优先取 msg.kind；
+ *  其次看 parts 里有没有 image；其余一律按 text 处理。 */
+function messageKind(msg = {}) {
+  if (typeof msg.kind === 'string' && msg.kind) return msg.kind;
+  const parts = Array.isArray(msg.parts) ? msg.parts : [];
+  if (parts.some((p) => p && p.type === 'image')) return 'image';
+  if (msg.isStatusUpdate) return 'status';
+  if (msg.isWithdrawn) return 'withdrawn';
+  return 'text';
+}
+
+/** 是否自己的消息（可编辑/可撤回的前提）。 */
+function isOwnMessage(msg = {}) {
+  return msg.role === 'user';
+}
+
+/** 是否 AI 回复（可重新生成的前提）。 */
+function isAssistantMessage(msg = {}) {
+  return msg.role === 'assistant';
+}
+
+/** 是否在可撤回窗口内：自己的消息、未撤回、2 分钟内。now 可注入，便于测试。 */
+function canRecall(msg = {}, now = Date.now()) {
+  if (!isOwnMessage(msg) || msg.isWithdrawn) return false;
+  if (!Number.isFinite(msg.timestamp)) return false;
+  return now - msg.timestamp <= RECALL_WINDOW_MS;
+}
+
+/** 是否可编辑：自己的消息、未撤回、文本类（图片/卡片/状态不进编辑）。 */
+function canEdit(msg = {}) {
+  if (!isOwnMessage(msg) || msg.isWithdrawn) return false;
+  return messageKind(msg) === 'text';
+}
+
+/** 菜单项定义：一级菜单（按优先级排序；删除永远最后且标 danger）。
+ *  每项：{ id, label, icon, danger? }，icon 取 index.html 里已有的 SVG symbol id
+ *  （#i-copy / #i-reply / #i-star / #i-check / #i-pencil / #i-undo / #i-trash）。
+ *  上下文参与开关不在一级菜单里，见 getSecondaryItems()。 */
+function getMenuItems(msg = {}, now = Date.now()) {
+  const kind = messageKind(msg);
+  const items = [];
+  // 复制：文本/图片/卡片消息都有可复制的文本（宿主负责取纯文本）；状态类与已撤回不给复制。
+  if (kind !== 'status' && kind !== 'withdrawn') {
+    items.push({ id: 'copy', label: '复制', icon: 'i-copy' });
+  }
+  if (kind === 'text' || kind === 'image') {
+    items.push({ id: 'quote', label: '引用回复', icon: 'i-reply' });
+  }
+  if (kind !== 'status' && kind !== 'withdrawn') {
+    items.push({ id: 'favorite', label: '收藏', icon: 'i-star' });
+  }
+  items.push({ id: 'select', label: '选择', icon: 'i-check' });
+  if (canEdit(msg)) {
+    items.push({ id: 'edit', label: '编辑', icon: 'i-pencil' });
+  }
+  if (canRecall(msg, now)) {
+    items.push({ id: 'recall', label: '撤回', icon: 'i-undo' });
+  }
+  if (isAssistantMessage(msg) && kind === 'text') {
+    items.push({ id: 'regenerate', label: '重新生成', icon: 'i-sparkle' });
+  }
+  if (kind !== 'status') {
+    items.push({ id: 'delete', label: '删除', icon: 'i-trash', danger: true });
+  }
+  return items;
+}
+
+/** 次级入口（“更多”里展开）：上下文参与开关 + 查看原始内容。
+ *  调试开关不在此列——那是调试功能，不应出现在日常长按菜单里。 */
+function getSecondaryItems(msg = {}) {
+  const kind = messageKind(msg);
+  const items = [];
+  if (kind !== 'status' && kind !== 'withdrawn') {
+    items.push({
+      id: 'toggleContext',
+      label: msg.isContextDisabled ? '恢复进上下文' : '不进入上下文',
+      icon: 'i-eye',
+    });
+  }
+  items.push({ id: 'viewRaw', label: '查看原始内容', icon: 'i-file' });
+  return items;
+}
+
+/** 纯函数：切换“我”的某表情反应。返回一个新 message 对象（不改原对象）；
+ *  已有则取消（移除我对该表情的记录），没有则追加 { emoji, by:'me', ts }。
+ *  反应只存在本地（message.reactions），不请求模型。 */
+function toggleReaction(msg = {}, emoji, now = Date.now()) {
+  const reactions = Array.isArray(msg.reactions) ? [...msg.reactions] : [];
+  const idx = reactions.findIndex((r) => r && r.emoji === emoji && r.by === 'me');
+  if (idx >= 0) reactions.splice(idx, 1);
+  else reactions.push({ emoji, by: 'me', ts: now });
+  return { ...msg, reactions };
+}
+
+/** 纯函数：按表情汇总反应计数，返回 [{ emoji, count, mine }]（按首次出现顺序）。 */
+function reactionCounts(msg = {}) {
+  const out = [];
+  for (const r of Array.isArray(msg.reactions) ? msg.reactions : []) {
+    if (!r || !r.emoji) continue;
+    let row = out.find((o) => o.emoji === r.emoji);
+    if (!row) { row = { emoji: r.emoji, count: 0, mine: false }; out.push(row); }
+    row.count += 1;
+    if (r.by === 'me') row.mine = true;
+  }
+  return out;
+}
+
+/** 纯函数：我是否已对该表情反应过。 */
+function hasMyReaction(msg = {}, emoji) {
+  return (Array.isArray(msg.reactions) ? msg.reactions : [])
+    .some((r) => r && r.emoji === emoji && r.by === 'me');
+}
+
+/** 删除可撤销 token：宿主删除消息时把 token 交给 toast，数秒内可点撤销恢复。
+ *  token 只带恢复所需快照，不含任何 API 信息。 */
+function createDeleteToken(msg = {}, now = Date.now()) {
+  return {
+    messageId: msg.id,
+    snapshot: { ...msg },
+    deletedAt: now,
+    validMs: DELETE_UNDO_WINDOW_MS,
+  };
+}
+
+/** token 是否仍在可撤销窗口内。 */
+function isDeleteTokenValid(token, now = Date.now()) {
+  if (!token || !Number.isFinite(token.deletedAt)) return false;
+  return now - token.deletedAt <= (token.validMs || DELETE_UNDO_WINDOW_MS);
+}
+
+/**
+ * 纯函数：根据气泡位置算菜单 + 反应条的落点。
+ * @param {Object} anchorRect 气泡的 rect：{ top, bottom, left, right, width, height }
+ * @param {Object} menuSize 菜单尺寸：{ width, height }（含反应条高度请另传 reactionBarHeight）
+ * @param {Object} viewport 视口：{ width, height }
+ * @param {Object} opts { reactionBarHeight=48, bottomReserve=0 }
+ *   bottomReserve：底部要避让的高度（键盘高度 + 输入区 + Tab 栏），菜单底缘不进入该区域。
+ * @returns { menu: {top,left}, reactions: {top,left}, placement: 'above'|'below' }
+ *   规则：气泡下方空间够 → 菜单在气泡下方，反应条夹在气泡与菜单之间；
+ *   不够 → 整体翻到气泡上方，反应条夹在菜单与气泡之间；左右钳制在视口内。
+ */
+function computeMenuPlacement(anchorRect, menuSize, viewport, opts = {}) {
+  const reactionBarHeight = opts.reactionBarHeight ?? 48;
+  const bottomReserve = opts.bottomReserve ?? 0;
+  const vw = viewport.width;
+  const vh = viewport.height;
+  const gap = MENU_GAP_PX;
+  const margin = MENU_EDGE_MARGIN_PX;
+  const menuW = Math.min(menuSize.width, vw - margin * 2);
+  const menuH = menuSize.height;
+  const totalBelow = gap + reactionBarHeight + gap + menuH;
+  const totalAbove = gap + reactionBarHeight + gap + menuH;
+  const spaceBelow = (vh - bottomReserve) - anchorRect.bottom;
+  const spaceAbove = anchorRect.top;
+  const below = spaceBelow >= totalBelow || spaceBelow >= spaceAbove;
+  let left = anchorRect.left;
+  // 我方气泡靠右：菜单右缘贴气泡右缘；对方气泡靠左：左缘贴气泡左缘；再钳制进视口。
+  if (anchorRect.left + anchorRect.width / 2 > vw / 2) {
+    left = anchorRect.right - menuW;
+  }
+  left = Math.max(margin, Math.min(left, vw - menuW - margin));
+  let menuTop;
+  let reactionsTop;
+  if (below) {
+    reactionsTop = anchorRect.bottom + gap;
+    menuTop = reactionsTop + reactionBarHeight + gap;
+    // 底缘仍超 reserve：整体上移钳制，不让菜单被键盘/底栏遮住。
+    const maxTop = vh - bottomReserve - menuH - margin;
+    if (menuTop > maxTop) menuTop = Math.max(margin, maxTop);
+  } else {
+    menuTop = anchorRect.top - gap - menuH;
+    reactionsTop = menuTop + menuH + gap;
+    if (menuTop < margin) menuTop = margin;
+  }
+  void totalAbove;
+  return {
+    menu: { top: Math.round(menuTop), left: Math.round(left) },
+    reactions: { top: Math.round(reactionsTop), left: Math.round(left) },
+    placement: below ? 'below' : 'above',
+  };
+}
+
+/** 长按菜单的 DOM 构建器 + 手势绑定。
+ *
+ *  用法（集成轮在 app.js 里）：
+ *  ```js
+ *  import { LongPressMenu } from './longPressMenu.js';
+ *  const menu = new LongPressMenu({
+ *    onCopy: (msg) => { … }, onQuote, onFavorite, onSelect, onEdit,
+ *    onRecall, onRegenerate, onDelete: (msg, token) => { …toast 撤销… },
+ *    onToggleContext, onViewRaw, onReact: (msg, emoji) => { … },
+ *  });
+ *  menu.attachTo(wrapEl, msg); // 替代现行 attachMsgMenu()
+ *  ```
+ *  注入点：document/window/scrollContainer 均可注入，便于 Node 测试用 fake DOM。
+ */
+class LongPressMenu {
+  constructor(callbacks = {}, opts = {}) {
+    this.callbacks = callbacks;
+    this.doc = opts.document || globalThis.document;
+    this.win = opts.window || globalThis.window;
+    // 滚动恢复：打开时记下滚动容器的 scrollTop，关闭时还原。
+    this.scrollContainer = opts.scrollContainer || null;
+    this.menuSize = opts.menuSize || { width: 280, height: 320 };
+    this.reactionBarHeight = opts.reactionBarHeight ?? 48;
+    this._open = false;
+    this._message = null;
+    this._anchorEl = null;
+    this._root = null;
+    this._savedScrollTop = 0;
+    this._savedUserSelect = '';
+    this._savedTouchCallout = '';
+    this._boundDocClick = (e) => this._onDocPointerDown(e);
+    this._boundDocContextMenu = (e) => { if (this._open) e.preventDefault(); };
+    this._boundKeyDown = (e) => { if (e.key === 'Escape') this.close(); };
+    // 菜单打开期间禁止任何原生选区出现：打开时清掉，期间 selectionchange 再清掉。
+    this._boundSelectionChange = () => this._clearSelection();
+  }
+
+  get isOpen() { return this._open; }
+  get currentMessage() { return this._message; }
+
+  /** 把长按/右键手势绑到一条消息的气泡外层元素上（替代 app.js attachMsgMenu）。
+   *  触屏：pointerdown 起 500ms 计时；pointermove 超 10px、pointerup/pointercancel、
+   *  非主指针（多指）均取消。桌面：contextmenu 打开。 */
+  attachTo(el, msg) {
+    if (!el || typeof el.addEventListener !== 'function') return () => {};
+    let timer = null;
+    let startX = 0;
+    let startY = 0;
+    const clear = () => { if (timer !== null) { clearTimeout(timer); timer = null; } };
+    const onPointerDown = (e) => {
+      if (e.pointerType === 'mouse') return; // 桌面走 contextmenu，不走长按
+      if (e.isPrimary === false) { clear(); return; }
+      clear();
+      startX = e.clientX ?? 0;
+      startY = e.clientY ?? 0;
+      // 尽早拦住 iOS 原生选词 / 呼出菜单：pointerdown 可取消时就 preventDefault。
+      // 图片 / 链接 / 按钮自带点击行为（点图看大图），不拦；输入框不在气泡里，不受影响。
+      // 注意：这里拦的是 pointerdown，不是 touchstart，所以不影响从气泡起手的滚动。
+      const t = e.target;
+      const interactive = t && typeof t.closest === 'function'
+        ? t.closest('img, a, button, input, textarea, select')
+        : (t && /^(IMG|A|BUTTON|INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''));
+      if (!interactive && e.cancelable !== false && typeof e.preventDefault === 'function') {
+        e.preventDefault();
+      }
+      this._clearSelection();
+      timer = setTimeout(() => {
+        timer = null;
+        this.open(msg, el, { x: startX, y: startY });
+      }, LONG_PRESS_MS);
+    };
+    const onPointerMove = (e) => {
+      if (timer === null) return;
+      const dx = (e.clientX ?? 0) - startX;
+      const dy = (e.clientY ?? 0) - startY;
+      if (Math.hypot(dx, dy) > LONG_PRESS_MOVE_TOLERANCE_PX) clear();
+    };
+    const onContextMenu = (e) => {
+      e.preventDefault();
+      this.open(msg, el, { x: e.clientX ?? 0, y: e.clientY ?? 0 });
+    };
+    el.addEventListener('pointerdown', onPointerDown);
+    el.addEventListener('pointermove', onPointerMove);
+    el.addEventListener('pointerup', clear);
+    el.addEventListener('pointercancel', clear);
+    el.addEventListener('contextmenu', onContextMenu);
+    return () => {
+      clear();
+      el.removeEventListener?.('pointerdown', onPointerDown);
+      el.removeEventListener?.('pointermove', onPointerMove);
+      el.removeEventListener?.('pointerup', clear);
+      el.removeEventListener?.('pointercancel', clear);
+      el.removeEventListener?.('contextmenu', onContextMenu);
+    };
+  }
+
+  /** 打开菜单。anchorRect 优先取气泡元素的 getBoundingClientRect()，
+   *  拿不到时用传入的点坐标退化为 1×1 锚点。 */
+  open(msg, anchorEl, point = {}) {
+    this.close({ restoreScroll: false });
+    // 打开前先清掉可能已出现的原生选区（真机上长按 500ms 内选区可能已起）。
+    this._clearSelection();
+    const doc = this.doc;
+    const rect = this._anchorRect(anchorEl, point);
+    const viewport = {
+      width: this.win?.innerWidth || 390,
+      height: this.win?.innerHeight || 844,
+    };
+    const bottomReserve = this._bottomReserve();
+    const pos = computeMenuPlacement(rect, this.menuSize, viewport, {
+      reactionBarHeight: this.reactionBarHeight,
+      bottomReserve,
+    });
+    if (this.scrollContainer) this._savedScrollTop = this.scrollContainer.scrollTop || 0;
+
+    const root = doc.createElement('div');
+    root.className = 'lp-menu-root';
+    const backdrop = doc.createElement('div');
+    backdrop.className = 'lp-menu-backdrop';
+    backdrop.addEventListener('click', () => this.close());
+    root.appendChild(backdrop);
+
+    const reactions = doc.createElement('div');
+    reactions.className = 'lp-reaction-bar';
+    reactions.style.top = `${pos.reactions.top}px`;
+    reactions.style.left = `${pos.reactions.left}px`;
+    for (const emoji of REACTION_EMOJIS) {
+      const b = doc.createElement('button');
+      b.className = 'lp-reaction' + (hasMyReaction(msg, emoji) ? ' active' : '');
+      b.type = 'button';
+      b.textContent = emoji;
+      b.setAttribute('aria-label', `反应 ${emoji}`);
+      b.addEventListener('click', () => {
+        const next = toggleReaction(this._message || msg, emoji);
+        this._message = next;
+        b.classList.toggle('active', hasMyReaction(next, emoji));
+        this.callbacks.onReact?.(next, emoji);
+      });
+      reactions.appendChild(b);
+    }
+    const more = doc.createElement('button');
+    more.className = 'lp-reaction lp-reaction-more';
+    more.type = 'button';
+    more.textContent = '＋';
+    more.setAttribute('aria-label', '更多反应');
+    more.addEventListener('click', () => this.callbacks.onMoreReactions?.(this._message || msg));
+    reactions.appendChild(more);
+    root.appendChild(reactions);
+
+    const menu = doc.createElement('div');
+    menu.className = 'lp-menu';
+    menu.setAttribute('role', 'menu');
+    menu.style.top = `${pos.menu.top}px`;
+    menu.style.left = `${pos.menu.left}px`;
+    for (const item of getMenuItems(msg)) {
+      menu.appendChild(this._menuButton(item, msg));
+    }
+    // 次级入口：单独一行“更多”，点开再展开上下文开关与查看原始内容。
+    const moreRow = doc.createElement('button');
+    moreRow.className = 'lp-menu-item lp-menu-more';
+    moreRow.type = 'button';
+    moreRow.textContent = '更多';
+    moreRow.addEventListener('click', () => {
+      if (menu.querySelector('.lp-menu-secondary')) return;
+      const sec = doc.createElement('div');
+      sec.className = 'lp-menu-secondary';
+      for (const item of getSecondaryItems(msg)) {
+        sec.appendChild(this._menuButton(item, msg));
+      }
+      menu.appendChild(sec);
+      moreRow.remove();
+    });
+    menu.appendChild(moreRow);
+    root.appendChild(menu);
+
+    (doc.body || doc.documentElement).appendChild(root);
+    this._root = root;
+    this._message = msg;
+    this._anchorEl = anchorEl || null;
+    this._open = true;
+    if (anchorEl?.classList) anchorEl.classList.add('lp-highlight');
+    // 抑制原生 contextmenu 与整页默认选中菜单（touch-callout / user-select）。
+    // CSS 层（styles.css B 组块）已在气泡与菜单上禁选；这里再加运行时防线：
+    // 打开期间任何 selectionchange 都立即清掉，关菜单时解绑。
+    const de = doc.documentElement;
+    if (de?.style) {
+      this._savedUserSelect = de.style.userSelect || '';
+      this._savedTouchCallout = de.style.webkitTouchCallout || '';
+      de.style.userSelect = 'none';
+      de.style.webkitTouchCallout = 'none';
+    }
+    doc.addEventListener?.('selectionchange', this._boundSelectionChange);
+    doc.addEventListener?.('pointerdown', this._boundDocClick, true);
+    doc.addEventListener?.('contextmenu', this._boundDocContextMenu);
+    doc.addEventListener?.('keydown', this._boundKeyDown);
+    return pos;
+  }
+
+  /** 关闭菜单；默认恢复打开前记录的滚动位置。 */
+  close(opts = {}) {
+    const restoreScroll = opts.restoreScroll !== false;
+    if (!this._open && !this._root) return;
+    if (this._root?.remove) this._root.remove();
+    else if (this._root?.parentNode) this._root.parentNode.removeChild(this._root);
+    this._root = null;
+    this._open = false;
+    if (this._anchorEl?.classList) this._anchorEl.classList.remove('lp-highlight');
+    this._anchorEl = null;
+    const de = this.doc.documentElement;
+    if (de?.style) {
+      de.style.userSelect = this._savedUserSelect;
+      de.style.webkitTouchCallout = this._savedTouchCallout;
+    }
+    this.doc.removeEventListener?.('pointerdown', this._boundDocClick, true);
+    this.doc.removeEventListener?.('contextmenu', this._boundDocContextMenu);
+    this.doc.removeEventListener?.('keydown', this._boundKeyDown);
+    this.doc.removeEventListener?.('selectionchange', this._boundSelectionChange);
+    if (restoreScroll && this.scrollContainer) {
+      this.scrollContainer.scrollTop = this._savedScrollTop;
+    }
+    this._message = null;
+  }
+
+  destroy() {
+    this.close({ restoreScroll: false });
+  }
+
+  _menuButton(item, msg) {
+    const b = this.doc.createElement('button');
+    b.className = 'lp-menu-item' + (item.danger ? ' danger' : '');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitem');
+    const label = this.doc.createElement('span');
+    label.className = 'lp-menu-label';
+    label.textContent = item.label;
+    b.appendChild(label);
+    if (item.icon) {
+      const svg = this.doc.createElementNS
+        ? this.doc.createElementNS('http://www.w3.org/2000/svg', 'svg')
+        : this.doc.createElement('svg');
+      svg.setAttribute('class', 'icon lp-menu-icon');
+      const use = this.doc.createElementNS
+        ? this.doc.createElementNS('http://www.w3.org/2000/svg', 'use')
+        : this.doc.createElement('use');
+      use.setAttribute('href', `#${item.icon}`);
+      svg.appendChild(use);
+      b.appendChild(svg);
+    }
+    b.addEventListener('click', () => this._invoke(item.id, msg));
+    return b;
+  }
+
+  _invoke(id, msg) {
+    const cb = this.callbacks;
+    const m = this._message || msg;
+    switch (id) {
+      case 'copy': cb.onCopy?.(m); break;
+      case 'quote': cb.onQuote?.(m); break;
+      case 'favorite': cb.onFavorite?.(m); break;
+      case 'select': cb.onSelect?.(m); break;
+      case 'edit': cb.onEdit?.(m); break;
+      case 'recall': cb.onRecall?.(m); break;
+      case 'regenerate': cb.onRegenerate?.(m); break;
+      case 'toggleContext': cb.onToggleContext?.(m); break;
+      case 'viewRaw': cb.onViewRaw?.(m); break;
+      case 'delete': {
+        const token = createDeleteToken(m);
+        cb.onDelete?.(m, token);
+        break;
+      }
+      default: break;
+    }
+    // 删除也先关菜单：撤销入口在 toast 里，不在菜单里。
+    this.close();
+  }
+
+  /** 清掉当前原生选区（无选区 API 的环境直接跳过，不抛错）。 */
+  _clearSelection() {
+    try {
+      const sel = this.win?.getSelection?.()
+        || (typeof globalThis.getSelection === 'function' ? globalThis.getSelection() : null);
+      sel?.removeAllRanges?.();
+    } catch { /* ignore */ }
+  }
+
+  _onDocPointerDown(e) {
+    // 点到菜单/反应条之外 → 关闭；点在内部不处理（按钮自己会处理）。
+    if (!this._root) return;
+    let node = e.target;
+    while (node) {
+      if (node === this._root) return;
+      node = node.parentNode;
+    }
+    this.close();
+  }
+
+  _anchorRect(anchorEl, point) {
+    if (anchorEl && typeof anchorEl.getBoundingClientRect === 'function') {
+      const r = anchorEl.getBoundingClientRect();
+      if (r && Number.isFinite(r.width) && Number.isFinite(r.height) && (r.width > 0 || r.height > 0)) {
+        return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height };
+      }
+    }
+    const x = point.x ?? 0;
+    const y = point.y ?? 0;
+    return { top: y, bottom: y, left: x, right: x, width: 0, height: 0 };
+  }
+
+  /** 底部避让高度：键盘弹起时宿主可注入 visualViewport 高度差；
+   *  默认 0（集成轮在 app.js 里接 visualViewport / 输入区高度后传入）。 */
+  _bottomReserve() {
+    if (typeof this.callbacks.getBottomReserve === 'function') {
+      const v = this.callbacks.getBottomReserve();
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    return 0;
+  }
+}
+
+/* ===== js/innerVoice.js ===== */
+// innerVoice.js — 心声解析：从助理文本里剥离可选的 [inner_voice]…[/inner_voice] 块。
+//
+// 协议：模型在回复里用 [inner_voice]…[/inner_voice] 包裹 1–3 句内心独白；
+// 正文（cleanContent）里绝不能残留协议标记。
+//
+// 重要边界（写死在本模块，不依赖调用方自觉）：
+// - 本模块只处理“文本字段”（message.content / 段落文本）。它从不读取、
+//   不展示 API 返回的 reasoning / thinking / reasoning_content 等字段；
+//   那些字段根本不会传进本模块——调用方只把已渲染的正文文本交过来。
+// - 心声是“可选的独立输出字段”，不是推理过程：解析失败时安静降级
+//   （innerVoice=null），不报错、不把半截协议留在正文里。
+// - 默认 1～3 句：超过 3 句截断并标记 truncated=true。
+
+const INNER_VOICE_OPEN = '[inner_voice]';
+const INNER_VOICE_CLOSE = '[/inner_voice]';
+/** 默认保留的心声句数上限。 */
+const INNER_VOICE_MAX_SENTENCES = 3;
+/** 心声字符上限（与句数上限取先到者，防模型一次吐出大段独白）。 */
+const INNER_VOICE_MAX_CHARS = 240;
+
+/** 是否含有心声开标签（不保证闭合）。 */
+function hasInnerVoice(content) {
+  return String(content ?? '').includes(INNER_VOICE_OPEN);
+}
+
+/** 按中文/英文句末标点切句，保留标点；空行不计为句。 */
+function splitSentences(text) {
+  const out = [];
+  const re = /[^。！？!?…\n]+[。！？!?…\n]?/g;
+  for (const m of String(text ?? '').matchAll(re)) {
+    const s = m[0].trim();
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+/** 把心声截到上限句数/字符数，返回 { text, truncated }。 */
+function truncateInnerVoice(text, opts = {}) {
+  const maxSentences = opts.maxSentences ?? INNER_VOICE_MAX_SENTENCES;
+  const maxChars = opts.maxChars ?? INNER_VOICE_MAX_CHARS;
+  let sentences = splitSentences(text);
+  let truncated = false;
+  if (sentences.length > maxSentences) {
+    sentences = sentences.slice(0, maxSentences);
+    truncated = true;
+  }
+  let out = sentences.join('');
+  // 句数够了但仍超长：按字符截断（不截半个词以外的东西，只截尾不断句中）。
+  if ([...out].length > maxChars) {
+    out = [...out].slice(0, maxChars).join('').trimEnd();
+    truncated = true;
+  }
+  return { text: out, truncated };
+}
+
+/**
+ * 解析助理内容里的心声块。
+ * @returns { cleanContent, innerVoice, truncated }
+ * - 正常：取第一个完整块，cleanContent 删掉该块（多余空行并掉），
+ *   innerVoice 为截断后的文本（1～3 句）。
+ * - 开标签存在但闭标签缺失：解析失败 → innerVoice=null，且把从开标签
+ *   起到文末的半截协议整个从正文里删掉（绝不把协议代码留在正文里）。
+ * - 只有闭标签（无开标签）：删掉孤闭标签，innerVoice=null。
+ * - 块内空白：innerVoice=null，但仍删掉空块。
+ * - 多个块：只取第一个，其余块同样从正文里删掉（不残留协议标记）。
+ */
+function parseInnerVoice(content, opts = {}) {
+  const raw = String(content ?? '');
+  if (!raw.includes(INNER_VOICE_OPEN) && !raw.includes(INNER_VOICE_CLOSE)) {
+    return { cleanContent: raw, innerVoice: null, truncated: false };
+  }
+  let clean = raw;
+  let innerVoice = null;
+  let truncated = false;
+  const firstOpen = raw.indexOf(INNER_VOICE_OPEN);
+  if (firstOpen >= 0) {
+    const closeIdx = raw.indexOf(INNER_VOICE_CLOSE, firstOpen + INNER_VOICE_OPEN.length);
+    if (closeIdx >= 0) {
+      const body = raw.slice(firstOpen + INNER_VOICE_OPEN.length, closeIdx).trim();
+      // 删掉全部心声块（第一个 + 之后残留的），正文不留协议标记。
+      clean = stripAllInnerVoiceBlocks(raw);
+      if (body) {
+        const t = truncateInnerVoice(body, opts);
+        innerVoice = t.text || null;
+        truncated = t.truncated;
+      }
+    } else {
+      // 闭标签缺失：安静降级——心声丢弃，半截块整体从正文删除。
+      clean = raw.slice(0, firstOpen);
+      innerVoice = null;
+    }
+  }
+  // 孤闭标签（无开标签）也删掉。
+  clean = stripAllInnerVoiceBlocks(clean);
+  clean = collapseBlankLines(clean);
+  return { cleanContent: clean, innerVoice, truncated };
+}
+
+/** 删掉文本里所有心声块与孤标签（完整块、半截块、孤闭标签）。 */
+function stripAllInnerVoiceBlocks(content) {
+  let out = String(content ?? '');
+  // 完整块（可能多个）。
+  let prev;
+  do {
+    prev = out;
+    const open = out.indexOf(INNER_VOICE_OPEN);
+    if (open < 0) break;
+    const close = out.indexOf(INNER_VOICE_CLOSE, open + INNER_VOICE_OPEN.length);
+    if (close >= 0) out = out.slice(0, open) + out.slice(close + INNER_VOICE_CLOSE.length);
+    else out = out.slice(0, open);
+  } while (out !== prev);
+  // 孤闭标签。
+  out = out.split(INNER_VOICE_CLOSE).join('');
+  return out;
+}
+
+/** 正文里连续 3 个以上换行并为最多 2 个，首尾去空白。 */
+function collapseBlankLines(text) {
+  return String(text ?? '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/* ===== js/chatDaily.js ===== */
+// chatDaily.js — 日常体验纯逻辑：草稿、阅读位置、发送失败重试、生成状态恢复。
+//
+// 本模块不碰 DOM、不 import app.js、不读写 IndexedDB；持久化由调用方
+// 传入一个类 localStorage 的 storage（{ getItem, setItem, removeItem }），
+// 集成时 app.js 传入 localStorage 即可。所有函数都是纯函数或只通过
+// 传入的 storage 读写，便于 Node 测试。
+
+/** 草稿：按角色保存。 */
+function draftKey(charId) {
+  return `uwu-chat.draft.${charId}`;
+}
+
+/** 立即保存草稿；空文本则清除（不留空串占位）。返回保存后的文本（'' 表示已清除）。 */
+function saveDraft(storage, charId, text) {
+  if (!storage || !charId) return '';
+  const t = String(text ?? '');
+  if (t.trim() === '') {
+    storage.removeItem?.(draftKey(charId));
+    return '';
+  }
+  storage.setItem?.(draftKey(charId), t);
+  return t;
+}
+
+/** 读草稿（没有返回 ''）。 */
+function loadDraft(storage, charId) {
+  if (!storage || !charId) return '';
+  return String(storage.getItem?.(draftKey(charId)) ?? '');
+}
+
+/** 发送成功后清除草稿。 */
+function clearDraft(storage, charId) {
+  if (!storage || !charId) return;
+  storage.removeItem?.(draftKey(charId));
+}
+
+/**
+ * 防抖草稿保存器：输入时 schedule(text)，停稳 debounceMs 后才写 storage；
+ * 切页/发送前调 flush() 立即落盘；cancel() 丢弃未落盘的输入。
+ * （storage 仍由调用方传入；定时器用全局 setTimeout，便于测试注入小间隔。）
+ */
+function createDraftSaver(storage, charId, opts = {}) {
+  const debounceMs = opts.debounceMs ?? 300;
+  let timer = null;
+  let pending = null;
+  let hasPending = false;
+  return {
+    schedule(text) {
+      pending = String(text ?? '');
+      hasPending = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        hasPending = false;
+        saveDraft(storage, charId, pending);
+      }, debounceMs);
+    },
+    flush() {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      if (hasPending) {
+        hasPending = false;
+        saveDraft(storage, charId, pending);
+      }
+    },
+    cancel() {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      hasPending = false;
+      pending = null;
+    },
+    get pending() { return hasPending; },
+  };
+}
+
+/** 阅读位置：按角色保存。 */
+function readingPositionKey(charId) {
+  return `uwu-chat.readpos.${charId}`;
+}
+
+/**
+ * 保存阅读位置：最后可见消息 id + 距底偏移（px）。
+ * 距底偏移 = scrollHeight - scrollTop - clientHeight，刷新/切回后用它还原视口。
+ */
+function saveReadingPosition(storage, charId, pos) {
+  if (!storage || !charId || !pos) return null;
+  const value = {
+    lastVisibleMessageId: pos.lastVisibleMessageId ?? null,
+    distanceFromBottom: Math.max(0, Math.floor(pos.distanceFromBottom ?? 0)),
+    savedAt: Date.now(),
+  };
+  storage.setItem?.(readingPositionKey(charId), JSON.stringify(value));
+  return value;
+}
+
+/** 读阅读位置（没有/损坏返回 null）。 */
+function loadReadingPosition(storage, charId) {
+  if (!storage || !charId) return null;
+  try {
+    const raw = storage.getItem?.(readingPositionKey(charId));
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== 'object') return null;
+    return {
+      lastVisibleMessageId: v.lastVisibleMessageId ?? null,
+      distanceFromBottom: Number.isFinite(v.distanceFromBottom) ? v.distanceFromBottom : 0,
+      savedAt: v.savedAt ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 新消息到达时的拉底判定（核心日常体验规则）。
+ * @param {Object} state { distanceFromBottom } 当前距底偏移（px）
+ * @param {number} threshold 距底多少 px 内算“贴在底部”（默认 48）
+ * @returns { shouldStickToBottom, showNewMessagesPill }
+ * - 用户贴在底部（或就是底部）→ 跟随拉底，不显示“新消息” pill。
+ * - 用户上翻了（距底超过阈值）→ 不强制拉到底，显示“新消息 ↓” pill，点 pill 再拉底。
+ */
+function decideNewMessageDisplay(state = {}, threshold = 48) {
+  const distance = Math.max(0, Number(state.distanceFromBottom) || 0);
+  const nearBottom = distance <= threshold;
+  return {
+    shouldStickToBottom: nearBottom,
+    showNewMessagesPill: !nearBottom,
+  };
+}
+
+/** 距底偏移换算：scrollHeight/scrollTop/clientHeight → px（钳制 ≥ 0）。 */
+function distanceFromBottom(scrollState = {}) {
+  const { scrollHeight = 0, scrollTop = 0, clientHeight = 0 } = scrollState;
+  return Math.max(0, scrollHeight - scrollTop - clientHeight);
+}
+
+/** 发送状态：消息对象上的 sendState 字段（'sending' | 'sent' | 'failed' | 'interrupted'）。 */
+function isFailed(msg = {}) {
+  return msg.sendState === 'failed';
+}
+
+function canRetry(msg = {}) {
+  return isFailed(msg) && typeof msg.id === 'string' && msg.id !== '';
+}
+
+/** 标记发送失败：返回新对象（不改原对象），保留 id / 内容 / 时间戳。 */
+function markFailed(msg = {}, error = null) {
+  return {
+    ...msg,
+    sendState: 'failed',
+    sendError: error ? String(error) : (msg.sendError ?? null),
+    failedAt: Date.now(),
+  };
+}
+
+/**
+ * 重试失败消息：复用同一个 messageId（不产生重复记录），状态回到 sending，
+ * 清掉失败标记。调用方随后用同一 id 写回 IndexedDB（put 而非 add）。
+ */
+function retryMessage(msg = {}) {
+  if (!canRetry(msg)) return null;
+  const { sendError: _e, failedAt: _f, ...rest } = msg;
+  return { ...rest, sendState: 'sending' };
+}
+
+/**
+ * 生成状态恢复（刷新/重进后调用）：把残留的 generating 标为 interrupted。
+ * @param {Array} messages 消息数组；生成中的消息以 sendState==='generating'
+ *   或 generating===true 标记（两种写法都认，因为旧数据两种都可能有）。
+ * @returns { messages, wasGenerating }
+ * - wasGenerating：恢复前是否真有生成中的消息（供调用方决定是否提示“上次生成已中断”）。
+ * - 恢复后绝不自动续生成：调用方不要因此再调 getReply()；用户要点“获取回复”才重新生成。
+ */
+function recoverInterruptedMessages(messages = []) {
+  let wasGenerating = false;
+  const out = (Array.isArray(messages) ? messages : []).map((m) => {
+    const generating = m && (m.sendState === 'generating' || m.generating === true);
+    if (!generating) return m;
+    wasGenerating = true;
+    const { generating: _g, ...rest } = m;
+    return { ...rest, sendState: 'interrupted', interruptedAt: Date.now() };
+  });
+  return { messages: out, wasGenerating };
+}
+
+/** 刷新后是否应自动续生成：永远 false（不假装还在生成、不重复生成）。 */
+function shouldResumeGeneration() {
+  return false;
+}
+
+/** 同组消息的最大间隔（ms）：与 app.js 渲染里的连续判定一致（10 分钟）。 */
+const GROUP_GAP_MS = 10 * 60 * 1000;
+
+/**
+ * 组末判定（iMessage 尾巴规则的纯函数版，与 .continuous 方向相反）：
+ * continuous 标“非首条”，这里标“组内最后一条”。一条消息是组末，当且仅当
+ * 下一条不存在、角色不同、间隔 >= 10 分钟或跨天。app.js 的 renderMessages /
+ * appendMessageElement 与测试共用这一份判定，不各自另写。
+ */
+function groupLastFlags(messages = []) {
+  const list = Array.isArray(messages) ? messages : [];
+  return list.map((m, i) => {
+    const next = list[i + 1];
+    if (!next) return true;
+    if (next.role !== m.role) return true;
+    if (Number.isFinite(next.timestamp) && Number.isFinite(m.timestamp)) {
+      if (next.timestamp - m.timestamp >= GROUP_GAP_MS) return true;
+      if (new Date(next.timestamp).toDateString() !== new Date(m.timestamp).toDateString()) return true;
+    }
+    return false;
+  });
+}
+
+/* ===== js/quoteNavigation.js ===== */
+// 引用定位：ID 优先；旧记录只接受当前角色、时间在引用之前、唯一的原文匹配。
+// 不把相同文案当成相同消息，不跨角色跳转，不在缺失 ID 时偷偷跳到别的记录。
+function normalizeQuoteReference(value = {}) {
+  const q = value && typeof value === 'object' ? value : { content:String(value || '') };
+  return {
+    messageId: q.messageId ?? q.originalMessageId ?? q.targetId ?? null,
+    senderId: q.senderId ?? q.role ?? null,
+    content: String(q.content ?? q.text ?? ''),
+    senderName: String(q.senderName ?? q.name ?? ''),
+  };
+}
+
+function matchQuoteSource(quote, messages, { charId, sourceMessage, getText = m => m.content || '' } = {}) {
+  const ref = normalizeQuoteReference(quote);
+  const available = (messages || []).filter(m => m && m.charId === charId && m.id !== sourceMessage?.id
+    && (!Number.isFinite(sourceMessage?.timestamp) || !Number.isFinite(m.timestamp) || m.timestamp <= sourceMessage.timestamp));
+  if (ref.messageId != null) {
+    const target = available.find(m => String(m.id) === String(ref.messageId));
+    return target ? { ok:true, target, matchedBy:'id' } : { ok:false, reason:'missing' };
+  }
+  const normalize = text => String(text || '').replace(/\s+/g, ' ').trim();
+  const text = normalize(ref.content);
+  if (!text) return { ok:false, reason:'missing' };
+  const role = ref.senderId === 'user_me' || ref.senderId === 'user' ? 'user'
+    : ref.senderId === 'assistant' ? 'assistant' : null;
+  const hits = available.filter(m => (!role || m.role === role) && normalize(getText(m)) === text);
+  if (hits.length === 1) return { ok:true, target:hits[0], matchedBy:'text' };
+  return { ok:false, reason:hits.length > 1 ? 'ambiguous' : 'missing' };
+}
+
+async function resolveQuoteSource({ backend, charId, quote, sourceMessage, getText }) {
+  const ref = normalizeQuoteReference(quote);
+  // An explicit stale ID stays missing. Never silently fall back to a different same-text message.
+  const messages = ref.messageId != null
+    ? [await backend.get('messages', ref.messageId)].filter(Boolean)
+    : await backend.getAllMessages(charId);
+  const result = matchQuoteSource(ref, messages, { charId, sourceMessage, getText });
+  if (result.ok && (result.target.isWithdrawn || result.target.isDeleted)) return { ok:false, reason:'withdrawn' };
+  return result;
+}
+
+// UI supplies showTarget so navigation can render a bounded historical page around the original.
+async function followQuoteReference(options) {
+  const result = await resolveQuoteSource(options);
+  if (!result.ok) return result;
+  const shown = await options.showTarget(result.target);
+  return shown === false ? { ok:false, reason:'hidden' } : result;
+}
 
 /* ===== js/app.js ===== */
 // app.js — UWU 聊天第一阶段：独立聊天界面。
@@ -3531,8 +11257,42 @@ const ManageView = (() => {
 
 
 
+
+
+
+
+
+
+
+
+// A 组集成：长按菜单 / 心声解析 / 状态三模式 / 日常体验（草稿·阅读位置·重试·恢复）。
+// 这些模块不 import app.js，动作全走回调注入；接线见 docs/chat-audit.md 附表。
+
+
+
+// 聊天记录中心（B 组）：搜索 / 收藏 / 日期的数据查询走 A 组模块，UI 与定位走 js/chatCenter.js。
+// 注意：这里必须用原名 import（不要 `import { X as Y }`），build 脚本去掉 import 行后别名无定义。
+
+
+
+
+
+// B 组集成：通知 / 音频保活 / 推送 / 自定义图标 / 主动唤醒。
+// 这些模块不 import app.js，动作全走回调注入；接线见 docs/b-group-integration.md §8。
+
+
+
+
+
 const $ = (s) => document.querySelector(s);
 const messageArea = $('#message-area');
+
+// 调试模式（对照原始 UWU 的 isDebugMode，db.js:470）：只在当前会话里生效，默认关闭。
+// 状态更新、思考过程与隐藏指令在非调试模式下不渲染进聊天流（只进状态栏/执行状态变化）；
+// 调试模式下以【调试可见】样式显示原文。切换入口在消息长按菜单里。
+let isDebugMode = false;
+// 聊天页 HTML 卡片 iframe 的唯一编号（高度上报按 id 路由回对应的 iframe）。
+let chatHtmlSeq = 0;
 const inputEl = $('#input');
 const isCoarse = window.matchMedia?.('(pointer: coarse)').matches;
 
@@ -3542,6 +11302,41 @@ let worldBooks = [];
 let stickers = [];
 let apiSettings = { provider: 'openai', url: '', key: '', model: '', temperatureEnabled: false, temperature: 1.0, streamEnabled: true, timePerceptionEnabled: false };
 let apiPresets = [];
+// 两套独立副 API 配置：与主 API 分开存（settings 'summaryApi' / 'embeddingApi'），绝不混用。
+let summaryApi = { provider: 'openai', url: '', key: '', model: '' };
+let embeddingApi = { provider: 'openai', url: '', key: '', model: '' };
+// 记忆总结设置（settings 'summarySettings'）：自动总结默认关闭，默认每 30 轮一轮。
+let summarySettings = { autoEnabled: false, everyRounds: 30, prompt: DEFAULT_SUMMARY_PROMPT, length: 'medium', lastSummarizedMessageId: null, summarizedRounds: 0 };
+let summaryRunning = false; // 总结进行中：防重复触发
+let experienceRunning = false; // 经历提取进行中：防重复触发（与总结共用副 API，串行跑）
+// 向量记忆设置（settings 'vectorSettings'）与索引进度（settings 'vectorIndexProgress'，
+// 刷新后按已保存进度继续）。索引是可重建缓存，不随备份导出。
+let vectorSettings = { ...DEFAULT_VECTOR_SETTINGS };
+let vectorIndexProgress = null;
+let vectorIndexRunning = false;
+let vectorIndexCancel = null; // { cancelled: false }，暂停时置 true
+// 联想召回设置（settings 'assocSettings'）：总开关默认开；预算记录在
+// settings 'assocBudget'（{month, used, limit}，默认 300 次/月），见 associative.js。
+let assocSettings = { ...DEFAULT_ASSOC_SETTINGS };
+// B 组设置（settings 表键名见各模块的 *_SETTINGS_KEY；默认值为各模块的 DEFAULT_*）。
+let notifySettings = { ...DEFAULT_NOTIFY_SETTINGS };
+let keepAliveSettings = { ...DEFAULT_KEEPALIVE_SETTINGS };
+let pushSettings = { ...DEFAULT_PUSH_SETTINGS };
+let customIconSettings = { appName: DEFAULT_APP_NAME, dataUrl: null };
+let wakeSettings = { ...DEFAULT_WAKE_SETTINGS };
+// B 组单例（boot 里初始化；模块均不 import app.js，只拿回调）。
+let inAppNotifier = null;
+let audioKeepAlive = null;
+let wakeEngine = null;
+// 唤醒回合进行中标记：巡检不重入，且用户正在生成回复时不抢话。
+let wakeRoundRunning = false;
+// 批量任务队列（settings 'memoryJobs'）：用户主动启动的分批任务，进度持久化；
+// 页面关闭后任务不会在后台继续，回来显示“已暂停/未完成”，点继续可接着做；
+// 任务不开机自动跑。一次只跑一个任务。
+let memoryJobs = {};
+let memoryJobRunning = null; // 正在跑的任务 id
+let memoryJobCancel = null; // { cancelled: false }，暂停时置 true
+let memoryJobScratch = new Map(); // jobId -> 关键词重建算好的 postings（恢复写阶段时复用）
 let appearanceSettings = null; // 外观/背景/玻璃参数（settings 表 'appearance'），不随备份导出
 // 全局提示词设置：导入备份的 cotSettings 落在这里（settings 表 'cotSettings'），
 // 角色未指定专属版本时跟随它；缺省为 tt。之前这里写死 'tt'，导入的设置根本没用上。
@@ -3549,14 +11344,24 @@ let globalSettings = { cotSettings: { promptVersion: 'tt' } };
 // 最近一次构建的请求：预览与 Get Reply 共用同一份；历史/设置一变就失效重建。
 let lastBuiltRequest = null;
 let currentQuote = null;
+// 返回按钮的目的地：上一次离开聊天页时所在的非聊天页（默认动态）；
+// 单角色应用没有会话列表，“主界面”就是带 Tab 栏的页。
+let lastHomeView = 'moments';
 let isGenerating = false;
 let abortController = null;
 let streamBuf = '';
 let loadedOldest = null;    // 已加载窗口的最早时间戳
 let hasMoreHistory = false;
 let editingMessageId = null;
-let longPressTimer = null;
 let objectUrlCache = new Map();
+// A 组状态：长按菜单实例（懒创建，scrollContainer 是消息区，关闭时恢复滚动位置）。
+let lpMenu = null;
+// 多选：长按菜单「选择」攒起来的消息 id，批量删除 / 清除选择走顶栏 ··· 菜单。
+let selectedMessageIds = new Set();
+// 日常体验：草稿防抖保存器（按角色）、新消息 pill 计数、启动时一次性恢复阅读位置。
+let draftSaver = null;
+let newMessagesCount = 0;
+let restoreReadPosOnce = false;
 // 同毫秒连发时 IndexedDB 的 [charId, timestamp] 索引无法保证顺序，
 // 新消息用单调递增时间戳（与预览里的 seq 索引同等效果；导入的旧消息
 // 若时间戳相同，仍按原有顺序显示）。
@@ -3657,6 +11462,30 @@ async function loadAll() {
   if (settings?.value) apiSettings = { ...apiSettings, ...settings.value };
   const presets = await backend.get('settings', 'apiPresets');
   if (presets?.value) apiPresets = presets.value;
+  const sumApi = await backend.get('settings', 'summaryApi');
+  if (sumApi?.value) summaryApi = { ...summaryApi, ...sumApi.value };
+  const embApi = await backend.get('settings', 'embeddingApi');
+  if (embApi?.value) embeddingApi = { ...embeddingApi, ...embApi.value };
+  const sumSet = await backend.get('settings', 'summarySettings');
+  if (sumSet?.value) summarySettings = { ...summarySettings, ...sumSet.value };
+  const vecSet = await backend.get('settings', 'vectorSettings');
+  if (vecSet?.value) vectorSettings = { ...DEFAULT_VECTOR_SETTINGS, ...vecSet.value };
+  const assocSet = await backend.get('settings', 'assocSettings');
+  if (assocSet?.value) assocSettings = { ...DEFAULT_ASSOC_SETTINGS, ...assocSet.value };
+  const notifySet = await backend.get('settings', NOTIFY_SETTINGS_KEY);
+  if (notifySet?.value) notifySettings = { ...DEFAULT_NOTIFY_SETTINGS, ...notifySet.value };
+  const kaSet = await backend.get('settings', KEEPALIVE_SETTINGS_KEY);
+  if (kaSet?.value) keepAliveSettings = { ...DEFAULT_KEEPALIVE_SETTINGS, ...kaSet.value };
+  const pushSet = await backend.get('settings', PUSH_SETTINGS_KEY);
+  if (pushSet?.value) pushSettings = { ...DEFAULT_PUSH_SETTINGS, ...pushSet.value };
+  const iconSet = await backend.get('settings', CUSTOM_ICON_SETTINGS_KEY);
+  if (iconSet?.value) customIconSettings = { appName: iconSet.value.appName || DEFAULT_APP_NAME, dataUrl: iconSet.value.dataUrl || null };
+  const wakeSet = await backend.get('settings', WAKE_SETTINGS_KEY);
+  if (wakeSet?.value) wakeSettings = { ...DEFAULT_WAKE_SETTINGS, ...wakeSet.value };
+  const vecProg = await backend.get('settings', 'vectorIndexProgress');
+  if (vecProg?.value) vectorIndexProgress = vecProg.value;
+  const memJobs = await backend.get('settings', 'memoryJobs');
+  if (memJobs?.value) memoryJobs = memJobs.value;
   const cot = await backend.get('settings', 'cotSettings');
   if (cot?.value) globalSettings = { cotSettings: cot.value };
   const app = await backend.get('settings', 'appearance');
@@ -3709,6 +11538,11 @@ async function seedDemo() {
     ['assistant', '好。哪儿也不去，就在这里陪你。', -120000],
   ].map(([role, text, offset]) => ({ id: uid('msg'), charId: 'char_demo', role, content: text,
     parts: [{ type: 'text', text }], timestamp: now + offset }));
+  // 新安装的示例也包含双向引用，便于直接检查轮廓、方向及真实跳转；已有数据不受影响。
+  welcome[3].quote = { messageId:welcome[2].id, senderId:'user_me', senderName:'我', content:welcome[2].content };
+  welcome.push({ id:uid('msg'), charId:'char_demo', role:'user', content:'嗯，就这样。',
+    parts:[{ type:'text', text:'嗯，就这样。' }], timestamp:now-60000,
+    quote:{ messageId:welcome[1].id, senderId:'assistant', senderName:'Noah', content:welcome[1].content } });
   for (const m of welcome) await backend.put('messages', m);
   return demo;
 }
@@ -3721,13 +11555,56 @@ async function saveCharacter() {
 async function saveApiSettings() {
   await backend.put('settings', { key: 'api', value: apiSettings });
 }
+async function saveSummaryApi() {
+  await backend.put('settings', { key: 'summaryApi', value: summaryApi });
+}
+async function saveEmbeddingApi() {
+  await backend.put('settings', { key: 'embeddingApi', value: embeddingApi });
+}
+async function saveSummarySettings() {
+  await backend.put('settings', { key: 'summarySettings', value: summarySettings });
+}
+async function saveVectorSettings() {
+  await backend.put('settings', { key: 'vectorSettings', value: vectorSettings });
+}
+async function saveAssocSettings() {
+  await backend.put('settings', { key: 'assocSettings', value: assocSettings });
+}
+async function saveNotifySettings() {
+  await backend.put('settings', { key: NOTIFY_SETTINGS_KEY, value: notifySettings });
+}
+async function saveKeepAliveSettings() {
+  await backend.put('settings', { key: KEEPALIVE_SETTINGS_KEY, value: keepAliveSettings });
+}
+async function savePushSettings() {
+  await backend.put('settings', { key: PUSH_SETTINGS_KEY, value: pushSettings });
+}
+async function saveCustomIconSettings() {
+  await backend.put('settings', { key: CUSTOM_ICON_SETTINGS_KEY, value: customIconSettings });
+}
+async function saveWakeSettings() {
+  await backend.put('settings', { key: WAKE_SETTINGS_KEY, value: wakeSettings });
+}
+async function saveVectorIndexProgress(p) {
+  vectorIndexProgress = p;
+  await backend.put('settings', { key: 'vectorIndexProgress', value: p });
+}
 
 /* ---------------- 消息渲染 ---------------- */
 function allowedStickerNames() {
-  const groups = String(char?.stickerGroups || '').split(/[,，]/).map((s) => s.trim()).filter((s) => s && s !== '未分类');
-  return stickers.filter((s) => groups.includes(s.group)).map((s) => s.name);
+  // 渲染/解析认的是“库里有没有这个名字”（原版兜底：分组内先找，全库再找），
+  // 不是“在不在角色分组里”——分组只约束提示词（promptBuilder）。
+  return knownStickerNames(stickers, char?.stickerGroups);
 }
 function findSticker(name) { return stickers.find((s) => s.name === name); }
+
+/** 表情包取图（优先级 dataUrl > attachmentId > 原版 data 字段）；无图返回 null。 */
+async function resolveStickerSrc(st) {
+  const s = stickerImageSrc(st);
+  if (!s) return null;
+  if (s.kind === 'url') return s.src;
+  return attachmentDataURL(s.id);
+}
 
 function protocolBody(content) {
   // 取 [X的消息：正文] 里的正文；双语返回原文+译文结构
@@ -3749,46 +11626,373 @@ function renderTimeDivider(ts) {
   return d;
 }
 
-async function createMessageElement(msg, isContinuous = false) {
-  const wrap = el('div', `msg ${msg.role === 'user' ? 'sent' : 'received'}`);
+// 原始 UWU（chat_render.js:164/416）：状态更新、思考过程与隐藏指令
+// （接收/退回转账、接收礼物）在非调试模式下不渲染。判定除了消息上的
+// isStatusUpdate/isThinking 标记，也看内容本身——导入的旧数据可能只有
+// 协议文本没有标记，单段状态协议或整条 <thinking> 同样算隐藏消息。
+function isHiddenMessage(msg) {
+  if (msg.isStatusUpdate || msg.isThinking) return true;
+  const c = String(msg.content || '').trim();
+  if (c.startsWith('<thinking>')) return true;
+  const seg = classifyContent(msg.content || '', char, { allowedStickers: allowedStickerNames() });
+  const segs = seg.kind === 'mixed' ? seg.segments : [seg];
+  if (!segs.length) return false;
+  return segs.every((s) =>
+    s.kind === 'status' || s.kind === 'transferResponse' || s.kind === 'giftResponse'
+    || (s.kind === 'html' && String(s.content || '').trim().toLowerCase().startsWith('<thinking>')));
+}
+
+/* ---------------- 长按菜单（A 组集成，js/longPressMenu.js） ----------------
+ *  现行底部 sheet（openMsgMenu + #msg-menu）已退役：菜单改走浮动定位，
+ *  跟随气泡位置自动选上下/左右展开，反应条独立排布在菜单与气泡之间。
+ *  所有动作都真实生效（复制/引用/收藏/选择/编辑/撤回/重新生成/删除/反应），
+ *  不给装饰按钮假功能；调试开关不在长按菜单里，改走顶栏 ··· 菜单。 */
+function ensureLpMenu() {
+  if (lpMenu) return lpMenu;
+  lpMenu = new LongPressMenu({
+    onCopy: (m) => copyMessageText(m),
+    onQuote: (m) => startQuote(m),
+    onFavorite: (m) => toggleFavoriteMessage(m),
+    onSelect: (m) => toggleSelectMessage(m),
+    onEdit: (m) => startEditMessage(m),
+    onRecall: (m) => withdrawMessage(m),
+    onRegenerate: () => handleRegenerate(),
+    onDelete: (m, token) => deleteMessageWithUndo(m, token),
+    onToggleContext: (m) => toggleMessageContext(m),
+    onViewRaw: (m) => showModal('原始内容', `<pre class="code">${escapeHtml(JSON.stringify(m, null, 2))}</pre>`, [{ label: '关闭' }]),
+    onReact: (next, emoji) => persistReaction(next, emoji),
+    onMoreReactions: (m) => openMoreReactions(m),
+    getBottomReserve: () => getBottomReserve(),
+  }, { scrollContainer: messageArea });
+  return lpMenu;
+}
+
+/** 底部避让高度：键盘高度（visualViewport 差值）+ 输入区 + Tab 栏。
+ *  菜单底缘不进入这个区域，不被键盘和底栏遮挡。 */
+function getBottomReserve() {
+  let keyboard = 0;
+  if (window.visualViewport && window.innerHeight > window.visualViewport.height) {
+    keyboard = window.innerHeight - window.visualViewport.height;
+  }
+  const composerH = $('#composer')?.offsetHeight || 56;
+  const tabbarH = $('#tabbar')?.offsetHeight || 62;
+  return keyboard + composerH + tabbarH + 16;
+}
+
+function attachMsgMenu(wrap, msg) {
+  ensureLpMenu().attachTo(wrap, msg);
+}
+
+/** 旧 openMsgMenu 的兼容入口：x/y 被 void 丢弃的历史问题已修掉，
+ *  现在按气泡元素实际位置打开浮动菜单。 */
+function openMsgMenu(msg, x, y) {
+  const wrap = messageArea.querySelector(`[data-id="${CSS.escape(String(msg.id))}"]`);
+  ensureLpMenu().open(msg, wrap || null, { x: x ?? 0, y: y ?? 0 });
+}
+
+async function copyMessageText(msg) {
+  const text = msg.role === 'user' || msg.role === 'assistant'
+    ? extractProtocolText(messageText(msg)) || msg.content : msg.content;
+  try {
+    await navigator.clipboard?.writeText(text);
+    toast('已复制');
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); toast('已复制'); } catch { toast('复制失败'); }
+    ta.remove();
+  }
+}
+
+async function toggleFavoriteMessage(msg) {
+  const m = await backend.get('messages', msg.id);
+  if (!m) return;
+  m.isFavorite = !m.isFavorite;
+  await backend.put('messages', m);
+  await renderMessages(false);
+  toast(m.isFavorite ? '已收藏' : '已取消收藏');
+}
+
+function toggleSelectMessage(msg) {
+  const wrap = messageArea.querySelector(`[data-id="${CSS.escape(String(msg.id))}"]`);
+  if (selectedMessageIds.has(msg.id)) {
+    selectedMessageIds.delete(msg.id);
+    wrap?.classList.remove('selected');
+  } else {
+    selectedMessageIds.add(msg.id);
+    wrap?.classList.add('selected');
+  }
+  toast(selectedMessageIds.size
+    ? `已选 ${selectedMessageIds.size} 条，可在顶栏 ··· 菜单里批量删除或清除选择`
+    : '已清除选择');
+}
+
+async function toggleMessageContext(msg) {
+  const m = await backend.get('messages', msg.id);
+  if (!m) return;
+  m.isContextDisabled = !m.isContextDisabled;
+  await backend.put('messages', m);
+  await renderMessages(false);
+  toast(m.isContextDisabled ? '已设为不进入上下文' : '已恢复进上下文');
+}
+
+/** 删除 + 5 秒撤销：token 只带恢复快照，不含 API 信息；过期后撤销入口失效。 */
+async function deleteMessageWithUndo(msg, token) {
+  const ids = selectedMessageIds.has(msg.id) && selectedMessageIds.size > 1
+    ? [...selectedMessageIds] : [msg.id];
+  const snapshots = [];
+  for (const id of ids) {
+    const m = await backend.get('messages', id);
+    if (!m) continue;
+    snapshots.push({ ...m });
+    await backend.delete('messages', id);
+    await invalidateExperiencesForSourceMessage(id);
+  }
+  selectedMessageIds.clear();
+  await renderMessages(false);
+  if (!snapshots.length) return;
+  const undoToken = token && ids.length === 1 ? token : createDeleteToken(snapshots[0]);
+  showUndoToast(snapshots.length > 1 ? `已删除 ${snapshots.length} 条消息` : '已删除', undoToken, snapshots);
+}
+
+function showUndoToast(text, token, snapshots) {
+  const el = $('#toast');
+  el.innerHTML = '';
+  const span = document.createElement('span');
+  span.textContent = `${text} · `;
+  const btn = document.createElement('button');
+  btn.textContent = '撤销';
+  btn.className = 'mini-btn';
+  btn.onclick = async () => {
+    el.classList.add('hidden');
+    clearTimeout(showUndoToast._t);
+    for (const s of snapshots) await backend.put('messages', s);
+    await renderMessages(false);
+    toast('已恢复');
+  };
+  el.append(span, btn);
+  el.classList.remove('hidden');
+  clearTimeout(showUndoToast._t);
+  showUndoToast._t = setTimeout(() => el.classList.add('hidden'), 5000);
+  void token;
+}
+
+/** 表情反应：纯本地写回 IndexedDB（message.reactions），重复点取消，不请求模型。 */
+async function persistReaction(nextMsg, emoji) {
+  const current = await backend.get('messages', nextMsg.id);
+  const base = current || nextMsg;
+  const updated = toggleReaction(base, emoji);
+  await backend.put('messages', updated);
+  const wrap = messageArea.querySelector(`[data-id="${CSS.escape(String(nextMsg.id))}"]`);
+  if (wrap) renderReactionsRow(wrap, updated);
+}
+
+function openMoreReactions(msg) {
+  const extra = ['🎉', '😢', '🔥', '👀', '🙏', '💯'];
+  showModal('更多反应', `<div class="reaction-more">${extra.map((e) => `<button data-emoji="${e}">${e}</button>`).join('')}</div>`, [{ label: '关闭' }]);
+  document.querySelectorAll('.reaction-more button').forEach((b) => {
+    b.addEventListener('click', async () => {
+      hideModal();
+      const current = await backend.get('messages', msg.id);
+      if (!current) return;
+      await persistReaction(toggleReaction(current, b.dataset.emoji), b.dataset.emoji);
+    });
+  });
+}
+
+/** 气泡下方的反应汇总行：有点过的表情才显示，mine 高亮。 */
+function renderReactionsRow(wrap, msg) {
+  let row = wrap.querySelector('.msg-reactions');
+  const counts = reactionCounts(msg);
+  if (!counts.length) { row?.remove(); return; }
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'msg-reactions';
+    wrap.querySelector('.msg-body')?.appendChild(row);
+  }
+  row.innerHTML = '';
+  for (const c of counts) {
+    const chip = document.createElement('button');
+    chip.className = 'reaction-chip' + (c.mine ? ' mine' : '');
+    chip.type = 'button';
+    chip.textContent = c.count > 1 ? `${c.emoji} ${c.count}` : c.emoji;
+    chip.title = c.mine ? '点一下取消我的反应' : '反应';
+    chip.onclick = async () => {
+      const current = await backend.get('messages', msg.id);
+      if (!current) return;
+      await persistReaction(toggleReaction(current, c.emoji), c.emoji);
+    };
+    row.appendChild(chip);
+  }
+}
+
+/** 心声轻量面板：只在心声模式、点某条回复下的「心声」才打开，不自动弹出。 */
+function openInnerVoicePanel(text) {
+  const panel = $('#inner-voice-panel');
+  $('#inner-voice-text').textContent = text || '';
+  panel.classList.remove('hidden');
+}
+
+/** 发送失败重试：复用同一 messageId（put 而非 add），不产生重复记录。 */
+async function retrySendMessage(messageId) {
+  const m = await backend.get('messages', messageId);
+  if (!m || !canRetry(m)) return;
+  const next = retryMessage(m);
+  try {
+    await backend.put('messages', next);
+    await renderMessages(false);
+    toast('已重新发送');
+  } catch (e) {
+    toast('重试失败，请检查存储后导出备份');
+  }
+}
+
+function createTextBubble(text) {
+  const bubble = el('div', 'bubble message-bubble text-bubble');
+  const content = el('span', 'bubble-text');
+  content.textContent = String(text ?? '');
+  bubble.appendChild(content);
+  return bubble;
+}
+
+function createQuotedMessage(value, sourceMessage) {
+  const ref = normalizeQuoteReference(value);
+  const fromMe = ref.senderId === 'user_me' || ref.senderId === 'user';
+  const q = el('button', `quote-bubble quoted-message ${fromMe ? 'from-me' : 'from-ai'}`);
+  q.type = 'button';
+  q.dataset.quoteMessageId = String(ref.messageId || '');
+  q.dataset.sourceMessageId = String(sourceMessage.id || '');
+  q.setAttribute('aria-label', `定位被引用消息：${ref.content.slice(0, 80)}`);
+  const sender = el('span', 'quoted-sender');
+  sender.textContent = ref.senderName || (fromMe ? char.myName : (char.remarkName || char.realName)) || '';
+  const text = el('span', 'quote-text quoted-text quoted-content');
+  text.textContent = ref.content || '原消息';
+  q.append(sender, text);
+  q.addEventListener('click', e => { e.stopPropagation(); jumpToQuotedMessage(ref, sourceMessage, q); });
+  // A tap follows the reference; it must not start the parent's long-press timer.
+  q.addEventListener('pointerdown', e => e.stopPropagation());
+  return q;
+}
+
+// 引用定位的显示适配器（D2）：解析走 js/quoteNavigation.js，显示走现有的
+// jumpToMessage；不含 historyWindowBefore 分页逻辑。返回 false 时
+// followQuoteReference 判 reason 'hidden'。
+async function showMessageTarget(target) {
+  if (target.charId !== char.id || (isHiddenMessage(target) && !isDebugMode)) return false;
+  return jumpToMessage(target.id, { returnTo: 'quote' });
+}
+
+let quoteNavigationBusy = false;
+async function jumpToQuotedMessage(quote, source, button) {
+  if (quoteNavigationBusy) return;
+  quoteNavigationBusy = true;
+  button?.classList.add('is-loading');
+  button?.setAttribute('aria-busy', 'true');
+  // 记下含引用那条消息与当前滚动位置，供“← 返回引用处”跳回并恢复。
+  chatCenterState.quote = { sourceMessageId: source.id, scrollTop: messageArea.scrollTop };
+  try {
+    const result = await followQuoteReference({ backend, charId: char.id, quote, sourceMessage: source,
+      getText: m => extractProtocolText(messageText(m)) || m.content,
+      showTarget: showMessageTarget,
+    });
+    if (result.ok) {
+      $('#chat-announcement').textContent = '已定位到被引用消息';
+    } else {
+      chatCenterState.quote = null;
+      button?.classList.add('is-unavailable');
+      toast(result.reason === 'ambiguous' ? '有多条相同原文，旧引用没有消息 ID，无法准确定位'
+        : result.reason === 'withdrawn' ? '原消息已撤回或删除' : '原消息已不存在，或未包含在当前备份中');
+    }
+  } catch (e) { chatCenterState.quote = null; toast('定位失败，请稍后重试'); }
+  finally { quoteNavigationBusy = false; button?.classList.remove('is-loading'); button?.removeAttribute('aria-busy'); }
+}
+
+async function createMessageElement(msg, isContinuous = false, isGroupLast = true) {
+  // 非调试模式：隐藏消息直接不渲染（原版 chat_render.js:164 的 return null）。
+  if (isHiddenMessage(msg) && !isDebugMode) return null;
+  const wrap = el('div', `msg message-wrapper ${msg.role === 'user' ? 'sent' : 'received'}`);
   wrap.dataset.id = msg.id;
+  wrap.dataset.messageId = msg.id;
+  wrap.id = `message-${msg.id}`;
+  wrap.dataset.role = msg.role;
+  wrap.dataset.ts = String(msg.timestamp ?? 0);
   if (msg.isContextDisabled) wrap.classList.add('context-disabled');
   if (isContinuous) wrap.classList.add('continuous');
+  // 组末判定与 .continuous 方向相反：continuous 标“非首条”，group-last 标
+  // “组内最后一条”，iMessage 尾巴只出现在组末（chatDaily.js groupLastFlags）。
+  if (isGroupLast) wrap.classList.add('group-last');
   if (msg.isWithdrawn) wrap.classList.add('withdrawn');
-  // 状态更新消息：只留一句居中的系统提示，原始协议文本不进气泡——
-  // 原始 UWU 也是把状态码从气泡里剔掉的，完整卡片在状态栏弹窗里看。
-  if (msg.isStatusUpdate && msg.statusText) {
-    wrap.classList.add('system-note');
-    wrap.appendChild(el('div', 'bubble', escapeHtml(`状态已更新为：${summarizeStatus(msg.statusText, 40)}`)));
+  if (msg.sendState) wrap.dataset.sendState = msg.sendState;
+  if (selectedMessageIds.has(msg.id)) wrap.classList.add('selected');
+  // 调试模式才走到这里：状态更新显示原始状态文本（原版调试模式下不剥协议），
+  // 标上【调试可见】；完整卡片仍在状态栏弹窗里看。
+  if (msg.isStatusUpdate) {
+    wrap.classList.add('system-note', 'system-notification');
+    wrap.appendChild(el('div', 'bubble message-bubble debug-visible', escapeHtml(msg.statusText || msg.content || '')));
+    attachMsgMenu(wrap, msg);
     return wrap;
   }
 
-  const avatarSrc = msg.role === 'user'
-    ? await resolveAvatar(char.myAvatar)
-    : await resolveAvatar(char.avatar);
-  const avatar = el('img', 'msg-avatar' + (isContinuous ? ' invisible' : ''));
-  avatar.src = avatarSrc;
-  avatar.alt = '';
-  wrap.appendChild(avatar);
+  // 默认不在任何消息旁显示头像（分组首条也不显示）：iMessage 式无头像布局，
+  // 气泡与分组本身承担信息层级；头像只留在顶栏 58px 圆头像里。
 
-  const body = el('div', 'msg-body');
-  if (msg.quote) {
-    body.appendChild(el('div', 'quote-in-bubble', escapeHtml(msg.quote.content)));
+  // 心声解析（innerVoice.js）：助理文本入库/渲染前过 parseInnerVoice()，
+  // 正文存 cleanContent，心声另存 msg.innerVoice；解析失败安静降级，
+  // 协议标记绝不留在正文里。只处理文本字段，绝不读 reasoning/thinking。
+  let renderMsg = msg;
+  if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.includes('[inner_voice]')) {
+    const parsed = parseInnerVoice(msg.content);
+    if (parsed.innerVoice && !msg.innerVoice) msg.innerVoice = parsed.innerVoice;
+    if (parsed.cleanContent !== msg.content) {
+      renderMsg = {
+        ...msg,
+        content: parsed.cleanContent,
+        parts: (msg.parts || []).map((p) => (p?.type === 'text' && typeof p.text === 'string'
+          ? { ...p, text: parseInnerVoice(p.text).cleanContent } : p)),
+      };
+    }
   }
-  const contentEls = await renderMessageContent(msg);
+  const body = el('div', 'msg-body message-bubble-row');
+  if (msg.quote) {
+    wrap.classList.add('has-quote');
+    wrap.dataset.quoteMessageId = String(normalizeQuoteReference(msg.quote).messageId || '');
+    body.appendChild(createQuotedMessage(msg.quote, msg));
+  }
+  const contentEls = await renderMessageContent(renderMsg);
   for (const c of contentEls) body.appendChild(c);
+  // 尾巴只挂在组末消息的最后一段内容上（CSS 只画 .group-last 的尾巴）：
+  // 文字气泡/语音卡/转账/礼物卡直接挂；图片与表情包不挂尾巴（2026-11-21：
+  // 透明底图片上尾巴会悬空在图外，见截图右下角）；
+  // 旧版导入的引用协议（.quoted-reply 包装）挂其内层气泡。
+  const finalContent = contentEls[contentEls.length - 1];
+  const tailContent = finalContent?.matches('.bubble, .voice-card, .transfer-card, .gift-card') ? finalContent
+    : finalContent?.matches('.quoted-reply') ? finalContent.querySelector('.bubble') : null;
+  tailContent?.classList.add('message-tail');
+  if (body.querySelectorAll('.quoted-message').length > 1) wrap.classList.add('multiple-quotes');
+  if (body.querySelector('.quoted-message')) wrap.classList.add('has-quote');
   if (msg.mock) body.appendChild(el('span', 'mock-tag', '模拟回复'));
   if (msg.edited) body.appendChild(el('div', 'msg-meta', '已编辑'));
+  if (msg.isFavorite) body.appendChild(el('div', 'msg-fav', '★ 已收藏'));
+  // 心声只在心声模式露出入口：昵称附近小入口是这条回复下的「心声」按钮，
+  // 点开轻量面板查看对应回合内容，不自动弹出，不常驻占高度。
+  if (msg.role === 'assistant' && msg.innerVoice && getStatusMode(char) === 'inner') {
+    const ivBtn = el('button', 'inner-voice-btn', '心声');
+    ivBtn.type = 'button';
+    ivBtn.onclick = () => openInnerVoicePanel(msg.innerVoice);
+    body.appendChild(ivBtn);
+  }
+  // 发送失败：同一 messageId 的重试按钮（chatDaily.js retryMessage）。
+  if (msg.sendState === 'failed') {
+    const retryBtn = el('button', 'msg-retry', '发送失败 · 点此重试');
+    retryBtn.type = 'button';
+    retryBtn.onclick = () => retrySendMessage(msg.id);
+    body.appendChild(retryBtn);
+  }
   wrap.appendChild(body);
+  // 表情反应汇总行（有点过的表情才显示）。
+  if (Array.isArray(msg.reactions) && msg.reactions.length) renderReactionsRow(wrap, msg);
 
-  // 长按 / 右键菜单
-  wrap.addEventListener('contextmenu', (e) => { e.preventDefault(); openMsgMenu(msg, e.clientX, e.clientY); });
-  wrap.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'touch') return;
-    clearTimeout(longPressTimer);
-    longPressTimer = setTimeout(() => openMsgMenu(msg, e.clientX, e.clientY), 480);
-  });
-  ['pointerup', 'pointermove', 'pointercancel'].forEach((ev) => wrap.addEventListener(ev, () => clearTimeout(longPressTimer)));
+  attachMsgMenu(wrap, msg);
   return wrap;
 }
 
@@ -3804,11 +12008,13 @@ async function renderMessageContent(msg) {
       const img = el('img', 'photo-img');
       img.src = src;
       img.addEventListener('click', () => openImageViewer(src));
-      out.push(img);
+      const w = el('span', 'photo-wrap image-bubble');
+      w.appendChild(img);
+      out.push(w);
     }
     const textPart = parts.find((p) => p.type === 'text');
     if (textPart?.text && !textPart.text.includes('发来了一张图片')) {
-      out.push(el('div', 'bubble', escapeHtml(textPart.text)));
+      out.push(createTextBubble(textPart.text));
     }
     if (out.length) return out;
   }
@@ -3819,20 +12025,24 @@ async function renderMessageContent(msg) {
     const node = await renderSegment(msg, s);
     if (node) out.push(node);
   }
-  if (!out.length) out.push(el('div', 'bubble', escapeHtml(msg.content || '')));
+  // 全是被隐藏的段（状态/思考/隐藏指令）时不补原始内容，避免协议文本漏进聊天流。
+  if (!out.length && !isHiddenMessage(msg)) out.push(createTextBubble(msg.content || ''));
   return out;
 }
 
 async function renderSegment(msg, s) {
   switch (s.kind) {
     case 'bilingual': {
-      const b = el('div', 'bubble');
-      b.appendChild(document.createTextNode(s.foreign));
-      const t = el('span', 'translation hidden-t', escapeHtml(s.chinese));
-      const btn = el('button', 'toggle-t', '查看翻译');
+      // 译文在气泡内按正常文档流展开；原文减淡，避免长译文压住下一条消息。
+      const b = el('div', 'bubble message-bubble text-bubble');
+      const orig = el('span', 'bubble-text');
+      orig.textContent = s.foreign;
+      b.appendChild(orig);
+      const t = el('span', 'translation translation-text', escapeHtml(s.chinese));
+      const btn = el('button', 'toggle-t', '翻译');
       btn.onclick = () => {
-        const hidden = t.classList.toggle('hidden-t');
-        btn.textContent = hidden ? '查看翻译' : '收起翻译';
+        const shown = b.classList.toggle('show-translation'); t.classList.toggle('active', shown); btn.setAttribute('aria-expanded', String(shown));
+        btn.textContent = shown ? '原文' : '翻译';
       };
       b.appendChild(t); b.appendChild(btn);
       return b;
@@ -3840,78 +12050,102 @@ async function renderSegment(msg, s) {
     case 'text': {
       const { inner, bi } = protocolBody(s.content);
       if (bi) {
-        const b = el('div', 'bubble');
-        b.appendChild(document.createTextNode(bi.foreign));
-        const t = el('span', 'translation hidden-t', escapeHtml(bi.chinese));
-        const btn = el('button', 'toggle-t', '查看翻译');
-        btn.onclick = () => { const h = t.classList.toggle('hidden-t'); btn.textContent = h ? '查看翻译' : '收起翻译'; };
+        const b = el('div', 'bubble message-bubble text-bubble');
+        const orig = el('span', 'bubble-text');
+        orig.textContent = bi.foreign;
+        b.appendChild(orig);
+        const t = el('span', 'translation translation-text', escapeHtml(bi.chinese));
+        const btn = el('button', 'toggle-t', '翻译');
+        btn.onclick = () => { const shown = b.classList.toggle('show-translation'); t.classList.toggle('active', shown); btn.setAttribute('aria-expanded', String(shown)); btn.textContent = shown ? '原文' : '翻译'; };
         b.appendChild(t); b.appendChild(btn);
         return b;
       }
       // plain 可能是用户发的协议文本（[我的消息：…]）或导入的纯文本，
       // protocolBody 会剥掉协议外壳，只显示正文。
-      return el('div', 'bubble', escapeHtml(inner));
+      return createTextBubble(inner);
     }
     case 'quote': {
-      const b = el('div', 'bubble');
-      const q = el('span', 'quote-in-bubble', escapeHtml(s.quoted));
-      b.appendChild(q);
-      b.appendChild(document.createTextNode(s.reply));
-      return b;
+      // 旧版导入的原始引用协议与结构化 quote 走同一条渲染 / 定位链路。
+      const wrap = el('div', 'quoted-reply');
+      if (!msg.quote) wrap.appendChild(createQuotedMessage({
+        content: s.quoted, senderId: msg.role === 'user' ? 'assistant' : 'user_me',
+      }, msg));
+      const b = el('div', 'bubble message-bubble text-bubble');
+      b.appendChild(el('span', 'bubble-text', escapeHtml(s.reply)));
+      wrap.appendChild(b);
+      return wrap;
     }
     case 'sticker': {
       const st = findSticker(s.name);
-      if (st?.attachmentId) {
-        const src = await attachmentDataURL(st.attachmentId);
-        if (src) { const img = el('img', 'sticker-img'); img.src = src; img.alt = s.name; return img; }
+      const src = await resolveStickerSrc(st);
+      if (src) {
+        const img = el('img', 'sticker-img');
+        img.src = src; img.alt = s.name;
+        const w = el('span', 'sticker-wrap sticker-bubble');
+        w.appendChild(img);
+        return w;
       }
-      if (st?.dataUrl) { const img = el('img', 'sticker-img'); img.src = st.dataUrl; img.alt = s.name; return img; }
-      return el('div', 'bubble', escapeHtml(`[表情包：${s.name}]`));
+      return createTextBubble(`[表情包：${s.name}]`);
     }
     case 'stickerUnknown':
-      return el('div', 'bubble', escapeHtml(`[表情包：${s.name}]（未找到该表情包）`));
+      return createTextBubble(`[表情包：${s.name}]（未找到该表情包）`);
     case 'photo': {
       const galleryHit = (char.gallery || []).find((g) => g.name === s.body);
       if (galleryHit?.url) {
         const img = el('img', 'photo-img');
         img.src = galleryHit.url;
         img.addEventListener('click', () => openImageViewer(galleryHit.url));
-        return img;
+        const w = el('span', 'photo-wrap image-bubble');
+        w.appendChild(img);
+        return w;
       }
-      const card = el('div', 'card');
+      const card = el('div', 'card pv-card');
       card.innerHTML = `<div class="card-title">照片 / 视频</div><div class="card-sub">${escapeHtml(s.body || '图片描述')}</div><div class="card-status">描述卡 · 非真实照片</div>`;
       return card;
     }
     case 'voice': {
+      // 220×63 气泡：30px 播放按钮 + 波形条 + 时长；点播放/波形展开转写，
+      // 气泡变两行（47px 播放行 + 转写文本行），同一个形状，不另起卡片。
       const dur = Math.max(1, Math.min(60, Math.ceil((s.body || '').length / 3.5)));
-      const card = el('div', 'card voice-card');
-      const play = el('button', 'voice-play');
+      const card = el('div', 'voice-card voice-bubble');
+      const row = el('div', 'voice-row');
+      const play = el('button', 'voice-play play-icon');
+      play.setAttribute('aria-label', '展开语音文字');
+      play.setAttribute('aria-expanded', 'false');
       play.innerHTML = '<svg class="icon"><use href="#i-play"></use></svg>';
       const wave = el('div', 'voice-wave');
       for (const h of [7, 12, 17, 10, 20, 14, 8, 18, 12, 21, 9, 15, 19, 11, 16, 8, 13, 10]) {
         const bar = el('i'); bar.style.height = h + 'px'; wave.appendChild(bar);
       }
-      const durEl = el('span', 'voice-dur', escapeHtml(`${dur}″`));
-      const full = el('div', 'card-sub hidden', escapeHtml(s.body || ''));
-      const toggleText = () => full.classList.toggle('hidden');
+      const durEl = el('span', 'voice-dur duration', escapeHtml(`${dur}″`));
+      row.append(play, wave, durEl);
+      const transcript = el('div', 'voice-transcript hidden', escapeHtml(s.body || ''));
+      const toggleText = () => {
+        const nowHidden = transcript.classList.toggle('hidden');
+        card.classList.toggle('expanded', !nowHidden);
+        transcript.classList.toggle('active', !nowHidden);
+        play.setAttribute('aria-expanded', String(!nowHidden));
+        play.setAttribute('aria-label', nowHidden ? '展开语音文字' : '收起语音文字');
+      };
       play.onclick = toggleText;
       wave.onclick = toggleText;
-      card.append(play, wave, durEl);
-      const wrap = el('div', '');
-      wrap.append(card, full);
-      return wrap;
+      card.append(row, transcript);
+      return card;
     }
     case 'status':
-      return el('div', 'bubble', escapeHtml(`状态已更新为：${s.body || ''}`));
+      // 混合消息里的状态段：非调试不显示（原版做法是把状态正则从气泡里剔掉）；
+      // 调试模式显示原文，标【调试可见】。
+      if (!isDebugMode) return null;
+      return el('div', 'bubble message-bubble debug-visible', escapeHtml(s.body || ''));
     case 'withdraw':
-      return el('div', 'bubble', escapeHtml(s.content));
+      return createTextBubble(s.content);
     case 'transfer': {
       const m = s.content.match(/([0-9]+(?:\.[0-9]+)?)\s*元[；;]?\s*备注[：:](.*)/);
       const amount = m ? m[1] : '';
       const remark = m ? m[2].replace(/\]$/, '') : '';
       const card = el('div', 'card transfer-card');
       const statusText = msg.transferStatus === 'received' ? '已收款' : msg.transferStatus === 'returned' ? '已退回' : '待处理';
-      card.innerHTML = `<div class="card-title">转账 ${escapeHtml(amount)} 元</div><div class="card-sub">备注：${escapeHtml(remark)}</div><div class="card-status">${statusText}</div>`;
+      card.innerHTML = `<div class="card-label">转账</div><div class="card-amount">${escapeHtml(amount ? `${amount} 元` : '转账')}</div>${remark ? `<div class="card-sub">备注：${escapeHtml(remark)}</div>` : ''}<div class="card-status">${statusText}</div>`;
       if (msg.role === 'assistant' && msg.transferStatus === 'pending') {
         const acts = el('div', 'card-actions');
         const ok = el('button', '', '接收');
@@ -3926,7 +12160,7 @@ async function renderSegment(msg, s) {
     case 'gift': {
       const card = el('div', 'card gift-card');
       const statusText = msg.giftStatus === 'received' ? '已接收' : msg.giftStatus === 'sent' ? '已送出' : (msg.giftStatus || '');
-      card.innerHTML = `<div class="card-title">礼物</div><div class="card-sub">${escapeHtml(s.body || '')}</div><div class="card-status">${statusText}</div>`;
+      card.innerHTML = `<div class="card-label">礼物</div><div class="card-sub">${escapeHtml(s.body || '')}</div><div class="card-status">${statusText}</div>`;
       if (msg.role === 'assistant' && msg.giftStatus === 'sent') {
         const acts = el('div', 'card-actions');
         const ok = el('button', '', '接收礼物');
@@ -3936,18 +12170,38 @@ async function renderSegment(msg, s) {
       }
       return card;
     }
-    case 'forward':
     case 'html': {
+      const raw = String(s.content || '');
+      // <thinking> 块：思考过程，非调试不渲染（原版 chat_render.js:164/416）。
+      if (raw.trim().toLowerCase().startsWith('<thinking>')) {
+        if (!isDebugMode) return null;
+        return el('div', 'bubble message-bubble debug-visible', escapeHtml(raw));
+      }
+      // 真实 HTML 模板：先做变量匹配——与状态栏同一套 substituteTemplateVars、
+      // 同一份角色上下文（statusTemplateCtx）——再放进沙箱 iframe 隔离渲染，
+      // 绝不直接 innerHTML 进主页面（与状态栏同一条隔离规则）。
+      const substituted = substituteTemplateVars(raw, statusTemplateCtx(char));
+      const frameId = `chat-html-${++chatHtmlSeq}`;
+      const frame = document.createElement('iframe');
+      frame.className = 'html-card-frame html-bubble';
+      frame.dataset.chatFrame = frameId;
+      frame.title = 'HTML 卡片';
+      frame.setAttribute('sandbox', 'allow-scripts allow-popups');
+      frame.setAttribute('scrolling', 'no');
+      frame.style.height = '120px';
+      frame.srcdoc = buildStatusDocument(substituted, { marker: `chat ${msg.id} ${frameId}`, frameId });
+      return frame;
+    }
+    case 'forward': {
       const card = el('div', 'card placeholder-card');
-      const title = s.kind === 'forward' ? '转发的聊天记录（占位）' : 'HTML 卡片（本阶段显示为文字占位）';
-      card.innerHTML = `<div class="card-title">${title}</div><details><summary>查看原始内容</summary><div class="card-sub">${escapeHtml(s.content)}</div></details>`;
+      card.innerHTML = `<div class="card-title">转发的聊天记录（占位）</div><details><summary>查看原始内容</summary><div class="card-sub">${escapeHtml(s.content)}</div></details>`;
       return card;
     }
     case 'transferResponse':
     case 'giftResponse':
       return null; // 隐藏指令不显示气泡
     default:
-      return el('div', 'bubble', escapeHtml(s.content));
+      return createTextBubble(s.content);
   }
 }
 
@@ -3955,7 +12209,47 @@ function openImageViewer(src) {
   showModal('图片', `<img src="${escapeHtml(src)}" style="max-width:100%;border-radius:10px">`, [{ label: '关闭' }]);
 }
 
+/** 新消息到达时的滚动：贴在底部才跟随拉底；上翻看历史时不强行拉底，
+ *  改显示“有新消息”入口（chatDaily.js decideNewMessageDisplay）。 */
+function scrollToBottomIfNear(force = false) {
+  const d = distanceFromBottom(messageArea);
+  if (force || decideNewMessageDisplay({ distanceFromBottom: d }).shouldStickToBottom) {
+    messageArea.scrollTop = messageArea.scrollHeight;
+    hideNewMessagesPill();
+    return true;
+  }
+  return false;
+}
+
+function showNewMessagesPill() {
+  newMessagesCount += 1;
+  const pill = $('#new-msg-pill');
+  pill.textContent = `↓ 有 ${newMessagesCount} 条新消息`;
+  pill.classList.remove('hidden');
+}
+
+function hideNewMessagesPill() {
+  newMessagesCount = 0;
+  $('#new-msg-pill')?.classList.add('hidden');
+}
+
+/** 已送达：只在末条已发送消息下方显示一次（已送达 + 时间，10px）。
+ *  每次重渲染/追加后重算，旧标记先清掉，全流只有一处。 */
+function refreshDeliveredMarker() {
+  messageArea.querySelectorAll('.msg-delivered').forEach((n) => n.remove());
+  const sent = [...messageArea.querySelectorAll('.msg.sent:not(.withdrawn)')];
+  const last = sent[sent.length - 1];
+  if (!last) return;
+  const body = last.querySelector('.msg-body');
+  if (!body) return;
+  const ts = Number(last.dataset.ts || 0);
+  body.appendChild(el('div', 'msg-delivered', `已送达 · ${escapeHtml(formatTimeDivider(ts || Date.now()))}`));
+}
+
 async function renderMessages(isLoadMore = false) {
+  // 全量重渲染前记下距底偏移：用户上翻看历史时，重渲染也不强行拉到底。
+  const distBefore = isLoadMore ? 0 : distanceFromBottom(messageArea);
+  const savedPos = !isLoadMore && restoreReadPosOnce ? loadReadingPosition(localStorage, char.id) : null;
   if (!isLoadMore) {
     messageArea.innerHTML = '';
     loadedOldest = null;
@@ -3968,6 +12262,7 @@ async function renderMessages(isLoadMore = false) {
   if (messages.length) loadedOldest = messages[0].timestamp;
   const frag = document.createDocumentFragment();
   let lastTime = 0;
+  const lastFlags = groupLastFlags(messages);
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     const prev = i > 0 ? messages[i - 1] : null;
@@ -3975,7 +12270,7 @@ async function renderMessages(isLoadMore = false) {
       frag.appendChild(renderTimeDivider(m.timestamp));
     }
     const continuous = !!prev && prev.role === m.role && m.timestamp - prev.timestamp < 10 * 60 * 1000;
-    const node = await createMessageElement(m, continuous);
+    const node = await createMessageElement(m, continuous, lastFlags[i]);
     if (node) frag.appendChild(node);
     lastTime = m.timestamp;
   }
@@ -3985,7 +12280,18 @@ async function renderMessages(isLoadMore = false) {
     messageArea.scrollTop = messageArea.scrollHeight - oldHeight;
   } else {
     messageArea.appendChild(frag);
-    messageArea.scrollTop = messageArea.scrollHeight;
+    if (restoreReadPosOnce && savedPos && savedPos.distanceFromBottom > 48) {
+      // 启动时一次性恢复阅读位置：按保存的距底偏移还原，不拉到底。
+      restoreReadPosOnce = false;
+      messageArea.scrollTop = Math.max(0, messageArea.scrollHeight - messageArea.clientHeight - savedPos.distanceFromBottom);
+    } else if (restoreReadPosOnce) {
+      restoreReadPosOnce = false;
+      messageArea.scrollTop = messageArea.scrollHeight;
+    } else if (distBefore <= 48) {
+      messageArea.scrollTop = messageArea.scrollHeight;
+    } else {
+      messageArea.scrollTop = Math.max(0, messageArea.scrollHeight - messageArea.clientHeight - distBefore);
+    }
   }
   const oldBtn = $('#load-more-btn');
   if (oldBtn) oldBtn.remove();
@@ -3995,24 +12301,39 @@ async function renderMessages(isLoadMore = false) {
     btn.onclick = () => renderMessages(true);
     messageArea.prepend(btn);
   }
+  refreshDeliveredMarker();
 }
 
-async function appendMessageElement(msg) {
+async function appendMessageElement(msg, opts = {}) {
+  const distBefore = distanceFromBottom(messageArea);
   const count = await backend.countMessages(char.id);
   void count;
   const all = await backend.getMessagesPage(char.id, { before: msg.timestamp + 1, limit: 2 });
   const prev = all.messages.find((m) => m.id !== msg.id);
   const continuous = !!prev && prev.role === msg.role && msg.timestamp - prev.timestamp < 10 * 60 * 1000;
-  const node = await createMessageElement(msg, continuous);
+  const node = await createMessageElement(msg, continuous, true);
   if (node) {
+    // 新消息是组末：上一条同组消息的尾巴要收掉（它不再是组末）。
+    const lastWrap = messageArea.querySelector('.msg:last-child');
+    if (lastWrap && prev && lastWrap.dataset.id === prev.id && lastWrap.dataset.role === msg.role) {
+      lastWrap.classList.remove('group-last');
+    }
+    // 拉底判定用追加前的距底偏移：追加后距离会变大，不能事后量。
+    const shouldStick = opts.forceStick
+      || decideNewMessageDisplay({ distanceFromBottom: distBefore }).shouldStickToBottom;
     messageArea.appendChild(node);
-    messageArea.scrollTop = messageArea.scrollHeight;
+    if (shouldStick) {
+      messageArea.scrollTop = messageArea.scrollHeight;
+      hideNewMessagesPill();
+    } else {
+      showNewMessagesPill();
+    }
+    refreshDeliveredMarker();
   }
 }
 
 function updateHeader() {
   $('#char-name').textContent = char.remarkName || char.realName || '角色';
-  $('#char-status').textContent = char.status || '在线';
   resolveAvatar(char.avatar).then((src) => { $('#char-avatar').src = src; ManageView.refreshHome(src); });
   $('#mock-badge').classList.toggle('hidden', !!apiSettings.key);
   $('#mock-badge').textContent = apiSettings.key ? '' : '模拟';
@@ -4022,7 +12343,19 @@ function updateHeader() {
 }
 
 // 状态条 chips：只放简短纯文本摘要（顶栏短状态 + 自定义状态原文摘要），
-// 绝不把整段协议文本、HTML 或 CSS 放进 chip。
+// 绝不把整段协议文本、HTML 或 CSS 放进 chip。防御一道：summarizeStatus
+// 只剥带冒号的协议头，无冒号的「[xxx] …」协议头在这里再剥一次（截图里
+// 曾出现 `[ 【public_post】 current h…` 漏进 chip）。
+function stripProtocolHead(s) {
+  let out = String(s || '').trim();
+  // [xxx] / 【xxx】 形协议头整段去掉；截图实测的残留形是以 “[ ” 开头、
+  // 后跟 【xxx】 的无闭合协议头（summarizeStatus 只剥带冒号的头，漏了它）。
+  out = out.replace(/^\s*\[[^\]\n]{0,40}\]\s*/g, '');
+  out = out.replace(/^\s*【[^】\n]{0,40}】\s*/g, '');
+  out = out.replace(/^\s*\[+\s*【[^】\n]{0,40}】\s*/g, '');
+  return out.trim();
+}
+
 function renderStatusStrip() {
   const strip = $('#status-strip');
   if (!strip) return;
@@ -4031,7 +12364,7 @@ function renderStatusStrip() {
   const sp = char.statusPanel || {};
   if (sp.currentStatusRaw) items.push(summarizeStatus(sp.currentStatusRaw));
   if (sp.history?.length && sp.history[0].raw && sp.history[0].raw !== sp.currentStatusRaw) items.push(summarizeStatus(sp.history[0].raw));
-  const uniq = [...new Set(items)].filter(Boolean);
+  const uniq = [...new Set(items.map(stripProtocolHead))].filter(Boolean);
   $('#status-chips').innerHTML = uniq.length
     ? uniq.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join('')
     : '<span class="chip">在线</span>';
@@ -4050,14 +12383,25 @@ async function sendUserText(text, opts = {}) {
     timestamp: nextTs(),
   };
   if (currentQuote) {
-    msg.quote = { messageId: currentQuote.messageId, senderId: currentQuote.senderId || 'assistant', content: currentQuote.content };
+    msg.quote = { messageId: currentQuote.messageId, senderId: currentQuote.senderId || 'assistant', senderName: currentQuote.senderName, content: currentQuote.content };
     clearQuote();
   }
   if (opts.extraParts) msg.parts = [...msg.parts, ...opts.extraParts];
   if (opts.kind) msg.kind = opts.kind;
-  await backend.put('messages', msg);
-  await appendMessageElement(msg);
-  setSaveState('已保存');
+  try {
+    await backend.put('messages', msg);
+    await appendMessageElement(msg, { forceStick: true });
+    // B 组：唤醒分类用用户原文（msg.content 包了协议前缀，分类必须用原文）；失败静默。
+    if (wakeEngine) await wakeEngine.userMessage(char.id, msg.id, text).catch(() => {});
+    wakeEngine?.setUserTyping(false);
+    setSaveState('已保存');
+  } catch (e) {
+    // 发送失败：消息以 sendState='failed' 落盘并显示重试按钮，
+    // 复用同一 messageId（chatDaily.js retryMessage），不产生重复记录。
+    const failed = markFailed(msg, e);
+    try { await backend.put('messages', failed); } catch { /* 已弹过保存失败提示 */ }
+    await appendMessageElement(failed, { forceStick: true });
+  }
   return msg;
 }
 
@@ -4070,9 +12414,15 @@ async function sendImageMessage(file) {
     content: textPrompt, parts: [{ type: 'text', text: textPrompt }, { type: 'image', attachmentId: attId }],
     timestamp: nextTs(),
   };
-  await backend.put('messages', msg);
-  await appendMessageElement(msg);
-  setSaveState('已保存');
+  try {
+    await backend.put('messages', msg);
+    await appendMessageElement(msg, { forceStick: true });
+    setSaveState('已保存');
+  } catch (e) {
+    const failed = markFailed(msg, e);
+    try { await backend.put('messages', failed); } catch { /* 已弹过保存失败提示 */ }
+    await appendMessageElement(failed, { forceStick: true });
+  }
 }
 
 async function hydrateForRequest(slice) {
@@ -4092,31 +12442,574 @@ async function hydrateForRequest(slice) {
   return out;
 }
 
+/* ---------------- 向量记忆：索引与聊天召回 ---------------- */
+// 当前向量配置对应的索引空间键。维度只有调一次接口才知道：
+// 已缓存（同一 baseUrl+模型）时直接用；否则先发一次最小的 embeddings 探测
+// （「测试向量」一个短文本），拿到维度后缓存到 vectorSettings。
+async function getVectorSpaceKey() {
+  const dimsFor = `${embeddingApi.url || ''}|${embeddingApi.model || ''}`;
+  if (vectorSettings.dimensions && vectorSettings.dimensionsFor === dimsFor) {
+    return spaceKeyFor({ baseUrl: embeddingApi.url, model: embeddingApi.model, dimensions: vectorSettings.dimensions });
+  }
+  const { dimensions } = await callEmbeddings(embeddingApi, ['测试向量']);
+  if (!dimensions) throw new Error('向量接口没有返回维度。');
+  vectorSettings.dimensions = dimensions;
+  vectorSettings.dimensionsFor = dimsFor;
+  await saveVectorSettings();
+  return spaceKeyFor({ baseUrl: embeddingApi.url, model: embeddingApi.model, dimensions });
+}
+
+function vecProgressText(p) {
+  if (!p) return '尚未建立索引。';
+  const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+  const state = p.status === 'done' ? '已完成' : p.status === 'paused' ? '已暂停' : p.status === 'error' ? '出错' : '进行中';
+  return `已索引 ${p.done}/${p.total} 段（${pct}% · ${state}）${p.error ? `：${p.error}` : ''}`;
+}
+
+/** 当前角色 + 当前向量配置对应的索引空间键；维度未知时返回 null（空间未确定）。 */
+function currentVectorSpaceKey() {
+  const dimsFor = `${embeddingApi.url || ''}|${embeddingApi.model || ''}`;
+  return (vectorSettings.dimensions && vectorSettings.dimensionsFor === dimsFor)
+    ? spaceKeyFor({ baseUrl: embeddingApi.url, model: embeddingApi.model, dimensions: vectorSettings.dimensions })
+    : null;
+}
+
+/**
+ * 按角色 + 空间隔离的索引进度文案：进度按 charId + spaceKey 存（indexDocuments 写入时
+ * 就带这两个字段），这里只显示与当前角色、当前空间相符的进度；换角色 / 换模型后
+ * 旧进度不再显示，避免把别的角色 / 空间留下的旧进度当成当前的。
+ * 没有对应进度时显示「尚未建立索引。」；缺 charId / spaceKey 字段的旧记录无法
+ * 判定归属，按以前的样子原样显示（现行写入都带这两个字段）。
+ */
+function vecProgressTextForCurrent(p) {
+  if (!p) return '尚未建立索引。';
+  if (p.charId && p.charId !== char?.id) return '尚未建立索引。';
+  const spaceKey = currentVectorSpaceKey();
+  if (p.spaceKey && spaceKey && p.spaceKey !== spaceKey) return '尚未建立索引。';
+  if (p.spaceKey && !spaceKey) return '尚未建立索引。';
+  return vecProgressText(p);
+}
+
+/** 建索引 / 补齐缺失 / 重建索引（rebuild=true 时先清空当前空间）。暂停靠取消标记，进度已存。
+ * 记忆 + 经历一起进向量索引；关键词索引同时全量重建（纯本地，无网络请求）。 */
+async function runVectorIndex({ rebuild = false } = {}) {
+  if (vectorIndexRunning) { toast('索引正在进行中'); return; }
+  if (!embeddingApi.url || !embeddingApi.key || !embeddingApi.model) {
+    toast('请先在「API 设置 → 向量 Embedding API」里填写 Base URL、Key 和模型');
+    return;
+  }
+  vectorIndexRunning = true;
+  vectorIndexCancel = { cancelled: false };
+  try {
+    const spaceKey = await getVectorSpaceKey();
+    if (rebuild) await deleteSpaceIndex(backend, char.id, spaceKey);
+    const experiences = await getExperiencesForChar(backend, char.id);
+    await rebuildKeywordIndexForChar(backend, char.id, char.memoryJournals || [], experiences);
+    const res = await indexDocuments({
+      backend, charId: char.id,
+      documents: [...(char.memoryJournals || []), ...experiences], spaceKey,
+      embedTexts: (texts) => callEmbeddings(embeddingApi, texts),
+      signal: vectorIndexCancel,
+      onProgress: (p) => { const elp = document.getElementById('vec-progress'); if (elp) elp.textContent = vecProgressText(p); },
+      saveProgress: saveVectorIndexProgress,
+    });
+    if (res.cancelled) toast('索引已暂停，进度已保存，可点「继续建立索引」接着做');
+    else toast(res.embedded ? `索引完成：新增 ${res.embedded} 段向量，共 ${res.total} 段` : `索引已是最新：共 ${res.total} 段，无需新增`);
+  } catch (e) {
+    toast(`建立索引失败：${e?.message || '未知错误'}`);
+  } finally {
+    vectorIndexRunning = false;
+    vectorIndexCancel = null;
+    await refreshVectorStatusUI();
+  }
+}
+
+/**
+ * 单条记忆 / 经历编辑 / 新总结生成后，后台更新它自己的索引（失败只记日志，不打扰聊天）。
+ * 关键词索引一定更新（纯本地）；向量索引只在已配置向量 API 且不在全量建索引时更新。
+ * 不参与检索的文档在这里只清不建（syncDocumentIndexes 内部处理）。
+ */
+function scheduleReindexDocument(doc) {
+  if (!doc) return;
+  if (vectorIndexRunning) return; // 全量索引进行中时由它一并处理
+  void (async () => {
+    try {
+      let spaceKey = null;
+      let embedTexts = null;
+      if (vectorSettings.enabled && embeddingApi.url && embeddingApi.key && embeddingApi.model) {
+        spaceKey = await getVectorSpaceKey();
+        embedTexts = (texts) => callEmbeddings(embeddingApi, texts);
+      }
+      await syncDocumentIndexes({
+        backend, charId: char.id, doc, spaceKey, embedTexts,
+        saveProgress: saveVectorIndexProgress,
+      });
+    } catch (e) { console.warn('检索索引更新失败（聊天不受影响）：', e); }
+  })();
+}
+
+/**
+ * 经历写入/更新成功后，后台为它生成联想线索（走总结副 API，不用主 API）。
+ * 生成失败不阻断保存、静默跳过，经历本身仍可用；未配置副 API 时不跑。
+ * 线索写进经历记录的 clues 字段（不 bump version，见 associative.js）。
+ */
+function scheduleClueGeneration(exp) {
+  if (!exp) return;
+  void (async () => {
+    try {
+      await generateCluesForExperience(backend, exp, { summaryApi });
+    } catch (e) { console.warn('联想线索生成失败（经历本身仍可用）：', e); }
+  })();
+}
+
+/* ---------------- 批量任务队列（第 4 波） ---------------- */
+// 任务记录存在 settings 'memoryJobs'（{jobId: job}）；一次只跑一个任务；
+// 暂停靠取消标记，进度已存；页面关闭后 running 的任务回来显示“已暂停”
+// （renderMemoryJobsUI 里转换，绝不假装仍在后台运行）；任务不开机自动跑。
+
+/** 渲染记忆页的任务列表（当前角色的任务；上次 running 的改成已暂停）。 */
+async function renderMemoryJobsUI() {
+  const box = document.getElementById('memory-jobs');
+  if (!box) return;
+  // 正在跑的那个任务除外：它确实在跑，不能在进度回调里把它改成已暂停。
+  const others = Object.fromEntries(Object.entries(memoryJobs).filter(([id]) => id !== memoryJobRunning));
+  const { jobs: fixed, changed } = markInterruptedJobsPaused(others);
+  if (changed) {
+    memoryJobs = { ...memoryJobs, ...fixed };
+    await saveMemoryJobs(backend, memoryJobs);
+  }
+  const list = Object.values(memoryJobs).filter((j) => j.charId === char.id)
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  if (!list.length) {
+    box.innerHTML = '<p class="muted">还没有批量任务。任务只在你点开始后才跑，可暂停/恢复，进度保存在本机。</p>';
+    return;
+  }
+  box.innerHTML = list.map((j) => `
+    <div class="list-item"><strong>${esc(MEMORY_JOB_LABELS[j.kind] || j.kind)}</strong>
+    <span class="muted">${esc(memoryJobStatusText(j))}</span>
+    ${j.note ? `<p class="muted">${esc(j.note)}</p>` : ''}
+    <div class="actions-row">
+      ${(j.status === 'paused' || j.status === 'pending' || j.status === 'error')
+        ? `<button data-job-resume="${j.id}" ${memoryJobRunning ? 'disabled' : ''}>继续</button>` : ''}
+      ${j.status === 'running' ? `<button data-job-pause="${j.id}">暂停</button>` : ''}
+    </div></div>`).join('');
+  box.querySelectorAll('[data-job-resume]').forEach((b) => b.addEventListener('click', () => {
+    const job = memoryJobs[b.dataset.jobResume];
+    if (job) startMemoryJob(job.kind, job.id);
+  }));
+  box.querySelectorAll('[data-job-pause]').forEach((b) => b.addEventListener('click', () => {
+    if (memoryJobCancel) { memoryJobCancel.cancelled = true; toast('正在暂停任务…'); }
+  }));
+}
+
+/** 开始/继续一个批量任务（kind + 可选 jobId；不传 jobId 时恢复同种未完成的任务）。 */
+async function startMemoryJob(kind, jobId = null) {
+  if (memoryJobRunning) { toast('已有批量任务在进行中'); return; }
+  const job = (jobId && memoryJobs[jobId])
+    || Object.values(memoryJobs).find((j) => j.kind === kind && j.charId === char.id
+      && (j.status === 'paused' || j.status === 'pending' || j.status === 'error'))
+    || createMemoryJob(kind, char.id);
+  if (!memoryJobs[job.id]) {
+    memoryJobs[job.id] = job;
+    await saveMemoryJobs(backend, memoryJobs);
+  }
+  memoryJobRunning = job.id;
+  memoryJobCancel = { cancelled: false };
+  try {
+    if (kind === 'extract-all') await runExtractAllJob(job, memoryJobCancel);
+    else if (kind === 'backfill-clues') await runBackfillCluesJob(job, memoryJobCancel);
+    else if (kind === 'rebuild-keyword') await runRebuildKeywordJob(job, memoryJobCancel);
+    else if (kind === 'rebuild-vector') await runRebuildVectorJob(job, memoryJobCancel);
+    memoryJobs = await loadMemoryJobs(backend);
+    renderMemoryJobsUI();
+    await refreshVectorStatusUI();
+    if (job.status === 'done') toast(`批量任务完成：${MEMORY_JOB_LABELS[kind]}`);
+    else if (job.status === 'paused') toast('任务已暂停，进度已保存，可继续');
+  } catch (e) {
+    toast(`批量任务失败：${e?.message || '未知错误'}`);
+  } finally {
+    memoryJobRunning = null;
+    memoryJobCancel = null;
+    renderMemoryJobsUI();
+  }
+}
+
+/** 为全部历史提取经历：未总结的消息按 40 条一批，逐批调总结副 API 提取。 */
+async function runExtractAllJob(job, signal) {
+  if (!summaryApi.url || !summaryApi.key || !summaryApi.model) {
+    job.status = 'error';
+    job.error = '未配置记忆总结副 API';
+    await persistMemoryJob(backend, job);
+    toast('请先在「API 设置 → 记忆总结副 API」里填写 Base URL、Key 和模型');
+    return;
+  }
+  const history = await backend.getAllMessages(char.id);
+  const rest = unsummarizedMessages(history, summarySettings.lastSummarizedMessageId);
+  const batches = [];
+  for (let i = 0; i < rest.length; i += 40) batches.push(rest.slice(i, i + 40));
+  job.phase = '提取经历';
+  await runMemoryJob({
+    backend, job, items: batches, signal,
+    processItem: async (batch) => {
+      const res = await extractExperiencesFromRange(backend, char, batch, { summaryApi });
+      for (const rec of res.created) { scheduleReindexDocument(rec); scheduleClueGeneration(rec); }
+      if (!res.created.length && res.skipped.length) return 'skip';
+      return 'ok';
+    },
+    onProgress: () => renderMemoryJobsUI(),
+  });
+}
+
+/** 为旧经历补线索：无线索或线索已过期（version 不符）的经历，逐件调总结副 API
+ * 生成；单件失败只计 failed，不阻断整批。线索生成不计联想预算。 */
+async function runBackfillCluesJob(job, signal) {
+  if (!summaryApi.url || !summaryApi.key || !summaryApi.model) {
+    job.status = 'error';
+    job.error = '未配置记忆总结副 API';
+    await persistMemoryJob(backend, job);
+    toast('请先在「API 设置 → 记忆总结副 API」里填写 Base URL、Key 和模型');
+    return;
+  }
+  const exps = await getExperiencesForChar(backend, char.id);
+  const todo = exps.filter(experienceNeedsClues);
+  job.phase = '补线索';
+  await runMemoryJob({
+    backend, job, items: todo, signal,
+    processItem: async (exp) => {
+      const res = await generateCluesForExperience(backend, exp, { summaryApi });
+      return res.skipped ? 'skip' : 'ok';
+    },
+    onProgress: () => renderMemoryJobsUI(),
+  });
+}
+
+/** 重建关键词索引：Worker（建不出时主线程分片回退）算倒排，再分片写库。
+ * 全新开始时先清空该角色旧索引；恢复写阶段时不清已写好的行、不重写。 */
+async function runRebuildKeywordJob(job, signal) {
+  const journals = char.memoryJournals || [];
+  const experiences = await getExperiencesForChar(backend, char.id);
+  const docs = retrievalDocsForChar(journals, experiences).filter(retrievalDocRetrievable);
+  job.phase = '算倒排';
+  let postings = memoryJobScratch.get(job.id);
+  if (!postings) {
+    const { result, mode } = await executeRetrievalTask('build-keyword-postings', {
+      docs: docs.map((d) => ({ docId: d.docId, docKind: d.docKind, text: d.text })),
+    }, {
+      onProgress: (p) => {
+        job.mode = p.mode;
+        job.phase = '算倒排';
+        renderMemoryJobsUI();
+      },
+    });
+    postings = result.postings;
+    job.mode = mode;
+    memoryJobScratch.set(job.id, postings);
+  }
+  if (job.done === 0 && !job._cleared) {
+    await buildKeywordIndex(backend, char.id, []);
+    job._cleared = true;
+  }
+  job.phase = '写索引';
+  await runMemoryJob({
+    backend, job, items: postings, signal, sliceSize: 20,
+    processItem: async (row) => {
+      await backend.put('keywordIndex', {
+        id: `${char.id}:${row.term}`, charId: char.id, term: row.term, postings: row.postings,
+      });
+      return 'ok';
+    },
+    onProgress: () => renderMemoryJobsUI(),
+  });
+  memoryJobScratch.delete(job.id);
+}
+
+/** 重建向量索引：复用 indexDocuments（按 hash 复用已有向量段，暂停后恢复不重算）。
+ * 全新开始时先清空当前空间；恢复时不清。暂停靠 signal，进度双写
+ * vectorIndexProgress 与任务记录。 */
+async function runRebuildVectorJob(job, signal) {
+  if (!embeddingApi.url || !embeddingApi.key || !embeddingApi.model) {
+    job.status = 'error';
+    job.error = '未配置向量 Embedding API';
+    await persistMemoryJob(backend, job);
+    toast('请先在「API 设置 → 向量 Embedding API」里填写 Base URL、Key 和模型');
+    return;
+  }
+  job.phase = '建向量索引';
+  job.status = 'running';
+  const fresh = job.done === 0;
+  try {
+    const spaceKey = await getVectorSpaceKey();
+    if (fresh) await deleteSpaceIndex(backend, char.id, spaceKey);
+    const experiences = await getExperiencesForChar(backend, char.id);
+    const res = await indexDocuments({
+      backend, charId: char.id,
+      documents: [...(char.memoryJournals || []), ...experiences], spaceKey,
+      embedTexts: (texts) => callEmbeddings(embeddingApi, texts),
+      signal,
+      onProgress: (p) => {
+        job.done = p.done;
+        job.total = p.total;
+        job.phase = '建向量索引';
+        renderMemoryJobsUI();
+      },
+      saveProgress: async (p) => {
+        await saveVectorIndexProgress(p);
+        job.done = p.done;
+        job.total = p.total;
+        job.status = p.status === 'paused' ? 'paused' : p.status === 'done' ? 'done' : 'running';
+        await persistMemoryJob(backend, job);
+      },
+    });
+    job.failed = res.failed || 0;
+    if (res.cancelled) job.status = 'paused';
+    else { job.status = 'done'; job.done = res.total; job.total = res.total; }
+    await persistMemoryJob(backend, job);
+  } catch (e) {
+    job.status = 'error';
+    job.error = e?.message || String(e);
+    await persistMemoryJob(backend, job);
+    throw e;
+  }
+}
+
+/** 记忆页「测试召回」：与聊天同一条融合检索（fusedRetrieve），记忆 + 经历
+ * 都测——只传 journalsById 的旧写法会滤掉全部经历段（retrieveVectorCandidates
+ * 按 documentsById 判定可检索性，经历不在表里就进不来）。向量阈值用聊天
+ * 当前设置（vectorSettings.threshold），关键词路不设阈值；返回 fused
+ * results（带 docKind / sourceStatus / 融合分 / 向量相关度 vectorScore），
+ * 由调用方按 docKind 标明是记忆还是经历。 */
+async function testRecall(queryText) {
+  const { vectors, dimensions } = await callEmbeddings(embeddingApi, [queryText]);
+  if (!vectors?.[0]) throw new Error('向量接口没有返回向量。');
+  const spaceKey = spaceKeyFor({ baseUrl: embeddingApi.url, model: embeddingApi.model, dimensions });
+  const journals = char.memoryJournals || [];
+  const experiences = await getExperiencesForChar(backend, char.id).catch(() => []);
+  const fused = await fusedRetrieve(backend, char, queryText, vectors[0], {
+    spaceKey, journals, experiences,
+    topN: 5, threshold: vectorSettings.threshold ?? DEFAULT_VECTOR_SETTINGS.threshold,
+    tokenBudget: 0,
+    favoritedIds: journals.filter((j) => j.isFavorited).map((j) => j.id),
+  });
+  return fused.results;
+}
+
+/** 刷新记忆页的向量状态区（当前空间、各空间条数、每条记忆已索引几段）。 */
+async function refreshVectorStatusUI() {
+  const statusEl = document.getElementById('vec-status');
+  if (!statusEl) return;
+  try {
+    const spaces = await getIndexSpaces(backend, char.id);
+    const kwRows = (await backend.getAll('keywordIndex')).filter((r) => r?.charId === char.id);
+    const kwDocs = new Set(kwRows.flatMap((r) => (r.postings || []).map((p) => p.docId)));
+    const spaceKey = currentVectorSpaceKey();
+    // 维度未知时也显示新空间键（baseUrl|新模型|维度待定），并明确提示需建立索引：
+    // 换模型 / 换地址后维度要调一次接口才知道，空间键里的维度先标「维度待定」，
+    // 点「建立索引」后按接口返回的维度确定真正的空间键。
+    const pendingSpaceKey = (!spaceKey && (embeddingApi.url || embeddingApi.model))
+      ? `${normalizeBaseUrl(embeddingApi.url)}|${String(embeddingApi.model || '').trim().toLowerCase()}|维度待定`
+      : null;
+    let detail = '';
+    if (spaceKey) {
+      const experiences = await getExperiencesForChar(backend, char.id);
+      const st = await getIndexStatus(backend, char.id, [...(char.memoryJournals || []), ...experiences], spaceKey);
+      detail = `已索引 ${st.indexedChunks}/${st.totalChunks} 段，缺失 ${st.missing} 段`;
+      for (const row of st.perJournal) {
+        const span = document.querySelector(`[data-vec-for="${CSS.escape(row.journalId)}"]`);
+        if (span) span.textContent = row.wanted ? `已索引 ${row.indexed}/${row.wanted} 段` : '内容为空';
+      }
+    } else if (pendingSpaceKey) {
+      detail = '需建立索引：新空间还没有任何向量段，点「建立索引 / 补齐缺失」后按接口返回的维度确定空间';
+    } else {
+      detail = '当前空间未确定（建立一次索引后按接口返回的维度确定）';
+    }
+    statusEl.innerHTML = `
+      <div class="kv"><span>向量记忆总开关</span><b>${vectorSettings.enabled ? '开' : '关'}</b></div>
+      <div class="kv"><span>当前空间</span><b>${spaceKey ? escapeHtml(spaceKey) : pendingSpaceKey ? escapeHtml(pendingSpaceKey) : '（未确定）'}</b></div>
+      <div class="kv"><span>索引状态</span><b>${escapeHtml(detail)}</b></div>
+      <div class="kv"><span>各空间条数</span><b>${spaces.length ? spaces.map((s) => `${escapeHtml(s.spaceKey)}：${s.count} 段`).join('；') : '暂无索引'}</b></div>
+      <div class="kv"><span>关键词索引</span><b>${kwRows.length} 个词项，覆盖 ${kwDocs.size} 篇文档</b></div>
+      <div class="kv"><span>索引进度</span><b>${escapeHtml(vecProgressTextForCurrent(vectorIndexProgress))}</b></div>
+      <p class="muted">空间键 = 归一化 Base URL + 模型 + 维度；换模型 / 换维度 / 换地址都会换空间，旧空间的段保留，需在新空间重建。索引只是可重建的缓存，不随备份导出；恢复备份后这里会显示真实的缺失条数。</p>`;
+  } catch (e) {
+    statusEl.innerHTML = `<p class="err">索引状态读取失败：${escapeHtml(e.message || '')}</p>`;
+  }
+}
+
+/** 刷新记忆页的联想预算区（本月已用 / 上限；超预算只显示，不弹窗、不阻断聊天）。 */
+async function refreshAssocBudgetUI() {
+  const statusEl = document.getElementById('assoc-budget-status');
+  const limitEl = document.getElementById('assoc-budget-limit');
+  if (!statusEl && !limitEl) return;
+  try {
+    const b = await checkAssocBudget(backend);
+    if (limitEl) limitEl.value = String(b.limit);
+    if (statusEl) {
+      statusEl.innerHTML = `
+      <div class="kv"><span>联想召回</span><b>${assocSettings.enabled ? '开' : '关'}</b></div>
+      <div class="kv"><span>本月预算</span><b>已用 ${b.used} / ${b.limit} 次（剩余 ${b.budgetLeft} 次）</b></div>
+      ${b.allowed ? '' : '<p class="err">本月联想预算已用完：本月不再做联想选择与回执改述核验，聊天不受影响，下月自动恢复。</p>'}
+      <p class="muted">预算按月计数，只统计联想选择与回执改述核验的副 API 调用；线索生成不计入预算。</p>`;
+    }
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = `<p class="err">联想预算读取失败：${escapeHtml(e.message || '')}</p>`;
+  }
+}
+
+/**
+ * 聊天真正用记忆：最新用户发言 + 最近 2 轮对话拼成检索文本 → 关键词路与
+ * 向量路各出候选 → RRF k=60 只按排名融合 → 按事件去重取 topN。
+ * 两路独立：向量未配置/失败时只走关键词（keywordOnly），关键词索引未建/
+ * 失败时只走向量（vectorOnly）；失败不阻断聊天，错误汇总进 error 由调用方处理。
+ * 返回 {retrieved, error, spaceKey, query, neighbors, keywordOnly, vectorOnly}，
+ * 前四项与旧外形一致；neighbors 是独立附加的紧邻轮次（本波不注入提示词，
+ * 注入是第 4 波聊天请求重组的事），retrieved 里不含邻居、不占 topN。
+ * 发给主模型的是记忆文字，不是向量数组。
+ */
+async function retrieveForChat(history) {
+  const empty = { retrieved: [], error: null, spaceKey: null, query: '', neighbors: [], keywordOnly: false, vectorOnly: false, queryEmbedding: null };
+  const journals = char.memoryJournals || [];
+  const experiences = await getExperiencesForChar(backend, char.id).catch(() => []);
+  if (!journals.some(journalRetrievable)
+    && !experiences.some((e) => isExperienceValid(e) && e.retrievalEnabled !== false)) return empty;
+  const latestUser = [...history].reverse().find((m) => m.role === 'user');
+  if (!latestUser) return empty;
+  const latestText = extractProtocolText(messageText(latestUser)) || messageText(latestUser);
+  if (!latestText.trim()) return empty;
+  // 最近 2 轮已完成的对话作指代上下文（「那次」「那里」靠这些文本消解）。
+  const recentMsgs = selectMessagesForRounds(history, 2, char)
+    .filter((m) => m.id !== latestUser.id);
+  const recentTexts = recentMsgs.map((m) => extractProtocolText(messageText(m)) || messageText(m)).filter(Boolean);
+  const query = buildRetrievalQueryText(latestText, recentTexts);
+  // 向量路只在已配置向量 API 时跑：取查询向量并确定空间键；失败时不抛，
+  // 留给 fusedRetrieve 只走关键词路，并把错误带给调用方。
+  let queryEmbedding = null;
+  let spaceKey = null;
+  let embeddingError = null;
+  if (vectorSettings.enabled && embeddingApi.url && embeddingApi.key && embeddingApi.model) {
+    try {
+      const { vectors, dimensions } = await callEmbeddings(embeddingApi, [query]);
+      if (vectors?.[0]) {
+        queryEmbedding = vectors[0];
+        const dimsFor = `${embeddingApi.url}|${embeddingApi.model}`;
+        if (vectorSettings.dimensionsFor !== dimsFor || vectorSettings.dimensions !== dimensions) {
+          vectorSettings.dimensions = dimensions;
+          vectorSettings.dimensionsFor = dimsFor;
+          await saveVectorSettings();
+        }
+        spaceKey = spaceKeyFor({ baseUrl: embeddingApi.url, model: embeddingApi.model, dimensions });
+      }
+    } catch (e) {
+      embeddingError = e?.message || String(e);
+    }
+  }
+  const fused = await fusedRetrieve(backend, char, query, queryEmbedding, {
+    spaceKey, journals, experiences, history,
+    topN: vectorSettings.topK, threshold: vectorSettings.threshold,
+    tokenBudget: vectorSettings.tokenBudget,
+    favoritedIds: journals.filter((j) => j.isFavorited).map((j) => j.id),
+  });
+  return {
+    retrieved: fused.results,
+    error: embeddingError || fused.error,
+    spaceKey, query, queryEmbedding,
+    neighbors: fused.neighbors,
+    keywordOnly: fused.keywordOnly,
+    vectorOnly: fused.vectorOnly,
+  };
+}
+
 /**
  * 构建一次请求（提示词 + 上下文 + 请求体），「本次发送内容预览」与 Get Reply 共用同一份结果。
- * 历史、角色设定、世界书、表情包、API 选项任一变化都会改变签名，缓存失效重建；
- * 否则直接复用上一次的构建对象，不重新构建。只取尾部 maxMemory 条进签名，
- * 因为更早的消息本来就不会进请求。
+ * 历史、角色设定、世界书、表情包、API 选项、向量设置、记忆内容、索引指纹任一变化
+ * 都会改变签名，缓存失效重建；否则直接复用上一次的构建对象，不重新构建。
+ * 同一次请求的检索只做一次：预览与发送共用 buildCurrentRequest 的缓存，
+ * 检索结果存在 lastBuiltRequest.retrieved 里，不会各调一次向量接口。
  */
 async function buildCurrentRequest() {
   const history = await backend.getAllMessages(char.id);
   const last = history[history.length - 1];
   const maxMem = Math.max(1, parseInt(char?.maxMemory, 10) || 80);
   const tail = history.slice(-maxMem).map((m) => `${m.id}:${m.updatedAt || m.timestamp}`).join(',');
-  const sig = hashString(JSON.stringify({
+  const journals = char.memoryJournals || [];
+  const journalSig = journals.map((j) => `${j.id}:${j.isFavorited ? 1 : 0}:${j.retrievalEnabled !== false ? 1 : 0}:${j.updatedAt || j.timestamp || 0}:${hashString(`${j.title || ''}|${j.content || ''}`)}`).join(',');
+  const experiences = await getExperiencesForChar(backend, char.id);
+  const expSig = experiences.map((e) => `${e.id}:${e.status}:${e.retrievalEnabled !== false ? 1 : 0}:${e.updatedAt || e.timestamp || 0}:${hashString(`${e.title || ''}|${e.summary || ''}`)}`).join(',');
+  const chunks = (await backend.getAll('vectorChunks')).filter((c) => c.charId === char.id);
+  const chunkSig = chunks.map((c) => `${c.id}:${c.hash}`).sort().join(',');
+  // 关键词索引变化（编辑/删除/失效同步）同样改变检索结果，要进签名。
+  const kwRows = (await backend.getAll('keywordIndex')).filter((r) => r.charId === char.id);
+  const kwSig = kwRows.map((r) => `${r.term}:${(r.postings || []).length}`).sort().join(',');
+  // 签名因子含主 API 的 model（只改模型不失效缓存是审计发现的坑，这里修掉）
+  // 与联想配置（assocSettings.enabled）；任一因子变化都重建。
+  const sig = buildRequestSignature({
     c: char.id, h: history.length, l: last?.id || '', t: last?.timestamp || 0, tail,
-    p: apiSettings.provider || 'openai', tp: !!apiSettings.timePerceptionEnabled,
+    p: apiSettings.provider || 'openai', model: apiSettings.model || '', tp: !!apiSettings.timePerceptionEnabled,
     v: resolvePromptVersion(char, globalSettings),
-    ch: [char.persona, char.myPersona, char.worldBookIds, char.stickerGroups, char.bilingualModeEnabled, char.replyCountMin, char.replyCountMax, char.maxMemory, char.promptOverride, char.statusPanel],
+    ch: [char.persona, char.myPersona, char.worldBookIds, char.stickerGroups, char.bilingualModeEnabled, char.replyCountMin, char.replyCountMax, char.maxMemory, char.promptOverride, char.statusPanel, char.statusMode, char.innerVoicePrompt],
     wb: worldBooks, st: stickers,
-  }));
+    vec: { e: vectorSettings.enabled, k: vectorSettings.topK, th: vectorSettings.threshold, b: vectorSettings.tokenBudget, emb: [embeddingApi.provider, embeddingApi.url, embeddingApi.model] },
+    j: journalSig, ch2: chunkSig, e: expSig, kw: kwSig,
+    assoc: assocSettings.enabled,
+  });
   if (lastBuiltRequest && lastBuiltRequest.sig === sig) {
     return { ...lastBuiltRequest, reused: true };
   }
-  const sys = buildSystemPrompt(char, { worldBooks, stickers, globalSettings });
+  const { retrieved, error: retrievalError, spaceKey, query: retrievalQuery, neighbors: retrievalNeighbors, queryEmbedding } = await retrieveForChat(history);
+  if (retrievalError) {
+    toast(retrieved.length
+      ? '记忆检索有一路失败，本次只用了另一路的召回结果，已继续正常聊天'
+      : '记忆检索失败，已继续正常聊天（本次没有召回记忆）');
+  }
+  // 联想召回（第 3 波）：在准确检索之后、组装请求之前，只做当轮选择。选空 /
+  // 超时 / 超预算都不抛错、不阻断聊天；结果存进 lastBuiltRequest.assoc，
+  // 由下面的 buildSystemPrompt 按 use 注入“联想旧事”区块（第 4 波），
+  // pick 的文档内容按 docId 从经历记录里取。
+  // 注意：预览也会触发这一步（与发送共用同一份构建结果），每次签名变化
+  // 的重建都可能消费一次联想预算。
+  let assoc;
+  if (assocSettings.enabled && summaryApi.url && summaryApi.key && summaryApi.model) {
+    try {
+      const embedTexts = (vectorSettings.enabled && embeddingApi.url && embeddingApi.key && embeddingApi.model)
+        ? (texts) => callEmbeddings(embeddingApi, texts)
+        : null;
+      assoc = await runAssocForChat({
+        backend, charId: char.id, queryText: retrievalQuery, queryEmbedding, spaceKey,
+        fusedResults: retrieved, experiences, summaryApi, embedTexts,
+        assocEnabled: assocSettings.enabled,
+      });
+    } catch (e) {
+      console.warn('联想召回失败（聊天不受影响）：', e);
+      assoc = emptyAssoc('error', { reason: '联想召回失败，已按选空处理。' });
+    }
+  } else {
+    assoc = emptyAssoc(assocSettings.enabled ? 'no-api' : 'disabled', {
+      reason: assocSettings.enabled ? '未配置总结副 API，联想未启用。' : '联想召回总开关已关闭。',
+    });
+  }
+  // 第 4 波：请求按区块重组——阶段背景 / 检索证据（仅 sourced）+ 邻居 /
+  // 联想旧事；原文校验用消息表；三路共用 tokenBudget。
+  const messagesById = new Map(history.map((m) => [m.id, m]));
+  const assocExperience = assoc?.pick ? experiences.find((e) => e.id === assoc.pick) || null : null;
+  // fusedRetrieve 的结果不带 quotes：经历类命中从经历记录里把关键原话富集进来，
+  // 原文校验才能逐句核对引文（找不到原话的整条丢弃，不降级成无出处引用）。
+  const enrichedRetrieved = retrieved.map((r) => {
+    if (r?.docKind === 'experience') {
+      const exp = experiences.find((e) => e.id === r.docId);
+      return exp?.quotes?.length ? { ...r, quotes: exp.quotes } : r;
+    }
+    return r;
+  });
+  const sys = buildSystemPrompt(char, {
+    worldBooks, stickers, globalSettings,
+    relatedMemories: enrichedRetrieved,
+    stageSummaries: journals.filter((j) => j.isSummary),
+    neighbors: retrievalNeighbors,
+    assoc, assocExperience, messagesById,
+    tokenBudget: vectorSettings.tokenBudget,
+  });
   const hydrated = await hydrateForRequest(history);
   const req = buildRequest(char, hydrated, sys, { provider: apiSettings.provider || 'openai', timePerceptionEnabled: apiSettings.timePerceptionEnabled });
-  lastBuiltRequest = { sig, sys, req, history, reused: false };
+  lastBuiltRequest = { sig, sys, req, history, reused: false, retrieved, retrievalError, retrievalQuery, spaceKey, neighbors: retrievalNeighbors, assoc, memorySections: sys.memorySections };
   return lastBuiltRequest;
 }
 
@@ -4124,7 +13017,10 @@ function setGenerating(on, label) {
   isGenerating = on;
   const btn = $('#get-reply-btn');
   btn.disabled = false;
-  btn.textContent = on ? (label || '停止生成') : 'get reply';
+  // 图标按钮：空闲星星 / 生成中停止；文字只进 aria-label 与 title。
+  btn.innerHTML = on ? '<svg class="icon"><use href="#i-stop"/></svg>' : '<svg class="icon"><use href="#i-sparkle"/></svg>';
+  btn.setAttribute('aria-label', on ? (label || '停止生成') : '获取回复');
+  btn.title = on ? (label || '停止生成') : '获取回复';
   btn.classList.toggle('generating', !!on);
   $('#composer').classList.toggle('generating', !!on);
   $('#typing-indicator').classList.toggle('hidden', !on);
@@ -4141,7 +13037,13 @@ async function getReply() {
   setGenerating(true);
   abortController = new AbortController();
   streamBuf = '';
+  // 生成中断标记：刷新/前后台切换后，启动时凭这个标记提示“上次生成已中断”，
+  // 绝不自动续生成（chatDaily.js recoverInterruptedMessages / shouldResumeGeneration）。
+  localStorage.setItem('uwu-chat.generating', '1');
   const roundId = uid('round');
+  // 本轮请求的联想选择（buildCurrentRequest 里算出）：只在真实发送路径里
+  // 有；模拟回复不走构建，不带联想选择，回执也就不结算。
+  let assocForRound = null;
   try {
     if (!apiSettings.url || !apiSettings.key || !apiSettings.model) {
       // 无密钥：本地模拟回复，明确标注
@@ -4152,7 +13054,9 @@ async function getReply() {
       return;
     }
     // 与「本次发送内容预览」同一份构建结果：刚预览过且历史未变时直接复用。
-    const { req } = await buildCurrentRequest();
+    const built = await buildCurrentRequest();
+    assocForRound = built.assoc || null;
+    const { req } = built;
     const streamBox = await createStreamingBubble();
     const { text } = await sendChat(apiSettings, req.body, {
       signal: abortController.signal,
@@ -4160,13 +13064,13 @@ async function getReply() {
     });
     streamBuf = text || streamBuf;
     removeStreamingBubble(streamBox);
-    await handleAiReplyContent(streamBuf, roundId, {});
+    await handleAiReplyContent(streamBuf, roundId, { assoc: assocForRound });
   } catch (e) {
     if (e?.name === 'AbortError' || abortController?.signal.aborted) {
       // 停止：已解析出的完整片段照常落库，未闭合片段保留为纯文本
       if (streamBuf.trim()) {
         toast('已停止生成');
-        await handleAiReplyContent(streamBuf, roundId, { partial: true });
+        await handleAiReplyContent(streamBuf, roundId, { partial: true, assoc: assocForRound });
       }
     } else {
       showApiErrorModal(e);
@@ -4175,6 +13079,9 @@ async function getReply() {
     setGenerating(false);
     abortController = null;
     streamBuf = '';
+    localStorage.removeItem('uwu-chat.generating');
+    // 一轮回复落定后检查自动总结（未开启或未到轮数时静默返回，不打扰聊天）。
+    void maybeAutoSummarize();
   }
 }
 
@@ -4186,23 +13093,95 @@ function showApiErrorModal(e) {
   ]);
 }
 
+/* ---------------- 记忆总结 ---------------- */
+// 生成一份总结并存为独立记忆（journals 表一条新记录，带 isSummary 标记）。
+// 成功后才推进增量进度（lastSummarizedMessageId / summarizedRounds）；失败不推进、
+// 不写记忆、不影响聊天。总结只走总结副 API，未配置时明确提示，绝不偷用主 API。
+async function generateSummary(selected, { source, titleSuffix }) {
+  if (!selected?.length) return { ok: false, message: '没有可总结的聊天记录。' };
+  if (!summaryApi.url || !summaryApi.key || !summaryApi.model) {
+    return { ok: false, message: '未配置记忆总结副 API：请先在「我 → API 设置 → 记忆总结副 API」里填写 Base URL、API Key 和模型。总结不会使用主 API。' };
+  }
+  const rounds = countRounds(selected, char);
+  if (!rounds) return { ok: false, message: '选定范围里没有完整的一轮对话（需要一次用户发言 + 对应 AI 回复）。' };
+  const transcript = extractSummarizableText(selected, char);
+  if (!transcript.trim()) return { ok: false, message: '选定范围里没有可总结的正文（状态、思考、HTML 模板类内容不进总结）。' };
+  const req = buildSummaryRequest({ prompt: summarySettings.prompt, length: summarySettings.length, transcript });
+  let text;
+  try {
+    text = (await callSummaryChat(summaryApi, req.messages)).trim();
+  } catch (e) {
+    return { ok: false, message: e.message || '总结调用失败。' };
+  }
+  if (!text) return { ok: false, message: '副 API 没有返回总结文字，请重试。' };
+  const now = Date.now();
+  const dateStr = new Date(now).toISOString().slice(0, 10);
+  const journal = {
+    id: uid('journal'), charId: char.id,
+    title: `总结 · ${dateStr}（${rounds} 轮）${titleSuffix ? ` · ${titleSuffix}` : ''}`,
+    content: text,
+    source,
+    isFavorited: false,
+    isSummary: true,
+    sourceMessageIds: selected.map((m) => m.id),
+    range: { fromMessageId: selected[0].id, toMessageId: selected[selected.length - 1].id, rounds },
+    timestamp: now, createdAt: now,
+  };
+  await backend.put('journals', journal);
+  await attachJournals(char);
+  // 新生成的总结记忆同样进向量索引（后台做，失败不影响总结本身）。
+  scheduleReindexDocument(journal);
+  // 成功后才推进进度；只向前推进，不回退（手动总结旧范围不改锚点）。
+  const history = await backend.getAllMessages(char.id);
+  const anchorIdx = summarySettings.lastSummarizedMessageId
+    ? history.findIndex((m) => m.id === summarySettings.lastSummarizedMessageId) : -1;
+  const lastIdx = history.findIndex((m) => m.id === selected[selected.length - 1].id);
+  if (lastIdx > anchorIdx) {
+    summarySettings.lastSummarizedMessageId = selected[selected.length - 1].id;
+    summarySettings.summarizedRounds = (summarySettings.summarizedRounds || 0) + rounds;
+    await saveSummarySettings();
+  }
+  return { ok: true, journal, rounds };
+}
+
+// 自动总结：默认关闭；每累计 N 轮触发一轮。只在 AI 回复完成后检查，
+// 失败只提示一次，不影响聊天、不推进进度、不重复写。
+async function maybeAutoSummarize() {
+  if (!summarySettings.autoEnabled || summaryRunning) return;
+  if (!summaryApi.url || !summaryApi.key || !summaryApi.model) return;
+  try {
+    const history = await backend.getAllMessages(char.id);
+    const rest = unsummarizedMessages(history, summarySettings.lastSummarizedMessageId);
+    const rounds = countRounds(rest, char);
+    if (rounds < Math.max(1, summarySettings.everyRounds || 30)) return;
+    summaryRunning = true;
+    try {
+      const res = await generateSummary(rest, { source: '自动总结', titleSuffix: '' });
+      if (res.ok) toast(`已自动生成一份聊天总结（${res.rounds} 轮），见「记忆」页。`);
+      else console.warn('自动总结失败（聊天不受影响）：', res.message);
+    } finally {
+      summaryRunning = false;
+    }
+  } catch (e) {
+    console.warn('自动总结检查失败（聊天不受影响）：', e);
+  }
+}
+
 async function createStreamingBubble() {
-  const wrap = el('div', 'msg received');
-  const avatar = el('img', 'msg-avatar');
-  avatar.src = await resolveAvatar(char.avatar);
-  const body = el('div', 'msg-body');
-  const bubble = el('div', 'bubble', '');
+  const wrap = el('div', 'msg message-wrapper received is-streaming');
+  const body = el('div', 'msg-body message-bubble-row');
+  const bubble = createTextBubble('');
   body.appendChild(bubble);
-  wrap.append(avatar, body);
+  wrap.appendChild(body);
   messageArea.appendChild(wrap);
-  messageArea.scrollTop = messageArea.scrollHeight;
+  scrollToBottomIfNear();
   return { wrap, bubble };
 }
 function updateStreamingBubble(box, text) {
   if (!box) return;
   // 流式过程只显示纯文本预览，不执行协议指令
-  box.bubble.textContent = text.replace(/^\[.*?(?:消息|回复)[：:]/, '').slice(0, 600);
-  messageArea.scrollTop = messageArea.scrollHeight;
+  box.bubble.querySelector('.bubble-text').textContent = text.replace(/^\[.*?(?:消息|回复)[：:]/, '').slice(0, 600);
+  scrollToBottomIfNear();
 }
 function removeStreamingBubble(box) { box?.wrap.remove(); }
 
@@ -4213,6 +13192,13 @@ async function handleAiReplyContent(raw, roundId, opts = {}) {
   if (thinkEnd !== -1) text = text.slice(thinkEnd + '</thinking>'.length);
   text = text.replace(/\[incipere\]/g, '');
   if (!text.trim()) { if (!opts.partial) toast('模型返回了空内容'); return; }
+
+  // 心声解析（innerVoice.js）：在分段之前先剥 [inner_voice] 块，正文进分段，
+  // 心声挂到本轮第一条落盘的助理消息上（applySegment 里认领）。
+  // 解析失败安静降级（innerVoice=null），协议标记绝不进气泡。
+  const parsedInner = parseInnerVoice(text);
+  text = parsedInner.cleanContent;
+  if (parsedInner.innerVoice) opts = { ...opts, innerVoice: parsedInner.innerVoice };
 
   const segments = parseReplyText(text, char, { allowedStickers: allowedStickerNames() });
   let first = true;
@@ -4225,6 +13211,20 @@ async function handleAiReplyContent(raw, roundId, opts = {}) {
   }
   await saveCharacter();
   setSaveState('已保存');
+  // 联想回执（第 3 波）：每落定一次 AI 回复，已完成回合序号 +1（一轮 =
+  // 一次 AI 回复，多气泡同一 roundId 只算一轮；中途停止的回复也算一轮，
+  // 它确实落盘并被用户看到了）；再按本轮请求的联想选择结算回执——核对
+  // 最终回复是否实际提及所选经历。回执结算不阻塞聊天：副模型核验失败时
+  // 只用标记匹配的结果。没有联想选择（模拟回复）时不结算。
+  try {
+    await bumpCompletedRoundSeq(backend, char.id);
+  } catch (e) { console.warn('联想回合序号更新失败：', e); }
+  if (opts.assoc?.pick) {
+    void settleAssocReceipt({
+      backend, charId: char.id, roundId, replyText: text, assoc: opts.assoc, summaryApi,
+      excludeNames: [char.realName, char.myName, char.remarkName].filter(Boolean),
+    }).catch((e) => console.warn('联想回执结算失败：', e));
+  }
 }
 
 async function applySegment(seg, roundId, opts) {
@@ -4283,12 +13283,14 @@ async function applySegment(seg, roundId, opts) {
       msg.content = `[${char.realName}撤回了一条消息：${seg.original}]`;
       msg.parts = [{ type: 'text', text: msg.content }];
       await backend.put('messages', msg);
+      await invalidateExperiencesForSourceMessage(msg.id);
       await renderMessages(false);
     }, 2000);
     return;
   }
 
-  // 短状态更新：改顶栏，不显示成普通气泡
+  // 短状态更新：只改顶栏与状态栏，不显示成普通气泡（原版：非调试不渲染）。
+  // 调试模式下才把原文以【调试可见】样式留在消息流里。
   if (seg.kind === 'status') {
     char.status = seg.body || char.status;
     msg.isStatusUpdate = true;
@@ -4296,15 +13298,20 @@ async function applySegment(seg, roundId, opts) {
     await backend.put('messages', msg);
     await saveCharacter();
     updateHeader();
-    const note = el('div', 'msg system-note');
-    note.appendChild(el('div', 'bubble', escapeHtml(`状态已更新为：${seg.body || ''}`)));
-    messageArea.appendChild(note);
-    messageArea.scrollTop = messageArea.scrollHeight;
+    if (isDebugMode) {
+      const note = el('div', 'msg system-note');
+      note.dataset.id = msg.id;
+      note.appendChild(el('div', 'bubble message-bubble debug-visible', escapeHtml(seg.body || '')));
+      attachMsgMenu(note, msg);
+      messageArea.appendChild(note);
+      scrollToBottomIfNear();
+    }
     return;
   }
 
-  // 用户自定义状态栏：regex/replace 模板去重保存，消息只存引用与原文
-  if (char.statusPanel?.enabled && char.statusPanel.regexPattern) {
+  // 用户自定义状态栏：只在 HTML 状态栏模式下解析（statusMode.js）。
+  // 简洁模式不注入状态指令、也不从回复里抽状态；心声模式只走 [inner_voice]。
+  if (getStatusMode(char) === 'html' && char.statusPanel?.enabled && char.statusPanel.regexPattern) {
     try {
       const out = applyStatusTemplate(seg.content, char.statusPanel, statusTemplateCtx(char));
       if (out) {
@@ -4324,6 +13331,13 @@ async function applySegment(seg, roundId, opts) {
     } catch (e) { console.warn('状态栏正则解析错误', e); }
   }
 
+  // 心声认领：本轮第一条落盘的普通助理消息带上 innerVoice（只认领一次，
+  // 之后 opts.innerVoice 置空，多气泡同一轮不重复挂）。
+  if (opts.innerVoice && !msg.innerVoice) {
+    msg.innerVoice = opts.innerVoice;
+    opts.innerVoice = null;
+  }
+
   await backend.put('messages', msg);
   await appendMessageElement(msg);
 }
@@ -4339,6 +13353,8 @@ async function handleRegenerate() {
   char.supersededRounds = char.supersededRounds || [];
   char.supersededRounds.push({ roundId: lastRound, messages: roundMsgs, at: Date.now() });
   for (const m of roundMsgs) await backend.delete('messages', m.id);
+  // 被替换轮次的消息是物理删除：同样按来源失效规则处理经历。
+  for (const m of roundMsgs) await invalidateExperiencesForSourceMessage(m.id);
   await saveCharacter();
   await renderMessages(false);
   toast('已替换上一轮，可在管理 → 数据管理里恢复');
@@ -4371,57 +13387,417 @@ async function receiveGift(messageId) {
   toast('已接收礼物');
 }
 
-/* ---------------- 消息操作 ---------------- */
-function openMsgMenu(msg, x, y) {
-  const box = $('#msg-menu-actions');
-  box.innerHTML = '';
-  const add = (label, fn, danger) => {
-    const b = document.createElement('button');
-    b.textContent = label;
-    if (danger) b.style.color = '#b0442f';
-    b.onclick = () => { closeSheet('#msg-menu'); fn(); };
-    box.appendChild(b);
-  };
-  add('复制', () => {
-    const text = msg.role === 'user' || msg.role === 'assistant'
-      ? extractProtocolText(messageText(msg)) || msg.content : msg.content;
-    navigator.clipboard?.writeText(text).then(() => toast('已复制'));
+/* ---------------- 顶栏 ··· 聊天设置（次级入口） ----------------
+ *  聊天页常驻控制已移入这里：自动回复开关、状态模式切换、保存状态、
+ *  多选批量操作、调试开关、API 设置与角色设置入口。
+ *  调试开关原来在长按菜单里（日常菜单不应出现调试功能），随这次搬家。 */
+/** 顶栏返回：单角色应用没有会话列表，返回即切回上一次所在的非聊天页
+ *  （默认动态），Tab 栏随 .in-chat 移除而重新出现。 */
+function goBackFromChat() {
+  NavShell.switchView(lastHomeView || 'moments');
+}
+
+function openChatMenu() {
+  const auto = localStorage.getItem('uwu-chat.autoReply') === '1';
+  const mode = getStatusMode(char);
+  const saveText = $('#save-state')?.textContent || '';
+  const modeOptions = Object.entries(STATUS_MODE_LABELS)
+    .map(([v, label]) => `<option value="${v}" ${v === mode ? 'selected' : ''}>${label}</option>`).join('');
+  showModal('聊天设置', `
+    <div class="cm-row"><div class="setting-row"><span class="setting-label">自动回复<small>发完消息后自动获取回复</small></span><label class="switch"><input type="checkbox" id="cm-auto-reply" ${auto ? 'checked' : ''}><span class="switch-track"></span></label></div></div>
+    <div class="cm-row"><label>状态模式</label><select id="cm-status-mode">${modeOptions}</select></div>
+    <p class="muted">状态模式按角色保存。简洁（默认）：不注入状态指令；心声：生成 [inner_voice] 独白；HTML 状态栏：沿用现有状态模板。切换不删除模板与历史。心声提示词在「角色与状态模板」里改。</p>
+    <div class="cm-row"><span>保存状态</span><span class="muted">${escapeHtml(saveText || '—')}</span></div>
+    ${selectedMessageIds.size ? `<div class="cm-row"><span>已选 ${selectedMessageIds.size} 条消息</span><span><button id="cm-del-selected">删除所选</button> <button id="cm-clear-selected">清除选择</button></span></div>` : ''}
+    <div class="cm-row"><button id="cm-api">API 设置</button><button id="cm-persona">角色与状态模板</button></div>
+    <div class="cm-row"><button id="cm-debug">${isDebugMode ? '退出调试' : '进入调试'}</button><span class="muted">调试模式显示状态 / 思考原文</span></div>
+    <div class="cm-row"><button id="cm-chat-search">搜索聊天</button><button id="cm-chat-favorites">收藏消息</button><button id="cm-chat-dates">按日期查看</button></div>`,
+  [{ label: '关闭' }]);
+  $('#cm-auto-reply')?.addEventListener('change', (e) => {
+    localStorage.setItem('uwu-chat.autoReply', e.target.checked ? '1' : '0');
+    const hidden = $('#auto-reply-toggle');
+    if (hidden) hidden.checked = e.target.checked;
   });
-  add('引用回复', () => startQuote(msg));
-  if (msg.role === 'user') {
-    add('编辑', () => startEditMessage(msg));
-    if (Date.now() - msg.timestamp <= 2 * 60 * 1000 && !msg.isWithdrawn) {
-      add('撤回（2 分钟内）', () => withdrawMessage(msg));
+  $('#cm-status-mode')?.addEventListener('change', async (e) => {
+    char = setStatusMode(char, e.target.value);
+    await saveCharacter();
+    lastBuiltRequest = null; // 模式换了，缓存的请求要重建（签名里含 statusMode）
+    toast(`状态模式已切换为${STATUS_MODE_LABELS[getStatusMode(char)]}`);
+  });
+  $('#cm-del-selected')?.addEventListener('click', async () => {
+    hideModal();
+    const ids = [...selectedMessageIds];
+    if (!ids.length) return;
+    for (const id of ids) {
+      await backend.delete('messages', id);
+      await invalidateExperiencesForSourceMessage(id);
     }
+    selectedMessageIds.clear();
+    await renderMessages(false);
+    toast(`已删除 ${ids.length} 条消息`);
+  });
+  $('#cm-clear-selected')?.addEventListener('click', () => {
+    selectedMessageIds.clear();
+    document.querySelectorAll('.msg.selected').forEach((n) => n.classList.remove('selected'));
+    hideModal();
+    toast('已清除选择');
+  });
+  $('#cm-api')?.addEventListener('click', () => { hideModal(); openSettings('api'); });
+  $('#cm-persona')?.addEventListener('click', () => { hideModal(); openSettings('persona'); });
+  $('#cm-debug')?.addEventListener('click', () => {
+    isDebugMode = !isDebugMode;
+    hideModal();
+    toast(isDebugMode ? '已进入调试模式' : '已退出调试模式');
+    renderMessages(false);
+  });
+  // 聊天记录中心入口（B 组）：三个二级页，复用 ManageView.openSubpage，不加常驻按钮。
+  $('#cm-chat-search')?.addEventListener('click', () => { hideModal(); openChatSearch(); });
+  $('#cm-chat-favorites')?.addEventListener('click', () => { hideModal(); openChatFavorites(); });
+  $('#cm-chat-dates')?.addEventListener('click', () => { hideModal(); openChatDates(); });
+}
+
+/* ---------------- 聊天记录中心（B 组） ---------------- */
+// 三个二级页复用 ManageView.openSubpage（index.html 里的 sub-chat-search /
+// sub-chat-favorites / sub-chat-dates），黑白灰，不加常驻按钮与底部导航。
+// 数据查询只走 A 组模块（searchChatMessages / listFavoriteMessages /
+// getChatDates / messagesForDay），本文件不另建搜索实现；纯逻辑在
+// js/chatCenter.js（可进 Node 测试），这里只做 DOM 接线。
+const chatCenterState = {
+  search: { keyword: '', sender: 'all', dateFrom: '', dateTo: '', types: [], results: [], nextCursor: null, scrollTop: 0, querySeq: 0 },
+  favorites: { results: [], nextCursor: null, scrollTop: 0 },
+  dates: { dates: [], year: new Date().getFullYear(), month: new Date().getMonth(), scrollTop: 0 },
+  jumpReturn: null, // { from: 'search' | 'favorites' | 'dates' }
+  // 引用跳转返回点：{ sourceMessageId, scrollTop }，点引用时记下，返回时跳回并恢复滚动位置。
+  quote: null,
+};
+const CHAT_CENTER_RETURN_LABELS = {
+  search: '← 返回搜索结果',
+  favorites: '← 返回收藏夹',
+  dates: '← 返回日期查看',
+  quote: '← 返回引用处',
+};
+
+/** 消息定位（全应用唯一的一套定位逻辑）：查到目标消息后按现有分页
+ *  往前翻页加载包含它的那一页（复用 renderMessages，不另写消息渲染），
+ *  滚动到该消息并短暂高亮 1.5s。returnTo 指定来源页时，在聊天页顶栏下
+ *  显示一条轻量返回入口；不传 returnTo 时不显示（横幅跳转走这条）。
+ *  找不到消息记录时 toast 提示并返回 false。 */
+async function jumpToMessage(messageId, { returnTo } = {}) {
+  if (!char?.id || !messageId) return false;
+  ManageView.closeSubpage(); // 二级页是覆盖层：先关掉，定位后的聊天页才看得见
+  const res = await runJumpToMessage({
+    backend, charId: char.id, messageId,
+    findTarget: (id) => messageArea.querySelector(`[data-id="${CSS.escape(String(id))}"]`),
+    renderLatest: () => renderMessages(false),
+    renderOlder: async () => { await renderMessages(true); return { hasMore: hasMoreHistory, oldest: loadedOldest }; },
+    scrollTo: (el) => el.scrollIntoView({ block: 'center' }),
+    highlight: (el) => {
+      el.classList.add('msg-jump-highlight');
+      setTimeout(() => el.classList.remove('msg-jump-highlight'), 1500);
+    },
+    onMissing: () => toast('找不到这条消息，可能已被删除'),
+  });
+  if (!res.ok) { hideJumpReturnBar(); return false; }
+  if (returnTo && CHAT_CENTER_RETURN_LABELS[returnTo]) {
+    chatCenterState.jumpReturn = { from: returnTo };
+    showJumpReturnBar(returnTo);
+  } else {
+    chatCenterState.jumpReturn = null;
+    hideJumpReturnBar();
   }
-  add(msg.isContextDisabled ? '恢复进上下文' : '不进入上下文', async () => {
-    msg.isContextDisabled = !msg.isContextDisabled;
-    await backend.put('messages', msg);
-    await renderMessages(false);
-    toast(msg.isContextDisabled ? '已设为不进入上下文' : '已恢复进上下文');
+  return true;
+}
+
+function showJumpReturnBar(from) {
+  const bar = $('#jump-return-bar');
+  const btn = $('#jump-return-btn');
+  const latest = $('#jump-latest-btn');
+  if (!bar || !btn) return;
+  btn.textContent = CHAT_CENTER_RETURN_LABELS[from] || '← 返回';
+  latest?.classList.toggle('hidden', from !== 'dates');
+  bar.classList.remove('hidden');
+}
+function hideJumpReturnBar() { $('#jump-return-bar')?.classList.add('hidden'); }
+
+/** 点返回入口：回到跳过来的那一页，恢复当时的结果与滚动位置（不重新搜索）。 */
+function returnFromJump() {
+  const from = chatCenterState.jumpReturn?.from;
+  hideJumpReturnBar();
+  chatCenterState.jumpReturn = null;
+  if (from === 'search') openChatSearch({ restore: true });
+  else if (from === 'favorites') openChatFavorites({ restore: true });
+  else if (from === 'dates') openChatDates({ restore: true });
+  else if (from === 'quote') returnToQuoteMessage();
+}
+
+/** 引用返回：跳回含引用的那条消息，并恢复点击引用前的聊天滚动位置。 */
+async function returnToQuoteMessage() {
+  const saved = chatCenterState.quote;
+  chatCenterState.quote = null;
+  if (!saved?.sourceMessageId) return;
+  const ok = await jumpToMessage(saved.sourceMessageId);
+  if (ok && typeof saved.scrollTop === 'number') messageArea.scrollTop = saved.scrollTop;
+}
+
+function chatCenterNames() {
+  return { myName: char?.myName || '', charName: char?.remarkName || char?.realName || '' };
+}
+
+/* ---- 搜索页 ---- */
+function openChatSearch({ restore = false } = {}) {
+  const body = ManageView.openSubpage('chat-search');
+  if (!body) return;
+  if (!body.dataset.ccBuilt) { buildChatSearchPage(body); body.dataset.ccBuilt = '1'; }
+  if (restore) {
+    // 从聊天页返回：恢复原来的滚动位置，结果列表不重新搜索。
+    body.scrollTop = chatCenterState.search.scrollTop || 0;
+    return;
+  }
+  // 每次打开都重新查：不持有跨打开的 results 缓存，同一页内编辑/删除消息后下次打开即更新。
+  chatCenterState.search.results = [];
+  chatCenterState.search.nextCursor = null;
+  runChatSearch(true);
+}
+
+function buildChatSearchPage(body) {
+  const chips = CHAT_CENTER_TYPES.map((t) => `<label class="cc-chip"><input type="checkbox" value="${t.value}">${t.label}</label>`).join('');
+  body.innerHTML = `
+    <input type="search" id="cc-search-input" class="cc-search-input" placeholder="搜索聊天记录…" autocomplete="off" aria-label="搜索聊天记录">
+    <div class="cc-filter-row"><span class="setting-label">发送者</span><select id="cc-search-sender" aria-label="发送者筛选"><option value="all">全部</option><option value="me">我</option><option value="ai">对方</option></select></div>
+    <div class="cc-filter-row"><span class="setting-label">开始日期</span><input type="date" id="cc-search-from" aria-label="开始日期"></div>
+    <div class="cc-filter-row"><span class="setting-label">结束日期</span><input type="date" id="cc-search-to" aria-label="结束日期"></div>
+    <div class="cc-types" id="cc-search-types">${chips}</div>
+    <p class="muted" id="cc-search-status"></p>
+    <div id="cc-search-results"></div>
+    <button id="cc-search-more" class="cc-load-more hidden">加载更多</button>`;
+  const st = chatCenterState.search;
+  const debouncedRun = debounce(() => runChatSearch(true), 300);
+  body.querySelector('#cc-search-input')?.addEventListener('input', (e) => {
+    st.keyword = e.target.value;
+    debouncedRun();
   });
-  if (msg.role === 'assistant') add('重新生成这一轮', () => handleRegenerate());
-  add('查看原始内容', () => {
-    showModal('原始内容', `<pre class="code">${escapeHtml(JSON.stringify(msg, null, 2))}</pre>`, [{ label: '关闭' }]);
+  body.querySelector('#cc-search-sender')?.addEventListener('change', (e) => {
+    st.sender = e.target.value;
+    runChatSearch(true);
   });
-  add('删除', async () => {
-    await backend.delete('messages', msg.id);
-    await renderMessages(false);
-    toast('已删除');
-  }, true);
-  openSheet('#msg-menu');
-  void x; void y;
+  body.querySelector('#cc-search-from')?.addEventListener('change', (e) => {
+    st.dateFrom = e.target.value;
+    runChatSearch(true);
+  });
+  body.querySelector('#cc-search-to')?.addEventListener('change', (e) => {
+    st.dateTo = e.target.value;
+    runChatSearch(true);
+  });
+  body.querySelector('#cc-search-types')?.addEventListener('change', (e) => {
+    const box = e.target.closest('input[type="checkbox"]');
+    if (!box) return;
+    st.types = [...body.querySelectorAll('#cc-search-types input:checked')].map((c) => c.value);
+    runChatSearch(true);
+  });
+  body.querySelector('#cc-search-results')?.addEventListener('click', (e) => {
+    const row = e.target.closest('.cc-result');
+    if (!row?.dataset.id) return;
+    st.scrollTop = body.scrollTop; // 记下滚动位置，返回时恢复
+    jumpToMessage(row.dataset.id, { returnTo: 'search' });
+  });
+  body.querySelector('#cc-search-more')?.addEventListener('click', () => runChatSearch(false));
+}
+
+async function runChatSearch(reset) {
+  if (!char?.id) return;
+  const st = chatCenterState.search;
+  if (reset) { st.results = []; st.nextCursor = null; }
+  const statusEl = $('#cc-search-status');
+  if (statusEl) statusEl.textContent = '搜索中…';
+  const seq = (st.querySeq = (st.querySeq || 0) + 1);
+  try {
+    const { results, nextCursor } = await searchChatMessages(backend, char.id, {
+      ...buildSearchFilters(st), limit: SEARCH_PAGE_SIZE, cursor: reset ? null : st.nextCursor,
+    });
+    if (seq !== st.querySeq) return; // 后一次查询已发出，丢弃旧结果
+    st.results = reset ? (results || []) : [...st.results, ...(results || [])];
+    st.nextCursor = nextCursor ?? null;
+    renderChatSearchResults();
+  } catch (err) {
+    console.warn('搜索失败：', err);
+    if (statusEl) statusEl.textContent = '搜索失败，请重试';
+  }
+}
+
+function renderChatSearchResults() {
+  const st = chatCenterState.search;
+  const { myName, charName } = chatCenterNames();
+  const box = $('#cc-search-results');
+  if (box) box.innerHTML = st.results.map((r) => searchResultItemHTML(r, myName, charName)).join('');
+  const statusEl = $('#cc-search-status');
+  if (statusEl) statusEl.textContent = st.results.length ? `共 ${st.results.length} 条结果` : '没有找到相关消息';
+  $('#cc-search-more')?.classList.toggle('hidden', !st.nextCursor);
+}
+
+/* ---- 收藏夹页（消息收藏，与记忆收藏分开） ---- */
+function openChatFavorites({ restore = false } = {}) {
+  const body = ManageView.openSubpage('chat-favorites');
+  if (!body) return;
+  if (!body.dataset.ccBuilt) { buildChatFavoritesPage(body); body.dataset.ccBuilt = '1'; }
+  if (restore) {
+    body.scrollTop = chatCenterState.favorites.scrollTop || 0;
+    return;
+  }
+  chatCenterState.favorites.results = [];
+  chatCenterState.favorites.nextCursor = null;
+  runChatFavorites(true);
+}
+
+function buildChatFavoritesPage(body) {
+  body.innerHTML = `
+    <p class="muted">这里只收聊天里的消息，与记忆收藏分开管理；保存为记忆要手动点，不会自动建。</p>
+    <div id="cc-fav-results"></div>
+    <p class="muted hidden" id="cc-fav-empty">还没有收藏的消息，在聊天里长按消息收藏后，这里会列出来。</p>
+    <button id="cc-fav-more" class="cc-load-more hidden">加载更多</button>`;
+  const st = chatCenterState.favorites;
+  body.querySelector('#cc-fav-results')?.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-cc-act]');
+    if (!btn?.dataset.id) return;
+    const id = btn.dataset.id;
+    if (btn.dataset.ccAct === 'view') {
+      st.scrollTop = body.scrollTop;
+      jumpToMessage(id, { returnTo: 'favorites' });
+    } else if (btn.dataset.ccAct === 'unfav') {
+      await unfavoriteMessage(backend, id);
+      toast('已取消收藏');
+      runChatFavorites(true); // 即时重查列表，不用刷新页面
+    } else if (btn.dataset.ccAct === 'save-memory') {
+      const msg = await backend.get('messages', id);
+      if (!msg) { toast('消息已不存在'); return; }
+      const journal = await saveMessageAsMemory(backend, char.id, msg, getMessageText);
+      await attachJournals(char);
+      scheduleReindexDocument(journal);
+      toast('已保存为记忆');
+    }
+  });
+  body.querySelector('#cc-fav-more')?.addEventListener('click', () => runChatFavorites(false));
+}
+
+async function runChatFavorites(reset) {
+  if (!char?.id) return;
+  const st = chatCenterState.favorites;
+  if (reset) { st.results = []; st.nextCursor = null; }
+  try {
+    const { results, nextCursor } = await listFavoriteMessages(backend, char.id, {
+      limit: FAVORITES_PAGE_SIZE, cursor: reset ? null : st.nextCursor,
+    });
+    st.results = reset ? (results || []) : [...st.results, ...(results || [])];
+    st.nextCursor = nextCursor ?? null;
+    renderChatFavorites();
+  } catch (err) {
+    console.warn('收藏加载失败：', err);
+    toast('收藏加载失败，请重试');
+  }
+}
+
+function renderChatFavorites() {
+  const st = chatCenterState.favorites;
+  const { myName, charName } = chatCenterNames();
+  const box = $('#cc-fav-results');
+  if (box) box.innerHTML = st.results.map((r) => favoriteItemHTML(r, myName, charName)).join('');
+  $('#cc-fav-empty')?.classList.toggle('hidden', st.results.length > 0);
+  $('#cc-fav-more')?.classList.toggle('hidden', !st.nextCursor);
+}
+
+/* ---- 按日期查看页 ---- */
+function openChatDates({ restore = false } = {}) {
+  const body = ManageView.openSubpage('chat-dates');
+  if (!body) return;
+  if (!body.dataset.ccBuilt) { buildChatDatesPage(body); body.dataset.ccBuilt = '1'; }
+  if (restore) {
+    body.scrollTop = chatCenterState.dates.scrollTop || 0;
+    return;
+  }
+  runChatDates();
+}
+
+function buildChatDatesPage(body) {
+  body.innerHTML = `
+    <div class="cc-month-nav"><button id="cc-dates-prev" aria-label="上个月">‹</button><span id="cc-dates-title"></span><button id="cc-dates-next" aria-label="下个月">›</button></div>
+    <div id="cc-dates-cal"></div>
+    <p class="muted">只显示有聊天记录的日期；点日期跳到当天第一条消息，之后在聊天页按时间顺序浏览。</p>
+    <button id="cc-dates-latest" class="cc-load-more">回到最新消息</button>`;
+  const st = chatCenterState.dates;
+  body.querySelector('#cc-dates-prev')?.addEventListener('click', () => {
+    const n = shiftMonth(st.year, st.month, -1);
+    st.year = n.year; st.month = n.month;
+    renderChatDates();
+  });
+  body.querySelector('#cc-dates-next')?.addEventListener('click', () => {
+    const n = shiftMonth(st.year, st.month, 1);
+    st.year = n.year; st.month = n.month;
+    renderChatDates();
+  });
+  body.querySelector('#cc-dates-cal')?.addEventListener('click', async (e) => {
+    const day = e.target.closest('[data-date]');
+    if (!day) return;
+    st.scrollTop = body.scrollTop;
+    await jumpToChatDate(day.dataset.date);
+  });
+  body.querySelector('#cc-dates-latest')?.addEventListener('click', () => {
+    ManageView.closeSubpage();
+    hideJumpReturnBar();
+    chatCenterState.jumpReturn = null;
+    messageArea.scrollTop = messageArea.scrollHeight;
+  });
+}
+
+async function runChatDates() {
+  if (!char?.id) return;
+  try {
+    const dates = await getChatDates(backend, char.id);
+    const st = chatCenterState.dates;
+    st.dates = dates || [];
+    // 默认打开最近有记录的月份；没有记录时留在当月。
+    const latest = st.dates[st.dates.length - 1];
+    if (latest) {
+      const [y, m] = latest.split('-').map(Number);
+      st.year = y; st.month = m - 1;
+    }
+    renderChatDates();
+  } catch (err) {
+    console.warn('日期加载失败：', err);
+    toast('日期加载失败，请重试');
+  }
+}
+
+function renderChatDates() {
+  const st = chatCenterState.dates;
+  const box = $('#cc-dates-cal');
+  if (box) box.innerHTML = calendarMonthHTML(buildCalendarMonth(st.year, st.month, new Set(st.dates)));
+  const title = $('#cc-dates-title');
+  if (title) title.textContent = `${st.year}年${st.month + 1}月`;
+}
+
+/** 点日期 → 定位到当天第一条消息（dayBounds 校验当天范围；
+ *  注意 messagesForDay 第一页取的是当天最新的 limit 条，所以首条要
+ *  翻到最旧一页才取得到，见 findFirstMessageOfDay）。 */
+async function jumpToChatDate(dateStr) {
+  if (!char?.id) return;
+  const bounds = dayBounds(dateStr);
+  const first = await findFirstMessageOfDay(messagesForDay, backend, char.id, dateStr);
+  if (!first || first.timestamp < bounds.start || first.timestamp > bounds.end) { toast('这一天没有消息'); return; }
+  await jumpToMessage(first.id, { returnTo: 'dates' });
 }
 
 function startQuote(msg) {
   const plain = extractProtocolText(messageText(msg)) || msg.content;
-  currentQuote = { messageId: msg.id, senderId: msg.role === 'user' ? 'user_me' : 'assistant', content: plain.slice(0, 120) };
-  $('#quote-text').textContent = `引用：${currentQuote.content}`;
+  currentQuote = { messageId: msg.id, senderId: msg.role === 'user' ? 'user_me' : 'assistant', content: plain, senderName: msg.role === 'user' ? char.myName : (char.remarkName || char.realName) };
+  $('#quote-text').textContent = currentQuote.content;
+  $('#quote-sender').textContent = currentQuote.senderName || '';
+  $('#quote-bar').dataset.sender = msg.role;
+  $('#view-chat').classList.add('is-replying');
   $('#quote-bar').classList.remove('hidden');
   inputEl.focus();
 }
 function clearQuote() {
   currentQuote = null;
+  $('#view-chat').classList.remove('is-replying');
   $('#quote-bar').classList.add('hidden');
 }
 
@@ -4455,6 +13831,34 @@ function startEditMessage(msg) {
   setTimeout(() => $('#edit-text')?.focus(), 50);
 }
 
+/**
+ * 来源消息被删/撤回 → 对应经历标记失效（第 2 波）。
+ * 只检查 quotes/sourceMessageIds 的来源；经历记录本身不删，只标 invalid，
+ * 并清掉它的两路索引（失效内容不能继续召回）。无原文出处的旧总结本来就
+ * 没有来源可失效，不受影响。返回被标失效的经历数。
+ */
+async function invalidateExperiencesForSourceMessage(messageId) {
+  if (!messageId || !char?.id) return 0;
+  let n = 0;
+  try {
+    const exps = await getExperiencesForChar(backend, char.id);
+    for (const e of exps) {
+      if (!isExperienceValid(e)) continue;
+      const ids = new Set([
+        ...(e.sourceMessageIds || []),
+        ...(e.quotes || []).map((q) => q.messageId),
+      ]);
+      if (!ids.has(messageId)) continue;
+      await markExperienceInvalid(backend, e.id);
+      await deleteDocumentIndexes(backend, e.id);
+      n++;
+    }
+  } catch (err) {
+    console.warn('经历失效标记失败：', err);
+  }
+  return n;
+}
+
 async function withdrawMessage(msg) {
   const clean = extractProtocolText(messageText(msg)) || msg.content;
   msg.isWithdrawn = true;
@@ -4463,6 +13867,7 @@ async function withdrawMessage(msg) {
   msg.content = `[${name} 撤回了一条消息：${clean}]`;
   msg.parts = [{ type: 'text', text: msg.content }];
   await backend.put('messages', msg);
+  await invalidateExperiencesForSourceMessage(msg.id);
   await renderMessages(false);
   toast('消息已撤回');
 }
@@ -4472,7 +13877,14 @@ function autoGrow() {
   inputEl.style.height = 'auto';
   inputEl.style.height = Math.min(120, inputEl.scrollHeight) + 'px';
 }
-inputEl.addEventListener('input', () => { autoGrow(); $('#composer').classList.toggle('has-text', !!inputEl.value.trim()); });
+inputEl.addEventListener('input', () => {
+  autoGrow();
+  $('#composer').classList.toggle('has-text', !!inputEl.value.trim());
+  // B 组：输入框有字 = 用户正在发言，唤醒回合让位；清空后恢复。
+  wakeEngine?.setUserTyping(!!inputEl.value.trim());
+  // 草稿按角色保存（chatDaily.js，300ms 防抖；切页/发送前 flush 落盘）。
+  draftSaver?.schedule(inputEl.value);
+});
 inputEl.addEventListener('keydown', (e) => {
   // 回车发送（手机与桌面一致；Shift+回车换行）。
   // 之前只在非触屏设备上回车发送，iPhone 上回车只换行，又没有别的发送入口，
@@ -4491,20 +13903,78 @@ async function sendCurrent() {
   inputEl.value = '';
   autoGrow();
   $('#composer').classList.remove('has-text');
+  // 发出去就清草稿（已落盘的也清；未落盘的丢弃）。
+  draftSaver?.cancel();
+  clearDraft(localStorage, char.id);
   await sendUserText(text);
   if (localStorage.getItem('uwu-chat.autoReply') === '1') await getReply();
 }
 $('#send-btn').addEventListener('click', sendCurrent);
 $('#get-reply-btn').addEventListener('click', getReply);
 $('#quote-cancel').addEventListener('click', clearQuote);
+$('#reply-preview-scrim').addEventListener('click', clearQuote);
+$('#quote-return-btn').addEventListener('click', () => {
+  if (chatCenterState.jumpReturn?.from === 'quote') returnFromJump();
+  else returnToQuoteMessage();
+});
+$('#quote-latest-btn').addEventListener('click', async () => {
+  hideJumpReturnBar();
+  chatCenterState.jumpReturn = null;
+  chatCenterState.quote = null;
+  await renderMessages(false);
+  messageArea.scrollTop = messageArea.scrollHeight;
+  hideNewMessagesPill();
+});
 $('#auto-reply-toggle').addEventListener('change', (e) => {
   localStorage.setItem('uwu-chat.autoReply', e.target.checked ? '1' : '0');
 });
-// 状态栏弹窗的三个入口：顶栏昵称标题、心形、状态条——都打开同一个弹窗
+// 状态栏弹窗的入口：顶栏头像与昵称胶囊（心形按钮已并入这里）——都打开同一个弹窗
 $('#top-info-btn').addEventListener('click', openStatusPopup);
-$('#status-btn').addEventListener('click', openStatusPopup);
+$('#char-avatar-btn').addEventListener('click', openStatusPopup);
 $('#status-strip').addEventListener('click', openStatusPopup);
-$('#chat-menu-btn').addEventListener('click', () => { openSettings('persona'); });
+// 顶栏返回：回到带 Tab 栏的主界面（上一次离开聊天页时所在的页，默认动态）
+$('#chat-back-btn').addEventListener('click', goBackFromChat);
+// 顶栏 ···：聊天设置（自动回复 / 状态模式 / 保存状态 / 多选 / 调试 / 各设置入口）
+$('#chat-menu-btn').addEventListener('click', openChatMenu);
+// 新消息 pill：点它拉到底并清计数
+$('#new-msg-pill').addEventListener('click', () => {
+  messageArea.scrollTop = messageArea.scrollHeight;
+  hideNewMessagesPill();
+});
+// 聊天记录中心返回条：点它回到跳过来的那一页；日期来源时另有“回到最新消息”
+$('#jump-return-btn').addEventListener('click', returnFromJump);
+$('#jump-latest-btn').addEventListener('click', () => {
+  hideJumpReturnBar();
+  chatCenterState.jumpReturn = null;
+  messageArea.scrollTop = messageArea.scrollHeight;
+});
+// 心声面板关闭
+$('#inner-voice-close').addEventListener('click', () => $('#inner-voice-panel').classList.add('hidden'));
+// Esc 关闭引用与状态弹窗、心声面板
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  clearQuote();
+  if (isStatusPopupOpen()) closeStatusPopup();
+  $('#inner-voice-panel')?.classList.add('hidden');
+  lpMenu?.close();
+});
+// 阅读位置：滚动停稳后按角色保存（距底偏移 + 最后可见消息 id），切页/刷新后还原
+let readPosTimer = null;
+messageArea.addEventListener('scroll', () => {
+  if (readPosTimer !== null) clearTimeout(readPosTimer);
+  readPosTimer = setTimeout(() => {
+    readPosTimer = null;
+    const lastWrap = messageArea.querySelector('.msg:last-child');
+    saveReadingPosition(localStorage, char?.id, {
+      lastVisibleMessageId: lastWrap?.dataset.id || null,
+      distanceFromBottom: distanceFromBottom(messageArea),
+    });
+    if (distanceFromBottom(messageArea) <= 48) hideNewMessagesPill();
+  }, 300);
+});
+// 切到后台/关闭页面前把未落盘的草稿 flush
+document.addEventListener('visibilitychange', () => { if (document.hidden) draftSaver?.flush(); });
+window.addEventListener('pagehide', () => draftSaver?.flush());
 
 /* ---------------- 自定义状态栏：沙箱 iframe 隔离渲染 ----------------
  *  模板 HTML 绝不直接 innerHTML 进主页面。它只活在 sandbox="allow-scripts"
@@ -4516,15 +13986,24 @@ let statusFrameHeightOk = false;
 let statusFrameTimer = null;
 
 window.addEventListener('message', (e) => {
-  if (!statusFrame || e.source !== statusFrame.contentWindow) return;
   const d = e.data || {};
   if (d.type === STATUS_HEIGHT_MSG && Number.isFinite(d.height)) {
+    // 聊天页 HTML 卡片：高度消息里带 frameId，按 id 路由到对应的 iframe。
+    if (d.frame) {
+      const f = document.querySelector(`iframe[data-chat-frame="${CSS.escape(String(d.frame))}"]`);
+      if (f && e.source === f.contentWindow) {
+        f.style.height = `${Math.max(24, Math.min(d.height, 6000))}px`;
+      }
+      return;
+    }
+    if (!statusFrame || e.source !== statusFrame.contentWindow) return;
     statusFrameHeightOk = true;
     clearTimeout(statusFrameTimer);
     // 只清“加载超时”的提示：模板脚本报错的提示要留着，别被随后到达的高度消息冲掉
     document.querySelector('#status-custom .status-error[data-kind="timeout"]')?.remove();
     statusFrame.style.height = `${Math.max(24, Math.min(d.height, 6000))}px`;
   } else if (d.type === STATUS_ERROR_MSG) {
+    if (!statusFrame || e.source !== statusFrame.contentWindow) return;
     showStatusFrameError(`状态栏模板运行出错：${String(d.message || '').slice(0, 60)}`, 'script');
   }
 });
@@ -4629,7 +14108,12 @@ function renderStatusPopup() {
     frame.setAttribute('sandbox', 'allow-scripts allow-popups');
     frame.setAttribute('scrolling', 'no');
     frame.style.height = '120px'; // 首条高度消息到达前的占位
-    frame.srcdoc = buildStatusDocument(entry.html, { marker: `regen ${Date.now()}` });
+    // 原版 UWU 只在渲染时做变量匹配（chat_render.js:981/984），提取时存的 HTML
+    // 里 {{char_remark}} 这类占位符还是字面量（备份导入的旧条目尤其如此）；
+    // 所以渲染前再对已存 HTML 做一次替换——新条目重复替换是空操作，旧条目、
+    // 改备注名后的条目也都能对上。注意不要把替换结果写回存储：写回去就把
+    // 占位符烤死了，以后改备注名不会再变。
+    frame.srcdoc = buildStatusDocument(substituteTemplateVars(entry.html, statusTemplateCtx(char)), { marker: `regen ${Date.now()}` });
     host.appendChild(frame);
     statusFrame = frame;
     statusFrameTimer = setTimeout(() => {
@@ -4771,31 +14255,120 @@ $('#file-input').addEventListener('change', async (e) => {
   catch (err) { toast('图片处理失败，请重试'); console.warn(err); }
 });
 
-async function renderStickerPicker() {
+// 表情包面板状态：分组筛选 + 搜索 + 分批渲染（每次追加一页）。
+let stickerPickerGroup = '全部';
+let stickerPickerQuery = '';
+let stickerPickerShown = STICKER_PAGE_SIZE;
+
+function stickerPickerFiltered() {
+  return filterStickers(stickers, { group: stickerPickerGroup, query: stickerPickerQuery });
+}
+
+/** 渲染分组 chips（按首次出现顺序；缺 group 的归入「未分类」）。 */
+function renderStickerChips() {
+  const wrap = $('#sticker-groups');
+  const groups = ['全部', ...stickerGroupsOf(stickers)];
+  wrap.innerHTML = '';
+  for (const g of groups) {
+    const chip = el('button', 'sticker-chip' + (g === stickerPickerGroup ? ' active' : ''));
+    chip.type = 'button';
+    chip.textContent = g === '全部' ? `全部（${stickers.length}）` : g;
+    chip.setAttribute('aria-pressed', String(g === stickerPickerGroup));
+    chip.onclick = () => { stickerPickerGroup = g; stickerPickerShown = STICKER_PAGE_SIZE; renderStickerGrid(); };
+    wrap.appendChild(chip);
+  }
+}
+
+function stickerCellFallback() {
+  return el('div', '', '<svg class="icon"><use href="#i-image"></use></svg>');
+}
+
+/** 只渲染当前批次的格子：img 用 loading="lazy"；attachment 异步解析时先放骨架。 */
+function renderStickerGrid() {
   const grid = $('#sticker-grid');
+  const list = stickerPickerFiltered();
+  const shown = list.slice(0, stickerPickerShown);
   grid.innerHTML = '';
-  $('#sticker-count').textContent = `共 ${stickers.length} 个`;
-  for (const st of stickers) {
+  $('#sticker-count').textContent = list.length === stickers.length
+    ? `共 ${stickers.length} 个`
+    : `已选 ${list.length} 个（共 ${stickers.length} 个）`;
+  const empty = $('#sticker-empty');
+  if (!stickers.length) {
+    empty.textContent = '还没有表情包，去管理 → 贴纸导入。';
+    empty.classList.remove('hidden');
+  } else if (!list.length) {
+    empty.textContent = '没有找到匹配的表情包，换个分组或关键词试试。';
+    empty.classList.remove('hidden');
+  } else {
+    empty.classList.add('hidden');
+  }
+  for (const st of shown) {
     const cell = el('button', 'sticker-cell');
-    let src = st.dataUrl || null;
-    if (!src && st.attachmentId) src = await attachmentDataURL(st.attachmentId);
-    if (src) { const img = el('img'); img.src = src; img.alt = st.name; cell.appendChild(img); }
-    else cell.appendChild(el('div', '', '<svg class="icon"><use href="#i-image"></use></svg>'));
-    cell.appendChild(el('div', 'nm', escapeHtml(`${st.name} · ${st.group || ''}`)));
+    cell.type = 'button';
+    const src = stickerImageSrc(st);
+    if (src?.kind === 'url') {
+      const img = el('img');
+      img.src = src.src; img.alt = st.name; img.loading = 'lazy'; img.decoding = 'async';
+      img.onerror = () => { img.replaceWith(stickerCellFallback()); };
+      cell.appendChild(img);
+    } else if (src?.kind === 'attachment') {
+      const skel = el('div', 'skel');
+      cell.appendChild(skel);
+      attachmentDataURL(src.id).then((url) => {
+        if (!cell.isConnected) return;
+        if (url) {
+          const img = el('img');
+          img.src = url; img.alt = st.name; img.loading = 'lazy'; img.decoding = 'async';
+          img.onerror = () => { img.replaceWith(stickerCellFallback()); };
+          skel.replaceWith(img);
+        } else skel.replaceWith(stickerCellFallback());
+      }).catch(() => { if (cell.isConnected) skel.replaceWith(stickerCellFallback()); });
+    } else {
+      cell.appendChild(stickerCellFallback());
+    }
+    cell.appendChild(el('div', 'nm', escapeHtml(`${st.name} · ${stickerGroupOf(st)}`)));
     cell.onclick = async () => {
       closeSheet('#sticker-sheet');
-      const content = `[${char.myName}的表情包：${st.name}]`;
+      const content = `[${char.myName}发送的表情包：${st.name}]`;
       const m = { id: uid('msg'), charId: char.id, role: 'user', content, parts: [{ type: 'text', text: content }], timestamp: nextTs(), stickerName: st.name };
       await backend.put('messages', m);
       await appendMessageElement(m);
     };
     grid.appendChild(cell);
   }
-  if (!stickers.length) grid.innerHTML = '<p class="muted">还没有表情包，去管理 → 贴纸导入。</p>';
+  const more = $('#sticker-more');
+  const hasMore = list.length > stickerPickerShown;
+  more.classList.toggle('hidden', !hasMore);
+  more.textContent = hasMore ? `加载更多（已显示 ${shown.length} / ${list.length}）` : '';
+}
+
+async function renderStickerPicker() {
+  stickerPickerGroup = '全部';
+  stickerPickerQuery = '';
+  stickerPickerShown = STICKER_PAGE_SIZE;
+  const search = $('#sticker-search');
+  search.value = '';
+  search.oninput = () => { stickerPickerQuery = search.value; stickerPickerShown = STICKER_PAGE_SIZE; renderStickerGrid(); };
+  $('#sticker-more').onclick = () => {
+    stickerPickerShown += STICKER_PAGE_SIZE;
+    renderStickerGrid();
+  };
+  // 滚动到底部自动续一页（赋值而非 addEventListener，避免重复打开叠加监听）。
+  $('#sticker-sheet .sheet-card').onscroll = (e) => {
+    const card = e.currentTarget;
+    if (card.scrollTop + card.clientHeight >= card.scrollHeight - 160) {
+      if (stickerPickerFiltered().length > stickerPickerShown) {
+        stickerPickerShown += STICKER_PAGE_SIZE;
+        renderStickerGrid();
+      }
+    }
+  };
+  renderStickerChips();
+  renderStickerGrid();
 }
 
 /* ---------------- 设置面板 ---------------- */
-const TABS = ['persona', 'prompt', 'worldbook', 'memory', 'stickers', 'api', 'data'];
+const TABS = ['persona', 'prompt', 'worldbook', 'memory', 'stickers', 'api', 'data', 'notify'];
 let settingsTab = 'persona';
 let settingsContainer = null; // 当前打开的二级页 .sub-body（管理页用二级页，不再用 #settings 浮层）
 
@@ -4810,6 +14383,200 @@ function field(label, inner, hint) {
 }
 function esc(v) { return escapeHtml(String(v ?? '')); }
 function inputVal(id) { return document.getElementById(id)?.value ?? ''; }
+
+/** 记忆页一条 journal 的 HTML（阶段总结 / 固定记忆两处共用）。 */
+function journalItemHTML(j) {
+  const sourced = sourceStatusOfJournal(j);
+  return `
+        <div class="list-item">
+          <strong>${esc(j.title || '未命名')}</strong>
+          ${j.isSummary ? '<span class="badge">总结</span>' : ''}
+          <span class="badge">${j.isFavorited ? '★ 已收藏 · 固定注入' : '未收藏'}</span>
+          <span class="badge">${j.retrievalEnabled === false ? '不参与检索' : '参与检索'}</span>
+          ${j.isSummary && sourced === 'unsourced' ? '<span class="badge">无原文出处·不可引用</span>' : ''}
+          <div class="sub">${esc((j.content || '').slice(0, 160))}</div>
+          <div class="hint">来源：${esc(j.source || '手动记录')}${j.range?.rounds ? ` · 覆盖 ${esc(String(j.range.rounds))} 轮` : ''}${j.isSummary && sourced === 'sourced' ? ` · 来源消息 ${j.sourceMessageIds.length} 条` : ''} · ${esc(j.timestamp ? formatTimeDivider(j.timestamp) : '')} · <span data-vec-for="${esc(j.id)}">索引状态读取中…</span></div>
+          <div class="actions-row">
+            <button data-mem-fav="${j.id}">${j.isFavorited ? '取消收藏' : '收藏'}</button>
+            <button data-mem-retrieval="${j.id}">${j.retrievalEnabled === false ? '设为参与检索' : '设为不参与检索'}</button>
+            <button data-mem-edit="${j.id}">编辑</button>
+            <button data-mem-del="${j.id}">${j.isSummary ? '删除总结' : '删除'}</button>
+          </div>
+        </div>`;
+}
+
+/** 记忆页一条经历的 HTML（经历记忆列表用）。receipt 是这件经历的最近一条
+ * 联想回执（没有为 null）：记忆页至少能看到每件经历的最近回执状态。 */
+function experienceItemHTML(e, receipt = null) {
+  const label = planOutcomeLabel(e);
+  const clueCount = (e.clues || []).filter((c) => c && c.evidenceVersion === (e.version || 1)).length;
+  return `
+        <div class="list-item">
+          <strong>${esc(e.title || '未命名经历')}</strong>
+          ${label ? `<span class="badge">${esc(label)}</span>` : ''}
+          ${!isExperienceValid(e) ? '<span class="badge">已失效 · 来源被删/撤回</span>' : ''}
+          <span class="badge">${e.retrievalEnabled === false ? '不参与检索' : '参与检索'}</span>
+          <div class="sub">${esc((e.summary || '').slice(0, 160))}</div>
+          <div class="hint">关键原话 ${e.quotes?.length || 0} 条 · 来源消息 ${e.sourceMessageIds?.length || 0} 条${e.range?.rounds ? ` · 覆盖 ${esc(String(e.range.rounds))} 轮` : ''} · ${esc(e.timestamp ? formatTimeDivider(e.timestamp) : '')} · v${e.version || 1}</div>
+          <div class="hint">联想线索 ${clueCount} 条${e.lastMentionedRoundSeq != null ? ` · 上次提及第 ${esc(String(e.lastMentionedRoundSeq))} 轮` : ''} · ${esc(receiptStatusText(receipt))}</div>
+          <div class="actions-row">
+            <button data-exp-view="${e.id}">查看</button>
+            <button data-exp-edit="${e.id}">编辑</button>
+            <button data-exp-del="${e.id}">删除</button>
+          </div>
+        </div>`;
+}
+
+/** 查看一条经历：标题 / 关键细节 / 状态 / 关键原话与来源消息。receipt 是
+ * 这件经历的最近一条联想回执（没有为 null）。 */
+function openExperienceViewer(e, receipt = null) {
+  const label = planOutcomeLabel(e);
+  const quotes = (e.quotes || []).map((q) => `<p>「${esc(q.text)}」<span class="muted"> —— ${esc(q.speaker || '—')}（消息 ${esc(q.messageId)}）</span></p>`).join('')
+    || '<p class="muted">没有关键原话。</p>';
+  const clues = (e.clues || []).filter((c) => c && c.evidenceVersion === (e.version || 1));
+  const clueLines = clues.map((c) => `<p>· ${esc(c.text)} <span class="muted">（${esc({ context: '当时处境', quote: '特殊原话', future: '未来可能怎样问', unfinished: '未完成事项' }[c.kind] || c.kind)} · 原文「${esc(c.excerpt)}」）</span></p>`).join('')
+    || '<p class="muted">还没有联想线索（提取或编辑后由副 API 生成；未配置副 API 时不生成）。</p>';
+  showModal(e.title || '未命名经历', `
+    <p>${esc(e.summary || '')}</p>
+    <p class="muted">状态：${esc(label || '未标注')}${!isExperienceValid(e) ? ' · 已失效（来源被删/撤回，不进检索）' : ''} · 版本 v${e.version || 1}</p>
+    <p class="muted">来源消息 ${e.sourceMessageIds?.length || 0} 条${e.range?.rounds ? ` · 覆盖 ${e.range.rounds} 轮` : ''}</p>
+    <p class="muted">${esc(receiptStatusText(receipt))}${e.lastMentionedRoundSeq != null ? ` · 上次提及第 ${esc(String(e.lastMentionedRoundSeq))} 轮` : ''}</p>
+    <h3>关键原话（${e.quotes?.length || 0} 条）</h3>
+    ${quotes}
+    <h3>联想线索（${clues.length} 条）</h3>
+    ${clueLines}`, [{ label: '关闭' }]);
+}
+
+/** 编辑一条经历：标题 / 关键细节 / 计划状态 / 删原话；保存时版本 +1。 */
+function openExperienceEditor(e) {
+  let quotes = [...(e.quotes || [])];
+  const planOptions = [
+    ['none', '无计划含义'], ['planned', '计划'], ['completed', '已完成'],
+    ['cancelled', '已取消'], ['hypothetical', '假设剧情'],
+    ['setting', '角色设定'], ['paraphrase', '转述'],
+  ].map(([v, l]) => `<option value="${v}" ${e.plan_state === v ? 'selected' : ''}>${l}</option>`).join('');
+  const renderQuotes = () => {
+    const box = document.getElementById('exp-edit-quotes');
+    if (!box) return;
+    box.innerHTML = quotes.map((q, i) => `
+    <div class="list-item"><div class="sub">「${esc(q.text)}」</div>
+    <div class="hint">${esc(q.speaker || '—')} · 消息 ${esc(q.messageId)}</div>
+    <div class="actions-row"><button data-exp-quote-del="${i}">删除这句原话</button></div></div>`).join('')
+      || '<p class="muted">没有关键原话。</p>';
+  };
+  showModal('编辑经历', `
+    ${field('标题', `<input type="text" id="exp-edit-title" value="${esc(e.title || '')}">`)}
+    ${field('关键细节', `<textarea id="exp-edit-summary" rows="4">${esc(e.summary || '')}</textarea>`)}
+    ${field('计划状态', `<select id="exp-edit-plan">${planOptions}</select>`, '结果状态（已完成 / 已取消 / 已改期）只能由后续聊天原文佐证后填，不在这里改。')}
+    <h3>关键原话（${quotes.length} 条）</h3>
+    <div id="exp-edit-quotes"></div>
+    <p class="muted">原话来自聊天原文，带来源消息 ID；保存后版本 +1。至少保留一句原话。</p>`,
+  [
+    {
+      label: '保存', primary: true, onClick: async () => {
+        try {
+          const saved = await updateExperience(backend, e.id, {
+            title: inputVal('exp-edit-title'),
+            summary: inputVal('exp-edit-summary'),
+            plan_state: inputVal('exp-edit-plan'),
+            quotes,
+          });
+          // 经历编辑后同步两路索引（关键词重建该条 + 向量按 hash 复用或重算），
+          // 并按新版本重新生成联想线索（旧线索的 evidenceVersion 已过期）。
+          if (saved) scheduleReindexDocument(saved);
+          if (saved) scheduleClueGeneration(saved);
+          renderSettingsBody();
+          toast('经历已保存（版本 +1）');
+        } catch (err) {
+          toast(err.message || '保存失败');
+        }
+      },
+    },
+    { label: '取消' },
+  ]);
+  renderQuotes();
+  document.getElementById('exp-edit-quotes')?.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-exp-quote-del]');
+    if (!btn) return;
+    if (quotes.length <= 1) { toast('至少保留一句原话'); return; }
+    quotes.splice(Number(btn.dataset.expQuoteDel), 1);
+    renderQuotes();
+  });
+}
+
+// 副 API 配置区（记忆总结 / 向量 Embedding 共用一套结构，各自独立存取）。
+function auxApiSectionHTML(kind, cfg, title, hint) {
+  const p = `aux-${kind}`;
+  const pending = cfg._pending;
+  return `
+      <h3>${title}</h3>
+      ${pending ? `<div class="notice">从备份导入的设置已保存但未自动应用：${esc([pending.url, pending.model].filter(Boolean).join(' · ') || '（空）')}。Key 需单独填写，确认后点「应用导入的设置」。</div>` : ''}
+      <p class="muted">${hint}</p>
+      ${field('服务商', `<select id="${p}-provider"><option value="openai" ${cfg.provider === 'openai' ? 'selected' : ''}>OpenAI 兼容</option><option value="gemini" ${cfg.provider === 'gemini' ? 'selected' : ''}>Gemini 原生</option></select>`, 'Gemini 原生走独立分支，不会把 OpenAI 格式发到 Gemini 接口。')}
+      ${field('API 地址（Base URL）', `<input type="text" id="${p}-url" value="${esc(cfg.url || '')}" placeholder="https://api.openai.com/v1">`, '填完整地址；以 /v1 结尾的地址不会被重复拼接。')}
+      ${field('API Key', `<input type="password" id="${p}-key" value="${esc(cfg.key || '')}" placeholder="sk-…">`, '只存在本机，默认不进备份、不进日志。')}
+      ${field('模型', `<input type="text" id="${p}-model" value="${esc(cfg.model || '')}" placeholder="${kind === 'embedding' ? 'text-embedding-3-small' : 'gpt-4o-mini'}">`, '拉取失败时也可以手动填写。')}
+      ${field('搜索模型', `<input type="text" id="${p}-search" placeholder="输入关键字，过滤已拉取的模型">`)}
+      <div class="field"><label>已拉取的模型</label><select id="${p}-models"><option value="">（先点「拉取模型」）</option></select><div class="hint">点一个模型就会填进上面的模型框。</div></div>
+      <div class="actions-row">
+        <button class="primary" id="${p}-save">保存</button>
+        <button id="${p}-fetch">拉取模型</button>
+        <button id="${p}-test">测试连接</button>
+      </div>
+      <div id="${p}-result"></div>`;
+}
+
+// 已拉取的模型列表（只放当前会话，不进备份）。
+const auxModels = { summary: [], embedding: [] };
+function bindAuxApiSection(kind) {
+  const p = `aux-${kind}`;
+  const isSummary = kind === 'summary';
+  const getCfg = () => (isSummary ? summaryApi : embeddingApi);
+  const readForm = () => ({
+    provider: inputVal(`${p}-provider`) || 'openai',
+    url: inputVal(`${p}-url`).trim(),
+    key: inputVal(`${p}-key`).trim(),
+    model: inputVal(`${p}-model`).trim(),
+  });
+  const renderModelOptions = () => {
+    const q = (inputVal(`${p}-search`) || '').trim().toLowerCase();
+    const list = (auxModels[kind] || []).filter((m) => !q || m.toLowerCase().includes(q));
+    const sel = document.getElementById(`${p}-models`);
+    if (!sel) return;
+    sel.innerHTML = list.length
+      ? list.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('')
+      : '<option value="">（没有匹配的模型）</option>';
+  };
+  document.getElementById(`${p}-search`)?.addEventListener('input', renderModelOptions);
+  document.getElementById(`${p}-models`)?.addEventListener('change', (e) => {
+    const v = e.target.value;
+    if (v) document.getElementById(`${p}-model`).value = v;
+  });
+  document.getElementById(`${p}-save`)?.addEventListener('click', async () => {
+    const cfg = { ...getCfg(), ...readForm(), _pending: undefined };
+    if (isSummary) { summaryApi = cfg; await saveSummaryApi(); }
+    else { embeddingApi = cfg; await saveEmbeddingApi(); }
+    toast('已保存');
+  });
+  document.getElementById(`${p}-fetch`)?.addEventListener('click', async () => {
+    const box = document.getElementById(`${p}-result`);
+    box.innerHTML = '<p class="muted">正在拉取模型列表…</p>';
+    const res = await fetchModels(readForm());
+    auxModels[kind] = res.models || [];
+    renderModelOptions();
+    box.innerHTML = res.ok
+      ? `<p style="color:#2e7d4f">${esc(res.message || '')}</p>`
+      : `<p style="color:#b0442f">${esc(res.message || '')}</p><p class="muted">拉取失败不影响手动填写模型。</p>`;
+  });
+  document.getElementById(`${p}-test`)?.addEventListener('click', async () => {
+    const box = document.getElementById(`${p}-result`);
+    box.innerHTML = '<p class="muted">正在测试连接…</p>';
+    const res = isSummary ? await testSummaryApi(readForm()) : await testEmbeddingApi(readForm());
+    box.innerHTML = res.ok
+      ? `<p style="color:#2e7d4f">${esc(res.message || '连接成功')}</p>`
+      : `<p style="color:#b0442f">${esc(res.message || '连接失败')}</p>`;
+  });
+}
 function readCharForm() {
   char.realName = inputVal('f-realName') || char.realName;
   char.remarkName = inputVal('f-remarkName') || char.remarkName;
@@ -4824,6 +14591,9 @@ function readCharForm() {
   char.bilingualModeEnabled = document.getElementById('f-bilingual')?.checked ?? char.bilingualModeEnabled;
   char.stickerGroups = inputVal('f-stickerGroups');
   char.useRealGallery = document.getElementById('f-useGallery')?.checked ?? false;
+  // 状态三模式（statusMode.js）：只改选择字段，模板与历史原样保留。
+  char.statusMode = normalizeStatusMode(inputVal('f-status-mode'));
+  char.innerVoicePrompt = inputVal('f-inner-voice-prompt');
   char.statusPanel = {
     ...(char.statusPanel || {}),
     enabled: document.getElementById('f-sp-enabled')?.checked ?? false,
@@ -4832,6 +14602,56 @@ function readCharForm() {
     replacePattern: inputVal('f-sp-replace'),
     historyLimit: Math.max(0, parseInt(inputVal('f-sp-history') || '3', 10)),
   };
+}
+
+/** B 组：当前图标源图（内存里，未进 settings；导出图标包时用）。 */
+let customIconSourceImage = null;
+
+/** 把 data URL / 图片地址解码成 Image（供图标导出复用已存的小图）。 */
+function loadIconImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('图标图片解码失败'));
+    img.src = src;
+  });
+}
+
+/**
+ * B 组：图标文件选择回调。validateIconFile → 读图 → computeCropRect /
+ * previewSpecs 画三档预览 → 180px 压缩 data URL 存 customIconSettings.dataUrl。
+ */
+async function handleIconFileChange(file) {
+  const check = validateIconFile(file);
+  if (!check.ok) throw new Error(check.reason);
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('读取图标图片失败'));
+    reader.readAsDataURL(file);
+  });
+  const img = await loadIconImage(dataUrl);
+  customIconSourceImage = img;
+  const box = document.getElementById('icon-preview');
+  if (box) {
+    box.innerHTML = '';
+    for (const spec of previewSpecs(img)) {
+      const c = document.createElement('canvas');
+      const show = Math.min(72, spec.size);
+      c.width = show; c.height = show;
+      c.title = `${spec.size}×${spec.size}`;
+      c.getContext('2d').drawImage(img, spec.crop.x, spec.crop.y, spec.crop.size, spec.crop.size, 0, 0, show, show);
+      box.appendChild(c);
+    }
+  }
+  // 只存 180px 压缩小图到 settings，大图不进存储，避免撑爆 IndexedDB。
+  const small = document.createElement('canvas');
+  small.width = 180; small.height = 180;
+  const crop = computeCropRect(img.width, img.height);
+  small.getContext('2d').drawImage(img, crop.x, crop.y, crop.size, crop.size, 0, 0, 180, 180);
+  customIconSettings = { ...customIconSettings, dataUrl: small.toDataURL('image/png') };
+  await saveCustomIconSettings();
+  toast('图标图片已读入（预览为居中正方形裁切）');
 }
 
 function renderSettingsBody() {
@@ -4850,11 +14670,14 @@ function renderSettingsBody() {
       ${field('提示词版本', `<select id="f-promptVersion"><option value="">跟随全局</option><option value="tt" ${char.exclusivePromptVersion === 'tt' ? 'selected' : ''}>TT</option><option value="uwu" ${char.exclusivePromptVersion === 'uwu' ? 'selected' : ''}>UWU 默认</option></select>`, `当前生效：${esc(resolvePromptVersion(char, globalSettings))}（角色未指定专属版本时跟随全局 cotSettings.promptVersion）。`)}
       ${field('每次回复气泡数（最小 - 最大）', `<div class="row"><input type="number" id="f-replyMin" min="1" max="20" value="${char.replyCountMin ?? 3}"> <input type="number" id="f-replyMax" min="1" max="20" value="${char.replyCountMax ?? 8}"></div>`, 'TT 模板用的是这组数值（备份里的 3–8），不是默认的 1–6。')}
       ${field('上下文最大消息数（maxMemory）', `<input type="number" id="f-maxMemory" min="1" max="300" value="${esc(char.maxMemory ?? '80')}">`, '备份里是字符串 "80"，已按数字解析。')}
-      ${field('双语模式', `<label class="check"><input type="checkbox" id="f-bilingual" ${char.bilingualModeEnabled ? 'checked' : ''}> 开启（原文 + 译文分开显示）</label>`)}
+      ${field('双语模式', `<div class="setting-row"><span class="setting-label">开启<small>原文 + 译文分开显示</small></span><label class="switch"><input type="checkbox" id="f-bilingual" ${char.bilingualModeEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div>`)}
       ${field('可用表情包分组（逗号分隔）', `<input type="text" id="f-stickerGroups" value="${esc(char.stickerGroups || '')}">`)}
-      ${field('照片库', `<label class="check"><input type="checkbox" id="f-useGallery" ${char.useRealGallery ? 'checked' : ''}> 使用真实照片库（角色照片/视频描述里按名称匹配）</label>`)}
+      ${field('照片库', `<div class="setting-row"><span class="setting-label">使用真实照片库<small>角色照片/视频描述里按名称匹配</small></span><label class="switch"><input type="checkbox" id="f-useGallery" ${char.useRealGallery ? 'checked' : ''}><span class="switch-track"></span></label></div>`)}
+      <h3>状态模式（按角色保存）</h3>
+      ${field('状态模式', `<select id="f-status-mode">${Object.entries(STATUS_MODE_LABELS).map(([v, label]) => `<option value="${v}" ${getStatusMode(char) === v ? 'selected' : ''}>${label}</option>`).join('')}</select>`, '简洁（默认）：不注入状态指令；心声：生成 [inner_voice] 独白；HTML 状态栏：沿用下面这套状态模板。切换不删除模板与历史。')}
+      ${field('心声提示词', `<textarea id="f-inner-voice-prompt" rows="3" placeholder="${esc(DEFAULT_INNER_VOICE_PROMPT)}">${esc(char.innerVoicePrompt || '')}</textarea>`, '仅心声模式使用；留空则用默认提示词。')}
       <h3>用户自定义状态栏</h3>
-      ${field('启用', `<label class="check"><input type="checkbox" id="f-sp-enabled" ${sp.enabled ? 'checked' : ''}> 启用状态栏正则</label>`)}
+      ${field('启用', `<div class="setting-row"><span class="setting-label">启用状态栏正则</span><label class="switch"><input type="checkbox" id="f-sp-enabled" ${sp.enabled ? 'checked' : ''}><span class="switch-track"></span></label></div>`)}
       ${field('promptSuffix', `<input type="text" id="f-sp-suffix" value="${esc(sp.promptSuffix || '')}">`)}
       ${field('regexPattern', `<textarea id="f-sp-regex" rows="3" spellcheck="false">${esc(sp.regexPattern || '')}</textarea>`, '支持 /pattern/flags 与不带斜杠两种写法；多行正则也可以，未写 flags 时默认 gs。')}
       ${field('replacePattern', `<textarea id="f-sp-replace" rows="8" spellcheck="false">${esc(sp.replacePattern || '')}</textarea>`, '支持 $1、$2 占位；可写完整 HTML 模板（style / class / 动画等都会保留，在沙箱 iframe 里渲染，不影响聊天界面）。')}
@@ -4903,7 +14726,7 @@ function renderSettingsBody() {
       <p class="muted">绑定决定是否进入提示词；位置（limit_break / before / after / guidelines）与深度（depth）决定插入顺序。</p>
       <div id="wb-list">${worldBooks.map((wb) => `
         <div class="list-item">
-          <label class="check"><input type="checkbox" data-wb="${wb.id}" ${bound.has(wb.id) ? 'checked' : ''}> <strong>${esc(wb.title)}</strong> <span class="muted">${esc(wb.position || 'before')} · depth ${esc(String(wb.depth ?? 0))}</span></label>
+          <div class="setting-row"><span class="setting-label"><strong>${esc(wb.title)}</strong><small>${esc(wb.position || 'before')} · depth ${esc(String(wb.depth ?? 0))}</small></span><label class="switch"><input type="checkbox" data-wb="${wb.id}" ${bound.has(wb.id) ? 'checked' : ''}><span class="switch-track"></span></label></div>
           <div class="sub">${esc((wb.content || '').slice(0, 120))}</div>
           <div class="actions-row">
             <button data-wb-edit="${wb.id}">编辑</button>
@@ -4960,29 +14783,240 @@ function renderSettingsBody() {
 
   if (settingsTab === 'memory') {
     const journals = char.memoryJournals || [];
+    const summaries = journals.filter((j) => j.isSummary);
+    const favorites = journals.filter((j) => j.isFavorited);
     body.innerHTML = `
-      <p class="muted">向量检索尚未接入：下面是已保存的记忆摘要（收藏的才会进提示词）。</p>
-      <div id="mem-list">${journals.map((j) => `
-        <div class="list-item">
-          <strong>${esc(j.title || '未命名')}</strong>
-          <span class="badge">${j.isFavorited ? '★ 已收藏' : '未收藏'}</span>
-          <div class="sub">${esc((j.content || '').slice(0, 160))}</div>
-          <div class="hint">来源：${esc(j.source || '手动记录')} · ${esc(j.timestamp ? formatTimeDivider(j.timestamp) : '')}</div>
-          <div class="actions-row">
-            <button data-mem-fav="${j.id}">${j.isFavorited ? '取消收藏' : '收藏'}</button>
-            <button data-mem-edit="${j.id}">编辑</button>
-          </div>
-        </div>`).join('') || '<p class="muted">还没有记忆摘要。</p>'}</div>
+      <p class="muted">收藏的记忆会进提示词。记忆都可查看 / 编辑 / 删除；删除记忆会同时清理它的向量索引段，不影响原始聊天。</p>
+      <h3>聊天总结</h3>
+      <p class="muted">总结只读选定角色、指定范围的真实聊天，提取重要经历、关系变化、明确约定、稳定喜好、重要人物与未完成事项；不编造，不把猜测写成事实；状态、思考、HTML/状态栏模板代码、Base64 图片与系统提示词不进总结。总结走「记忆总结副 API」，未配置时不会偷用主 API。</p>
+      <div id="sum-progress"><p class="muted">正在统计已总结轮数…</p></div>
+      ${field('自动总结', `<div class="setting-row"><span class="setting-label">开启<small>默认关闭</small></span><label class="switch"><input type="checkbox" id="sum-auto" ${summarySettings.autoEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div>`, '开启后，每累计指定轮数就自动总结一次未总结的聊天。')}
+      ${field('每累计多少轮触发一次自动总结', `<input type="number" id="sum-every" min="1" max="500" value="${summarySettings.everyRounds || 30}">`, '一轮 = 一次用户发言 + 对应完整 AI 回复，多气泡同一轮只算一轮。')}
+      ${field('总结提示词（可编辑）', `<textarea id="sum-prompt" rows="6">${esc(summarySettings.prompt || DEFAULT_SUMMARY_PROMPT)}</textarea>`)}
+      ${field('总结长度', `<select id="sum-length"><option value="short" ${summarySettings.length === 'short' ? 'selected' : ''}>短（200 字以内）</option><option value="medium" ${summarySettings.length === 'medium' ? 'selected' : ''}>中（500 字以内）</option><option value="long" ${summarySettings.length === 'long' ? 'selected' : ''}>长（1000 字以内）</option></select>`)}
+      <div class="actions-row"><button class="primary" id="sum-save-settings">保存总结设置</button></div>
+      <h3>向量记忆</h3>
+      <p class="muted">先建立索引，聊天时才会按相关性召回记忆。只索引已有的导入记忆与手动记忆，其次是新生成的总结记忆；默认不把全部历史聊天上传给向量接口。索引只是可重建的缓存，不随备份导出。</p>
+      <div id="vec-status"><p class="muted">正在读取索引状态…</p></div>
+      <p class="muted" id="vec-progress">${vecProgressTextForCurrent(vectorIndexProgress)}</p>
+      ${field('向量记忆总开关', `<div class="setting-row"><span class="setting-label">开启<small>关闭后聊天不再做向量检索</small></span><label class="switch"><input type="checkbox" id="vec-enabled" ${vectorSettings.enabled ? 'checked' : ''}><span class="switch-track"></span></label></div>`)}
+      ${field('最多召回条数', `<input type="number" id="vec-topk" min="1" max="10" value="${vectorSettings.topK || 5}">`, '默认 5 条。')}
+      ${field('相似度阈值', `<input type="number" id="vec-threshold" min="0" max="1" step="0.01" value="${vectorSettings.threshold ?? 0.40}">`, '默认 0.40。默认值来自桩数据实测：近乎原文的查询（最新发言在查询文本里重复一次加权）相关组 0.436–0.664，不相关组经复核远低于阈值；换模型后建议用下面的「测试召回」校准：真实模型下的相似度分布与桩不同，阈值照搬可能召回太多或太少。')}
+      ${field('记忆 Token 预算', `<input type="number" id="vec-budget" min="0" max="8000" step="100" value="${vectorSettings.tokenBudget ?? 1500}">`, '召回记忆进请求的总 Token 估算上限，默认 1500，超出时按排名取，至少保留第一条。')}
+      <div class="actions-row">
+        <button class="primary" id="vec-save">保存向量设置</button>
+        <button id="vec-build">建立索引 / 补齐缺失</button>
+        <button id="vec-rebuild">重建索引</button>
+        <button id="vec-pause">暂停索引</button>
+      </div>
+      <h3>联想召回</h3>
+      <p class="muted">聊天时按线索联想起过去的经历：副模型从候选中严格选一个或空，不强行挑选；已提及的经历 6 轮内不再主动推荐（明确追问除外）。联想只走「记忆总结副 API」，未配置时静默不启用；选中的经历会按 use 注入请求（mention 表示回复里可顺口提到，understand 表示只作背景理解、不要主动提起），注入情况见「设置 → 上下文预览」。</p>
+      <div id="assoc-budget-status"><p class="muted">正在读取联想预算…</p></div>
+      ${field('联想召回总开关', `<div class="setting-row"><span class="setting-label">开启<small>关闭后聊天不再做联想选择</small></span><label class="switch"><input type="checkbox" id="assoc-enabled" ${assocSettings.enabled ? 'checked' : ''}><span class="switch-track"></span></label></div>`)}
+      ${field('每月联想预算（次）', `<input type="number" id="assoc-budget-limit" min="0" max="5000" value="">`, '默认 300 次/月，只统计联想选择与回执改述核验的副 API 调用；超预算跳过联想，不阻断聊天，下月自动恢复。')}
+      <div class="actions-row"><button class="primary" id="assoc-save">保存联想设置</button></div>
+      <h3>批量任务</h3>
+      <p class="muted">用户主动启动的分批任务：为全部历史提取经历、为旧经历补线索、重建关键词索引、重建向量索引。每个任务可暂停/恢复，进度保存在本机；页面关闭后任务不会在后台继续，回来会显示“已暂停/未完成”，点“继续”可接着做。任务不开机自动跑。</p>
+      <div id="memory-jobs"><p class="muted">正在读取任务…</p></div>
+      <div class="actions-row">
+        <button id="job-extract-all">为全部历史提取经历</button>
+        <button id="job-backfill-clues">为旧经历补线索</button>
+        <button id="job-rebuild-keyword">重建关键词索引</button>
+        <button id="job-rebuild-vector">重建向量索引</button>
+      </div>
+      <h3>测试召回</h3>
+      <p class="muted">输入一句话，看它会召回哪些记忆、相关度多少。显示前 5 名（不按阈值过滤），并标出每条是否达到当前阈值，方便校准阈值。</p>
+      ${field('测试句子', `<input type="text" id="vec-test-q" placeholder="例如：我们上次去海边约了什么">`)}
+      <div class="actions-row"><button class="primary" id="vec-test">测试召回</button></div>
+      <div id="vec-test-result"></div>
+      <h3>手动总结</h3>
+      ${field('消息范围', `<select id="sum-scope"><option value="recent">最近 N 轮</option><option value="unsummarized">全部未总结</option></select>`, '「全部未总结」只总结上次总结锚点之后的聊天，不反复覆盖已有记忆。')}
+      ${field('最近 N 轮（选「最近 N 轮」时用）', `<input type="number" id="sum-n" min="1" max="500" value="10">`)}
+      <div class="actions-row"><button class="primary" id="sum-generate">生成总结</button></div>
+      <div id="sum-result"></div>
+      <h3>提取经历</h3>
+      <p class="muted">从选定范围的聊天原文里提取经历（走「记忆总结副 API」，只在你点按钮时跑一次，不自动跑）。每件经历都带关键原话与来源消息 ID；原话对不上原文的会被丢弃，整件没有有效原话的不写入。提取不推进总结锚点。</p>
+      ${field('消息范围', `<select id="exp-scope"><option value="recent">最近 N 轮</option><option value="unsummarized">全部未总结</option></select>`)}
+      ${field('最近 N 轮（选「最近 N 轮」时用）', `<input type="number" id="exp-n" min="1" max="500" value="10">`)}
+      <div class="actions-row"><button class="primary" id="exp-generate">提取经历</button></div>
+      <div id="exp-result"></div>
+      <h3>阶段总结（${summaries.length} 条）</h3>
+      <div id="mem-summary-list">${summaries.map((j) => journalItemHTML(j)).join('') || '<p class="muted">还没有阶段总结。</p>'}</div>
+      <h3>固定记忆（${favorites.length} 条）</h3>
+      <div id="mem-fav-list">${favorites.map((j) => journalItemHTML(j)).join('') || '<p class="muted">还没有收藏的记忆。</p>'}</div>
+      <h3 id="exp-heading">经历记忆</h3>
+      <p class="muted">从聊天原文里提取出的经历，每件都带关键原话与来源消息；失效的（来源被删 / 撤回）不进检索。无原文出处的旧总结会标「无原文出处·不可引用」，引用时不得伪造引用。</p>
+      <div id="exp-list"><p class="muted">正在读取经历记忆…</p></div>
       <h3>新增记忆</h3>
       ${field('标题', `<input type="text" id="mem-title" placeholder="一句话标题">`)}
       ${field('内容', `<textarea id="mem-content" rows="4" placeholder="记忆内容…"></textarea>`)}
       ${field('来源', `<input type="text" id="mem-source" placeholder="来源（如：手动记录 / 第 12 轮对话）">`)}
       <div class="actions-row"><button class="primary" id="mem-save">保存记忆</button></div>`;
+    // 总结进度（异步统计，不阻塞页面渲染）
+    (async () => {
+      try {
+        const history = await backend.getAllMessages(char.id);
+        const rest = unsummarizedMessages(history, summarySettings.lastSummarizedMessageId);
+        const unsum = countRounds(rest, char);
+        const elp = document.getElementById('sum-progress');
+        if (elp) elp.innerHTML = `<p class="muted">已总结 ${summarySettings.summarizedRounds || 0} 轮 · 未总结 ${unsum} 轮${summarySettings.autoEnabled ? `（自动总结已开启，每 ${summarySettings.everyRounds || 30} 轮触发）` : '（自动总结未开启）'}</p>`;
+      } catch { /* 统计失败不影响页面 */ }
+    })();
+    $('#sum-save-settings').addEventListener('click', async () => {
+      summarySettings.autoEnabled = document.getElementById('sum-auto')?.checked ?? false;
+      summarySettings.everyRounds = Math.max(1, parseInt(inputVal('sum-every') || '30', 10) || 30);
+      summarySettings.prompt = inputVal('sum-prompt') || DEFAULT_SUMMARY_PROMPT;
+      summarySettings.length = inputVal('sum-length') || 'medium';
+      await saveSummarySettings();
+      renderSettingsBody();
+      toast('总结设置已保存');
+    });
+    // 向量记忆区绑定
+    refreshVectorStatusUI();
+    $('#vec-save').addEventListener('click', async () => {
+      vectorSettings.enabled = document.getElementById('vec-enabled')?.checked ?? true;
+      vectorSettings.topK = Math.max(1, Math.min(10, parseInt(inputVal('vec-topk') || '5', 10) || 5));
+      vectorSettings.threshold = Math.max(0, Math.min(1, parseFloat(inputVal('vec-threshold')) || 0));
+      vectorSettings.tokenBudget = Math.max(0, parseInt(inputVal('vec-budget') || '1500', 10) || 0);
+      await saveVectorSettings();
+      toast('向量设置已保存');
+    });
+    $('#vec-build').addEventListener('click', () => runVectorIndex({ rebuild: false }));
+    $('#vec-rebuild').addEventListener('click', async () => {
+      if (!confirm('重建索引会清空当前空间的全部向量段再重新生成，记忆原文不受影响。确定重建吗？')) return;
+      await runVectorIndex({ rebuild: true });
+    });
+    $('#vec-pause').addEventListener('click', () => {
+      if (vectorIndexCancel) { vectorIndexCancel.cancelled = true; toast('正在暂停索引…'); }
+      else toast('当前没有正在进行的索引任务');
+    });
+    // 联想召回区绑定
+    refreshAssocBudgetUI();
+    $('#assoc-save').addEventListener('click', async () => {
+      assocSettings.enabled = document.getElementById('assoc-enabled')?.checked ?? true;
+      await saveAssocSettings();
+      const limit = Math.max(0, parseInt(inputVal('assoc-budget-limit') || '300', 10) || 0);
+      const cur = await loadAssocBudget(backend);
+      await saveAssocBudget(backend, { ...cur, limit });
+      await refreshAssocBudgetUI();
+      toast('联想设置已保存');
+    });
+    // 批量任务区绑定
+    renderMemoryJobsUI();
+    $('#job-extract-all').addEventListener('click', () => startMemoryJob('extract-all'));
+    $('#job-backfill-clues').addEventListener('click', () => startMemoryJob('backfill-clues'));
+    $('#job-rebuild-keyword').addEventListener('click', () => startMemoryJob('rebuild-keyword'));
+    $('#job-rebuild-vector').addEventListener('click', () => startMemoryJob('rebuild-vector'));
+    $('#vec-test').addEventListener('click', async () => {
+      const q = inputVal('vec-test-q').trim();
+      const box = $('#vec-test-result');
+      if (!q) { toast('先输入一句话'); return; }
+      if (!embeddingApi.url || !embeddingApi.key || !embeddingApi.model) {
+        box.innerHTML = '<p style="color:#b0442f">未配置向量 Embedding API：请先在「API 设置 → 向量 Embedding API」里填写。</p>';
+        return;
+      }
+      box.innerHTML = '<p class="muted">正在检索…</p>';
+      try {
+        const items = await testRecall(q);
+        box.innerHTML = items.length
+          ? `<table class="preview-table">${items.map((m) => {
+            const kindLabel = m.docKind === 'experience' ? '经历' : '记忆';
+            const vec = Number.isFinite(m.vectorScore)
+              ? `向量 ${m.vectorScore.toFixed(3)}${m.vectorScore >= (vectorSettings.threshold ?? 0.40) ? ' · 达阈值' : ' · 低于阈值'}`
+              : '向量 —';
+            const kw = Number.isFinite(m.keywordRank) ? `关键词 #${m.keywordRank}` : '关键词 —';
+            const vr = Number.isFinite(m.vectorRank) ? ` · 向量 #${m.vectorRank}` : '';
+            return `<tr><td>${esc(m.title || '未命名')}</td><td>${kindLabel}</td><td>融合分 ${m.score.toFixed(4)}</td><td>${vec} · ${kw}${vr} · 会召回</td><td>${esc(m.source || '')}${m.date ? ` · ${esc(m.date)}` : ''}${m.sourceStatus ? ` · ${m.sourceStatus === 'sourced' ? '有出处' : '无出处'}` : ''}</td></tr>`;
+          }).join('')}</table><p class="muted">共 ${items.length} 条（与聊天同一条融合检索；固定注入的收藏记忆已排除）。</p>`
+          : '<p class="muted">没有找到相关记忆（索引可能还没建立，或这句话与已有记忆都不相关）。</p>';
+      } catch (e) {
+        box.innerHTML = `<p style="color:#b0442f">测试召回失败：${esc(e.message || '')}</p>`;
+      }
+    });
+    $('#sum-generate').addEventListener('click', async () => {
+      if (summaryRunning) { toast('正在生成总结，请稍候'); return; }
+      const btn = $('#sum-generate');
+      const box = $('#sum-result');
+      const scope = inputVal('sum-scope');
+      const n = Math.max(1, parseInt(inputVal('sum-n') || '10', 10) || 10);
+      box.innerHTML = '<p class="muted">正在生成总结…</p>';
+      btn.disabled = true;
+      summaryRunning = true;
+      try {
+        const history = await backend.getAllMessages(char.id);
+        const selected = scope === 'unsummarized'
+          ? unsummarizedMessages(history, summarySettings.lastSummarizedMessageId)
+          : selectMessagesForRounds(history, n, char);
+        const res = await generateSummary(selected, {
+          source: scope === 'unsummarized' ? '手动总结 · 全部未总结' : `手动总结 · 最近 ${n} 轮`,
+          titleSuffix: '',
+        });
+        if (res.ok) {
+          box.innerHTML = `<p style="color:#2e7d4f">总结已保存到记忆（${res.rounds} 轮）。</p>`;
+          renderSettingsBody();
+          toast('总结已保存');
+        } else {
+          box.innerHTML = `<p style="color:#b0442f">${esc(res.message)}</p>`;
+        }
+      } catch (e) {
+        box.innerHTML = `<p style="color:#b0442f">总结失败：${esc(e.message || '')}</p>`;
+      } finally {
+        summaryRunning = false;
+        btn.disabled = false;
+      }
+    });
+    $('#exp-generate').addEventListener('click', async () => {
+      if (experienceRunning) { toast('正在提取经历，请稍候'); return; }
+      const btn = $('#exp-generate');
+      const box = $('#exp-result');
+      const scope = inputVal('exp-scope');
+      const n = Math.max(1, parseInt(inputVal('exp-n') || '10', 10) || 10);
+      box.innerHTML = '<p class="muted">正在提取经历…</p>';
+      btn.disabled = true;
+      experienceRunning = true;
+      try {
+        const history = await backend.getAllMessages(char.id);
+        const selected = scope === 'unsummarized'
+          ? unsummarizedMessages(history, summarySettings.lastSummarizedMessageId)
+          : selectMessagesForRounds(history, n, char);
+        const res = await extractExperiencesFromRange(backend, char, selected, {
+          summaryApi,
+          onProgress: (p) => {
+            if (p.phase === 'calling') box.innerHTML = '<p class="muted">正在请副 API 提取经历…</p>';
+            else if (p.phase === 'saving') box.innerHTML = `<p class="muted">正在保存经历… ${p.done}/${p.total}</p>`;
+          },
+        });
+        const notes = res.skipped.map((s) => `<p class="muted">${esc(s.reason)}</p>`).join('');
+        box.innerHTML = res.created.length
+          ? `<p style="color:#2e7d4f">已提取 ${res.created.length} 件经历，见下方「经历记忆」。</p>${notes}`
+          : `<p class="muted">没有提取到可写入的经历。</p>${notes}`;
+        renderSettingsBody();
+        // 新提取的经历进两路索引（关键词立即建，向量后台建），并后台生成联想线索。
+        if (res.created.length) for (const rec of res.created) scheduleReindexDocument(rec);
+        if (res.created.length) for (const rec of res.created) scheduleClueGeneration(rec);
+        if (res.created.length) toast(`已提取 ${res.created.length} 件经历`);
+      } catch (e) {
+        box.innerHTML = `<p style="color:#b0442f">提取失败：${esc(e.message || '')}</p>`;
+      } finally {
+        experienceRunning = false;
+        btn.disabled = false;
+      }
+    });
     body.querySelectorAll('[data-mem-fav]').forEach((b) => b.addEventListener('click', async () => {
       const j = journals.find((x) => x.id === b.dataset.memFav); if (!j) return;
       j.isFavorited = !j.isFavorited;
       await backend.put('journals', { ...j, charId: char.id });
       renderSettingsBody();
+    }));
+    body.querySelectorAll('[data-mem-retrieval]').forEach((b) => b.addEventListener('click', async () => {
+      const j = journals.find((x) => x.id === b.dataset.memRetrieval); if (!j) return;
+      j.retrievalEnabled = j.retrievalEnabled === false ? true : false;
+      await backend.put('journals', { ...j, charId: char.id });
+      await attachJournals(char);
+      // 检索开关变化要同步两路索引：关掉即清理（不再召回），打开即重建。
+      scheduleReindexDocument(j);
+      renderSettingsBody();
+      toast(j.retrievalEnabled ? '已设为参与检索（索引后台更新）' : '已设为不参与检索（索引已清理）');
     }));
     body.querySelectorAll('[data-mem-edit]').forEach((b) => b.addEventListener('click', () => {
       const j = journals.find((x) => x.id === b.dataset.memEdit); if (!j) return;
@@ -4992,6 +15026,15 @@ function renderSettingsBody() {
       $('#mem-save').dataset.editId = j.id;
       $('#mem-title').focus();
     }));
+    body.querySelectorAll('[data-mem-del]').forEach((b) => b.addEventListener('click', async () => {
+      const j = journals.find((x) => x.id === b.dataset.memDel); if (!j) return;
+      if (!confirm(`确定删除「${j.title || '这条记忆'}」吗？它的向量索引段与关键词记录会一起清理，原始聊天不受影响。`)) return;
+      await backend.delete('journals', j.id);
+      await deleteDocumentIndexes(backend, j.id);
+      await attachJournals(char);
+      renderSettingsBody();
+      toast('已删除');
+    }));
     $('#mem-save').addEventListener('click', async () => {
       const editId = $('#mem-save').dataset.editId;
       const j = {
@@ -4999,17 +15042,57 @@ function renderSettingsBody() {
         title: inputVal('mem-title').trim() || '未命名记忆',
         content: inputVal('mem-content'),
         source: inputVal('mem-source') || '手动记录',
-        isFavorited: false, timestamp: Date.now(),
+        isFavorited: false, retrievalEnabled: true, timestamp: Date.now(),
       };
       if (editId) {
         const old = journals.find((x) => x.id === editId);
         j.isFavorited = old?.isFavorited || false;
+        j.retrievalEnabled = old?.retrievalEnabled !== false;
+        // 编辑总结时保留总结标记、来源消息与覆盖范围，不丢增量进度依据。
+        // 索引同步由下面的 scheduleReindexDocument 做（关键词重建 + 向量按 hash 复用或重算）。
+        if (old?.isSummary) {
+          j.isSummary = true;
+          j.sourceMessageIds = old.sourceMessageIds;
+          j.range = old.range;
+          j.createdAt = old.createdAt || j.timestamp;
+        }
       }
       await backend.put('journals', j);
       await attachJournals(char);
+      scheduleReindexDocument(j);
       renderSettingsBody();
       toast('记忆已保存');
     });
+    // 经历记忆列表（异步读库，不阻塞页面渲染）
+    (async () => {
+      const box = document.getElementById('exp-list');
+      const heading = document.getElementById('exp-heading');
+      if (!box) return;
+      try {
+        const exps = await getExperiencesForChar(backend, char.id);
+        const receipts = await getAssocReceipts(backend).catch(() => []);
+        if (heading) heading.textContent = `经历记忆（${exps.length} 条）`;
+        box.innerHTML = exps.map((e) => experienceItemHTML(e, latestReceiptForExp(receipts, e.id))).join('') || '<p class="muted">还没有经历记忆。用上面的「提取经历」从聊天里提取。</p>';
+        box.querySelectorAll('[data-exp-view]').forEach((b) => b.addEventListener('click', () => {
+          const e = exps.find((x) => x.id === b.dataset.expView); if (!e) return;
+          openExperienceViewer(e, latestReceiptForExp(receipts, e.id));
+        }));
+        box.querySelectorAll('[data-exp-edit]').forEach((b) => b.addEventListener('click', () => {
+          const e = exps.find((x) => x.id === b.dataset.expEdit); if (!e) return;
+          openExperienceEditor(e);
+        }));
+        box.querySelectorAll('[data-exp-del]').forEach((b) => b.addEventListener('click', async () => {
+          const e = exps.find((x) => x.id === b.dataset.expDel); if (!e) return;
+          if (!confirm(`确定删除经历「${e.title || '这条经历'}」吗？原始聊天不受影响。`)) return;
+          await deleteExperience(backend, e.id);
+          await deleteDocumentIndexes(backend, e.id);
+          renderSettingsBody();
+          toast('已删除');
+        }));
+      } catch {
+        box.innerHTML = '<p class="muted">经历记忆读取失败。</p>';
+      }
+    })();
     return;
   }
 
@@ -5061,25 +15144,28 @@ function renderSettingsBody() {
 
   if (settingsTab === 'api') {
     const pending = apiSettings._pending;
+    const anyPending = pending || summaryApi._pending || embeddingApi._pending;
     body.innerHTML = `
-      ${pending ? `<div class="notice">从备份导入的 API 设置已保存但未自动应用，确认无误后点「应用导入的设置」。</div>` : ''}
+      ${anyPending ? `<div class="notice">从备份导入的 API 设置已保存但未自动应用，确认无误后点「应用导入的设置」。</div>` : ''}
       <p class="muted">只在你点「测试连接」或「Get Reply」时才调用模型；不做后台请求，不自动重试烧额度。</p>
       ${field('服务商', `<select id="api-provider"><option value="openai" ${apiSettings.provider === 'openai' ? 'selected' : ''}>OpenAI 兼容</option><option value="gemini" ${apiSettings.provider === 'gemini' ? 'selected' : ''}>Gemini 原生</option></select>`, 'Gemini 原生走独立分支，不会把 OpenAI 格式发到 Gemini 接口。')}
       ${field('API 地址（Base URL）', `<input type="text" id="api-url" value="${esc(apiSettings.url || '')}" placeholder="https://api.openai.com/v1">`, '填完整地址；以 /v1 结尾的地址不会被重复拼接。')}
       ${field('API Key', `<input type="password" id="api-key" value="${esc(apiSettings.key || '')}" placeholder="sk-…">`, '只存在本机，不会出现在导出文件和预览里。')}
       ${field('模型', `<input type="text" id="api-model" value="${esc(apiSettings.model || '')}" placeholder="gpt-4o-mini">`)}
-      ${field('temperature', `<label class="check"><input type="checkbox" id="api-temp-enabled" ${apiSettings.temperatureEnabled ? 'checked' : ''}> 启用</label><input type="number" id="api-temp" min="0" max="2" step="0.1" value="${esc(String(apiSettings.temperature ?? 1))}">`)}
-      ${field('流式输出', `<label class="check"><input type="checkbox" id="api-stream" ${apiSettings.streamEnabled !== false ? 'checked' : ''}> 开启 SSE 流式</label>`)}
-      ${field('时间感知', `<label class="check"><input type="checkbox" id="api-time" ${apiSettings.timePerceptionEnabled ? 'checked' : ''}> 在提示词里注入当前时间</label>`)}
+      ${field('temperature', `<div class="setting-row"><span class="setting-label">启用</span><label class="switch"><input type="checkbox" id="api-temp-enabled" ${apiSettings.temperatureEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div><input type="number" id="api-temp" min="0" max="2" step="0.1" value="${esc(String(apiSettings.temperature ?? 1))}">`)}
+      ${field('流式输出', `<div class="setting-row"><span class="setting-label">开启 SSE 流式</span><label class="switch"><input type="checkbox" id="api-stream" ${apiSettings.streamEnabled !== false ? 'checked' : ''}><span class="switch-track"></span></label></div>`)}
+      ${field('时间感知', `<div class="setting-row"><span class="setting-label">在提示词里注入当前时间</span><label class="switch"><input type="checkbox" id="api-time" ${apiSettings.timePerceptionEnabled ? 'checked' : ''}><span class="switch-track"></span></label></div>`)}
       <div class="actions-row">
         <button class="primary" id="api-save">保存 API 设置</button>
         <button id="api-test">测试连接</button>
-        ${pending ? '<button id="api-apply-pending">应用导入的设置</button>' : ''}
+        ${anyPending ? '<button id="api-apply-pending">应用导入的设置</button>' : ''}
       </div>
       <div id="api-result"></div>
       <h3>快捷预设</h3>
       <div id="preset-list">${(apiPresets || []).map((p, i) => `<div class="list-item"><strong>${esc(p.name || p.provider || '')}</strong> <span class="muted">${esc(p.url || '')} · ${esc(p.model || '')}</span> <div class="actions-row"><button data-preset-apply="${i}">应用</button><button data-preset-del="${i}">删除</button></div></div>`).join('') || '<p class="muted">暂无预设。</p>'}</div>
-      <div class="actions-row"><button id="preset-save">把当前设置存为预设</button></div>`;
+      <div class="actions-row"><button id="preset-save">把当前设置存为预设</button></div>
+      ${auxApiSectionHTML('summary', summaryApi, '记忆总结副 API', '只给记忆总结用，不参与聊天；未配置时总结会明确提示，不会偷用主 API。测试会发一次最小的真实聊天调用，以“能出字”为标准。')}
+      ${auxApiSectionHTML('embedding', embeddingApi, '向量 Embedding API', '只给向量记忆用；测试会发一次真实 embeddings 调用并校验返回的向量，不只看模型名字判断支不支持。')}`;
     const readApiForm = () => ({
       provider: inputVal('api-provider') || 'openai',
       url: inputVal('api-url').trim(),
@@ -5109,6 +15195,9 @@ function renderSettingsBody() {
       const p = apiSettings._pending;
       apiSettings = { ...apiSettings, ...p, _pending: undefined };
       await saveApiSettings();
+      // 副 API 的待确认设置一起应用（同样不含 Key，Key 需单独填写）。
+      if (summaryApi._pending) { summaryApi = { ...summaryApi, ...summaryApi._pending, _pending: undefined }; await saveSummaryApi(); }
+      if (embeddingApi._pending) { embeddingApi = { ...embeddingApi, ...embeddingApi._pending, _pending: undefined }; await saveEmbeddingApi(); }
       renderSettingsBody();
       toast('已应用导入的 API 设置');
     });
@@ -5136,6 +15225,8 @@ function renderSettingsBody() {
       renderSettingsBody();
       toast('预设已保存（不含 Key）');
     });
+    bindAuxApiSection('summary');
+    bindAuxApiSection('embedding');
     return;
   }
 
@@ -5154,7 +15245,7 @@ function renderSettingsBody() {
         <textarea id="import-paste" rows="4" placeholder="把备份 JSON 文本粘贴到这里"></textarea>
         <div class="actions-row"><button id="data-import-paste">用粘贴的文本导入</button></div>
       </details>
-      <label class="check"><input type="checkbox" id="export-keys"> 导出时包含 API Key（默认不含；勾选后请妥善保管）</label>
+      <div class="setting-row"><span class="setting-label">导出时包含 API Key<small>默认不含；勾选后请妥善保管</small></span><label class="switch"><input type="checkbox" id="export-keys"><span class="switch-track"></span></label></div>
       <input type="file" id="import-file" class="file-input-hidden">
       <div id="import-report"></div>
       <h3>被替换的回复（可恢复）</h3>
@@ -5166,7 +15257,7 @@ function renderSettingsBody() {
       <div class="actions-row"><button id="data-selftest">运行自检</button></div>
       <div id="selftest-result"></div>
       <h3>向量记忆 / MCP</h3>
-      <p class="muted">向量检索尚未接入；本阶段只保留数据与扩展接口。MCP 仅保留模块边界，本阶段不提供入口。</p>
+      <p class="muted">向量检索已接入：记忆页可建立索引、测试召回、调整阈值；聊天时按相关性召回记忆进请求。MCP 仅保留模块边界，本阶段不提供入口。</p>
       <h3>示例数据</h3>
       ${char.isSample ? '<p class="muted">当前是示例角色（可删除）。导入备份后可在导入预览里选主角色。</p>' : ''}
       <div class="actions-row"><button id="data-delete-char" class="danger">删除当前角色（含全部消息）</button></div>`;
@@ -5217,6 +15308,8 @@ function renderSettingsBody() {
       for (const m of msgs) await backend.delete('messages', m.id);
       const j = await backend.getAll('journals');
       for (const x of j.filter((v) => v.charId === id)) await backend.delete('journals', x.id);
+      // 检索残留一起清：该角色的经历、关键词索引与向量段（cleanupCharacterRetrievalData）。
+      await cleanupCharacterRetrievalData(backend, id);
       localStorage.removeItem('uwu-chat.lastChar');
       location.reload();
     });
@@ -5231,12 +15324,17 @@ function renderSettingsBody() {
     const renderCtx = async () => {
       try {
         const built = await buildCurrentRequest();
+        const receipts = await getAssocReceipts(backend).catch(() => []);
         const msgs = built.req.body?.messages || [];
         const rows = msgs.map((m) => `<tr><td>${escapeHtml(m.role)}</td><td>${escapeHtml(String(m.content || '').slice(0, 120))}</td></tr>`).join('');
         $('#ctx-body').innerHTML = `
           <div class="kv"><span>提示词版本</span><b>${escapeHtml(built.sys.version || '')}</b></div>
           <div class="kv"><span>消息条数</span><b>${msgs.length}</b></div>
           <div class="kv"><span>预估 token</span><b>${countTextTokens(JSON.stringify(msgs))}</b></div>
+          <h3>本次真正加入请求的记忆</h3>
+          ${built.retrievalError ? `<p style="color:#b0442f">记忆检索失败：${escapeHtml(built.retrievalError)}（已继续正常聊天，本次没有召回记忆）</p>` : ''}
+          ${memorySectionsHTML(built.memorySections, receipts)}
+          <p class="muted">固定注入的收藏记忆见提示词模块「收藏记忆」，不在此重复列出。</p>
           <table class="preview-table">${rows}</table>
           <p class="muted">${built.reused ? '直接复用刚才的构建，未重新构建' : '本次新构建'}</p>`;
       } catch (e) {
@@ -5251,12 +15349,98 @@ function renderSettingsBody() {
   if (settingsTab === 'mcp') {
     body.innerHTML = `
       <div class="card"><p class="muted">MCP 尚未接入。本阶段只保留模块边界，不提供入口、不模拟连接状态。</p></div>
-      <p class="muted">向量记忆同样尚未接入；记忆数据见「记忆」页，收藏的记忆才会进提示词。</p>`;
+      <p class="muted">向量记忆见「记忆」页：建立索引后，聊天时会按相关性召回记忆进请求；收藏的记忆固定注入，召回的记忆是另外的独立区域。</p>`;
+    return;
+  }
+
+  if (settingsTab === 'notify') {
+    body.innerHTML = '<div id="b-notify-sec"></div><div id="b-keepalive-sec"></div><div id="b-push-sec"></div><div id="b-wake-sec"></div>';
+    renderNotifySettingsSection(document.getElementById('b-notify-sec'), {
+      settings: notifySettings,
+      onSave: async (next) => { notifySettings = next; if (inAppNotifier) inAppNotifier.settings = { ...inAppNotifier.settings, ...next }; await saveNotifySettings(); },
+      toast,
+    });
+    renderKeepAliveSettingsSection(document.getElementById('b-keepalive-sec'), {
+      settings: keepAliveSettings,
+      keepAlive: audioKeepAlive,
+      onSave: async (next) => { keepAliveSettings = next; await saveKeepAliveSettings(); },
+      onStateChange: () => renderSettingsBody(),
+      toast,
+    });
+    renderPushSettingsSection(document.getElementById('b-push-sec'), {
+      settings: pushSettings,
+      env: {
+        hasServiceWorker: 'serviceWorker' in navigator,
+        hasPushManager: 'PushManager' in window,
+        hasNotification: 'Notification' in window,
+        permission: ('Notification' in window) ? Notification.permission : 'unsupported',
+        configured: !!(pushSettings.vapidPublicKey && pushSettings.pushServiceUrl),
+        tested: false,
+        isIOS: /iPad|iPhone|iPod/.test(navigator.userAgent),
+        isStandalone: window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true,
+      },
+      onSave: async (next) => { pushSettings = next; await savePushSettings(); },
+      onRequestPermission: () => requestPermission(),
+      onSubscribe: async () => {
+        const reg = await navigator.serviceWorker?.getRegistration?.();
+        if (!reg) return { ok: false, reason: 'Service Worker 未注册。' };
+        return subscribePush(reg, pushSettings.vapidPublicKey);
+      },
+      toast,
+    });
+    renderWakeSettingsSection(document.getElementById('b-wake-sec'), {
+      settings: wakeSettings,
+      chars: [{ id: char.id, name: char.remarkName || char.realName }],
+      onSave: async (next) => { wakeSettings = next; if (wakeEngine) await wakeEngine.saveSettings(next); await saveWakeSettings(); },
+      toast,
+    });
     return;
   }
 
   if (settingsTab === 'appearance') {
     ThemeStore.renderAppearance(body);
+    const iconHost = document.createElement('div');
+    iconHost.id = 'b-icon-sec';
+    body.appendChild(iconHost);
+    renderIconSettingsSection(iconHost, {
+      settings: customIconSettings,
+      onSave: async (record) => {
+        // renderIconSettingsSection 渲染时快照的 dataUrl 可能已过期（文件选择后
+        // 才读入新图）：以当前 customIconSettings.dataUrl 为准补齐。
+        customIconSettings = { appName: record.appName, dataUrl: record.dataUrl || customIconSettings.dataUrl };
+        await saveCustomIconSettings();
+      },
+      onExportPack: async () => {
+        // 真实导出：用当前源图调 exportIconPack 逐档生成 PNG 并触发下载。
+        let src = customIconSourceImage;
+        if (!src && customIconSettings.dataUrl) {
+          src = await loadIconImage(customIconSettings.dataUrl).catch(() => null);
+        }
+        if (!src) return { ok: false, reason: '没有可用的源图，请先上传一张图标图片。' };
+        const pack = exportIconPack((size) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = size; canvas.height = size;
+          return { canvas, ctx: canvas.getContext('2d') };
+        }, src, customIconSettings.appName);
+        if (!pack.ok) return pack;
+        for (const f of pack.files) {
+          const a = document.createElement('a');
+          a.href = f.dataUrl; a.download = f.file; a.click();
+        }
+        toast(`图标包已下载（${pack.files.length} 个文件：180 / 192 / 512 / maskable）`);
+        return pack;
+      },
+      toast,
+    });
+    // 图标文件选择回调（renderIconSettingsSection 只渲染界面，不直接读文件）：
+    // validateIconFile → 读图 → computeCropRect / previewSpecs 画预览 →
+    // 压缩后 data URL 存 customIconSettings.dataUrl。
+    iconHost.querySelector('#icon-file')?.addEventListener('change', async (e) => {
+      const f = e.target.files?.[0];
+      e.target.value = '';
+      if (!f) return;
+      try { await handleIconFileChange(f); } catch (err) { toast(err?.message || '读取图标失败'); }
+    });
     return;
   }
 
@@ -5340,10 +15524,11 @@ async function handleImportBytes(buf, label) {
   showModal('导入预览', `
       <p>文件：${escapeHtml(label || '')}（${escapeHtml(formatLabel)}）</p>
       <table class="preview-table">
-        <tr><td>角色</td><td>${counts.characters}</td></tr>
+        <tr><td>角色</td><td>${counts.characters.length} 个（${esc(counts.characters.map((c) => c.remarkName || c.realName || '未命名').join('、'))}）</td></tr>
         <tr><td>消息</td><td>${counts.messages}</td></tr>
         <tr><td>世界书</td><td>${counts.worldBooks}</td></tr>
         <tr><td>记忆</td><td>${counts.journals}</td></tr>
+        <tr><td>经历</td><td>${counts.experiences}</td></tr>
         <tr><td>表情包</td><td>${counts.stickers}</td></tr>
         ${counts.gaps.length ? `<tr><td>待接入</td><td>${escapeHtml(counts.gaps.join('、'))}</td></tr>` : ''}
       </table>
@@ -5351,7 +15536,7 @@ async function handleImportBytes(buf, label) {
       <select id="import-main-char">${chars.map((c, i) => `<option value="${i}">${esc(c.remarkName || c.realName || '未命名')}</option>`).join('')}</select>
       <label>导入方式</label>
       <select id="import-mode"><option value="merge">合并（默认，不覆盖已有数据）</option><option value="replace">替换全部数据（先清空现有库，再导入）</option></select>
-      ${norm.apiSettings ? '<p class="notice">备份含 API 设置：导入后只保存非 Key 字段待你确认，Key 需在设置里单独填写。</p>' : ''}`,
+      ${norm.apiSettings || norm.summaryApi || norm.embeddingApi ? '<p class="notice">备份含 API 设置：导入后只保存非 Key 字段待你确认，Key 需在设置里单独填写。</p>' : ''}`,
     [
       { label: '取消' },
       { label: '开始导入', primary: true, onClick: async () => {
@@ -5365,13 +15550,22 @@ async function handleImportBytes(buf, label) {
           apiSettings = { ...apiSettings, _pending: rest };
           await saveApiSettings();
         }
+        // 副 API 配置同样只留非 Key 字段待确认，Key 永不随导入恢复。
+        if (norm.summaryApi) {
+          summaryApi = { ...summaryApi, ...withoutKey(norm.summaryApi), _pending: withoutKey(norm.summaryApi) };
+          await saveSummaryApi();
+        }
+        if (norm.embeddingApi) {
+          embeddingApi = { ...embeddingApi, ...withoutKey(norm.embeddingApi), _pending: withoutKey(norm.embeddingApi) };
+          await saveEmbeddingApi();
+        }
         if (mainId) localStorage.setItem('uwu-chat.lastChar', mainId);
         await loadAll();
         updateHeader();
         await renderMessages(false);
         const skippedTotal = Object.values(report.skipped || {}).reduce((s, n) => s + (n || 0), 0);
         const rep = $('#import-report');
-        if (rep) rep.innerHTML = `<div class="notice">导入完成：新增 ${report.added.characters || 0} 个角色、${report.added.messages || 0} 条消息、${report.added.worldBooks || 0} 本世界书、${report.added.journals || 0} 条记忆、${report.added.stickers || 0} 个表情包；跳过重复 ${skippedTotal} 条${report.conflicts.length ? `；冲突 ${report.conflicts.length} 条：${escapeHtml(report.conflicts[0] || '')}` : ''}${(report.unknownPreserved || []).length ? `；待接入（原样保存）：${escapeHtml(report.unknownPreserved.join('、'))}` : ''}。</div>`;
+        if (rep) rep.innerHTML = `<div class="notice">导入完成：新增 ${report.added.characters || 0} 个角色、${report.added.messages || 0} 条消息、${report.added.worldBooks || 0} 本世界书、${report.added.journals || 0} 条记忆、${report.added.experiences || 0} 条经历、${report.added.stickers || 0} 个表情包；跳过重复 ${skippedTotal} 条${report.conflicts.length ? `；冲突 ${report.conflicts.length} 条：${escapeHtml(report.conflicts[0] || '')}` : ''}${(report.unknownPreserved || []).length ? `；待接入（原样保存）：${escapeHtml(report.unknownPreserved.join('、'))}` : ''}。</div>`;
         toast('导入完成');
       } },
     ]);
@@ -5381,12 +15575,86 @@ async function handleImportBytes(buf, label) {
   }
 }
 
+/** 记忆三区块给预览看的 HTML：上下文预览（renderCtx）与“本次发送内容预览”
+ * （showSendPreview）共用同一份 built.memorySections，所以预览显示的与实际
+ * 发送的完全一致。receipts 是回执记录（getAssocReceipts），用来显示三态里的
+ * “回复实际提及”（有回执显示 mentioned/unused，没有显示“待回复后结算”）。
+ * 每条注入显示标题、完整原文（截断时明确标注）、出处（来源 + 日期 + docId）与
+ * 召回路径；已检索未注入的（无出处/校验失败/预算跳过）也如实列出原因。 */
+function memorySectionsHTML(sections, receipts = []) {
+  if (!sections) return '<p class="muted">本次没有注入记忆区块。</p>';
+  const out = [];
+  if (sections.injectedIntoPrompt === false) {
+    out.push('<p class="notice">当前使用了自定义覆盖层提示词，以下记忆区块没有进入系统提示词（只展示本次构建的结果）。</p>');
+  }
+  // ②阶段背景
+  out.push('<h3>阶段背景</h3>');
+  if (!sections.stage.items.length) {
+    out.push('<p class="muted">本次没有阶段总结记忆。</p>');
+  } else {
+    out.push(sections.stage.items.map((j) => `
+      <div class="mem-block"><strong>${esc(j.title)}</strong>
+      <span class="muted">${esc(j.date || '')}${j.date ? ' · ' : ''}${esc(j.source || '')} · docId：${esc(j.docId)}</span>
+      ${j.sourceStatus === 'unsourced' ? '<span class="muted">（无原文出处，仅作阶段背景参考，不可当作原话引用）</span>' : '<span class="muted">（有原文出处）</span>'}
+      <pre class="code">${esc(j.content)}</pre></div>`).join(''));
+  }
+  // ③检索证据（已注入）+ 邻居
+  out.push('<h3>检索证据（已注入）</h3>');
+  if (!sections.evidence.items.length) {
+    out.push('<p class="muted">本次没有进入检索证据区的记忆（未开启、未配置、未建索引，或没有达到阈值的记忆）。</p>');
+  } else {
+    out.push(sections.evidence.items.map((m) => `
+      <div class="mem-block"><strong>${esc(m.title)}</strong> <span class="muted">已注入</span>
+      <span class="muted">${esc(m.retrievalPath || '')}${m.date ? ` · ${esc(m.date)}` : ''} · ${esc(m.source || '')} · docId：${esc(m.docId)}</span>
+      ${m.alsoAssoc ? '<span class="muted">（联想亦选中）</span>' : ''}
+      ${m.truncated ? '<span class="muted">（已按 Token 预算截断，只注入了前一部分）</span>' : ''}
+      <pre class="code">${esc(m.injectedText || m.content || '')}</pre>
+      ${(m.neighbors || []).map((n) => `
+        <div class="mem-block"><span class="muted">相邻对话（补充上下文，非独立证据；${n.roundOffset < 0 ? '上一轮' : n.roundOffset > 0 ? '下一轮' : '同轮'}${n.speaker ? ` · ${esc(n.speaker)}` : ''}${n.timestamp ? ` · ${esc(formatEvidenceTime(n.timestamp))}` : ''}）</span>
+        <pre class="code">${esc(n.content || '')}</pre></div>`).join('')}
+      </div>`).join(''));
+  }
+  // ④联想旧事
+  out.push('<h3>联想旧事</h3>');
+  const assoc = sections.assoc || {};
+  if (assoc.status === 'in-evidence' && assoc.item) {
+    out.push(`<p>「${esc(assoc.item.title)}」已在检索证据里，不重复注入（联想亦选中）。用法：${assoc.item.use === 'mention' ? '回复里可以顺口自然提到' : '只作背景理解、不要主动提起'}。${assoc.item.reason ? `副模型原因：${esc(assoc.item.reason)}` : ''}</p>`);
+  } else if (assoc.status === 'injected' && assoc.item) {
+    const receipt = latestReceiptForExp(receipts, assoc.item.docId);
+    const state = receipt
+      ? (receipt.mentioned ? '回复实际提及：已提及' : '回复实际提及：已注入，未提及')
+      : '待回复后结算';
+    out.push(`<div class="mem-block"><strong>${esc(assoc.item.title)}</strong> <span class="muted">已注入 · ${state}</span>
+      <span class="muted">用法：${assoc.item.use === 'mention' ? '回复里可以顺口自然提到（也可以不提）' : '只作背景理解、不要主动提起'}${assoc.item.date ? ` · ${esc(assoc.item.date)}` : ''} · ${esc(assoc.item.source || '')} · docId：${esc(assoc.item.docId)}</span>
+      ${assoc.item.reason ? `<p class="muted">副模型原因：${esc(assoc.item.reason)}</p>` : ''}
+      ${(assoc.item.clues || []).map((c) => `<p>线索：${esc(c.text)}${c.excerpt ? `（原文「${esc(c.excerpt)}」）` : ''}</p>`).join('')}
+      ${(assoc.item.quotes || []).map((q) => `<p>关键原话：「${esc(q.text)}」${q.speaker ? ` —— ${esc(q.speaker)}` : ''}</p>`).join('')}
+      ${assoc.item.truncated ? '<span class="muted">（已按 Token 预算截断）</span>' : ''}
+      </div>`);
+  } else if (assoc.status === 'dropped') {
+    const d = (sections.dropped || []).find((x) => x.where === 'assoc');
+    out.push(`<p class="muted">联想选中的经历未注入${d ? `：${esc(d.reason)}` : ''}。</p>`);
+  } else {
+    out.push('<p class="muted">本轮没有联想选中。</p>');
+  }
+  // 预算跳过与丢弃（已检索，未注入）
+  if ((sections.skippedByBudget || []).length) {
+    out.push(`<p class="muted">因预算跳过 ${sections.skippedByBudget.length} 条：${esc(sections.skippedByBudget.map((x) => `${x.title || x.docId}（${{ evidence: '检索证据', neighbor: '相邻对话', assoc: '联想旧事' }[x.kind] || x.kind}）`).join('、'))}</p>`);
+  }
+  if ((sections.dropped || []).length) {
+    out.push(`<h3>已检索、未注入</h3>` + sections.dropped.map((d) => `<p class="muted">「${esc(d.title || d.docId)}」（${{ evidence: '检索证据', stage: '阶段背景', assoc: '联想旧事', neighbor: '相邻对话' }[d.where] || d.where}）：${esc(d.reason)}</p>`).join(''));
+  }
+  return out.join('');
+}
+
 async function showSendPreview() {
   try {
-    const { sys, req, reused } = await buildCurrentRequest();
+    const { sys, req, reused, retrieved = [], retrievalError = null } = await buildCurrentRequest();
+    const receipts = await getAssocReceipts(backend).catch(() => []);
     const msgs = req.body.messages || req.body.contents || [];
     const tokens = sys.tokenEstimate + countTextTokens(JSON.stringify(msgs));
     const sysText = req.systemPrompt || sys.systemPrompt;
+    const retrievedTokens = countTextTokens(retrieved.map((m) => m.content || '').join('\n'));
     showModal('本次发送内容预览', `
       <p class="muted">与 Get Reply 发送的是同一份构建结果（${reused ? '直接复用刚才的构建，未重新构建' : '本次新构建'}）；API Key 不显示。</p>
       <table class="preview-table">
@@ -5395,9 +15663,12 @@ async function showSendPreview() {
         <tr><td>提示词版本</td><td>${esc(sys.version)}</td></tr>
         <tr><td>消息数（请求内）</td><td>${msgs.length} 条（历史 ${req.stats.historyMessages} 条，进请求前已按 maxMemory ${req.stats.maxMemory} 截断；不进上下文 ${req.stats.droppedContextDisabled} 条）</td></tr>
         <tr><td>Token（估算）</td><td>约 ${tokens}（估算值，非官方计费口径）</td></tr>
+        <tr><td>向量召回记忆</td><td>${retrievalError ? `检索失败：${esc(retrievalError)}（已继续，本次无召回）` : retrieved.length ? `${retrieved.length} 条，约 ${retrievedTokens} token：${esc(retrieved.map((m) => `${m.title || '未命名'}（${m.score.toFixed(2)}）`).join('、'))}` : '本次无召回'}</td></tr>
       </table>
       <label>模块来源（Token 估算）</label>
       <table class="preview-table">${sys.modules.map((m) => `<tr><td>${esc(m.name)}</td><td>${esc(m.source)}</td><td>约 ${m.tokens}</td></tr>`).join('')}</table>
+      <label>记忆区块（本次真正注入，与实际发送一致）</label>
+      ${memorySectionsHTML(sys.memorySections, receipts)}
       <label>System Prompt</label>
       <textarea rows="8" readonly>${esc(sysText)}</textarea>
       <label>消息列表</label>
@@ -5475,7 +15746,177 @@ async function runSelfTest() {
 }
 
 /* ---------------- 启动 ---------------- */
+/* ---------------- B 组：站内横幅 + 唤醒回合 ---------------- */
+
+/** 是否正在看聊天页：以 NavShell 的当前页状态为准，不凭空编 DOM id。 */
+function isChatPageVisible() {
+  return NavShell.getCurrent() === 'chat' && !document.hidden;
+}
+
+/** 单角色现状：头像/昵称取当前角色；不是当前角色时返回空。 */
+async function charAvatarFor(charId) {
+  if (!char || char.id !== charId) return '';
+  try { return await resolveAvatar(char.avatar); } catch { return ''; }
+}
+function charNameFor(charId) {
+  if (!char || char.id !== charId) return '';
+  return char.remarkName || char.realName || '';
+}
+/** 横幅摘要用的纯文本（去协议前缀，取原文）。 */
+function plainTextOf(msg) {
+  return extractProtocolText(messageText(msg)) || msg.content || '';
+}
+
+// B 组：站内横幅渲染（按 InAppNotifier 返回的 banner 描述子渲染；CSS 见 styles.css 的 B-group block）。
+function renderInAppBanner(banner) {
+  document.querySelector('.inapp-banner')?.remove();
+  const el = document.createElement('div');
+  el.className = 'inapp-banner';
+  el.innerHTML = `${banner.avatar ? `<img class="inapp-banner-avatar" src="${escapeHtml(banner.avatar)}" alt="">` : ''}
+    <div class="inapp-banner-body"><div class="inapp-banner-name">${escapeHtml(banner.nickname)}</div>
+    <div class="inapp-banner-summary">${escapeHtml(banner.summary)}</div></div>
+    <button class="inapp-banner-close" aria-label="关闭通知">×</button>`;
+  el.addEventListener('click', () => { el.remove(); inAppNotifier?.openBanner(banner.id); });
+  el.querySelector('.inapp-banner-close').addEventListener('click', (e) => {
+    e.stopPropagation(); el.remove(); inAppNotifier?.dismissBanner(banner.id);
+  });
+  document.getElementById('app')?.appendChild(el);
+  setTimeout(() => { el.remove(); inAppNotifier?.dismissBanner(banner.id); }, 8000); // 8 秒自动消失，未读照计
+}
+
+/** 点横幅进聊天：切到聊天页并定位到 messageId（不生成新消息）；单角色现状下等价于回到聊天页。
+ *  定位走 jumpToMessage（与搜索/收藏/日期共用同一套逻辑）；定位失败时落到底部。 */
+async function openChatForBanner(charId, messageId) {
+  NavShell.switchView('chat');
+  if (inAppNotifier) { inAppNotifier.markRead(charId); await saveUnread(backend, inAppNotifier).catch(() => {}); }
+  if (!messageId) { messageArea.scrollTop = messageArea.scrollHeight; return; }
+  const ok = await jumpToMessage(messageId);
+  if (!ok) messageArea.scrollTop = messageArea.scrollHeight;
+}
+
+/**
+ * 唤醒回合的模型决策解析（纯函数）：模型回复第一行只能是
+ * 【发送】/【跳过】/【调整】其一；【发送】后跟要发的内容，
+ * 【调整】后跟一个唤醒工具调用 JSON（走 parseWakeToolCall 校验）。
+ * 解析不出决策时返回 unknown，调用方按 skip 处理，绝不凭空发消息。
+ */
+function parseWakeDecision(raw) {
+  const text = String(raw || '').trim();
+  const head = text.match(/^【(发送|跳过|调整)】/);
+  if (!head) return { decision: 'unknown', reason: '模型回复没有以【发送】/【跳过】/【调整】开头' };
+  const rest = text.slice(head[0].length).trim();
+  if (head[1] === '发送') return { decision: 'send', message: rest };
+  if (head[1] === '跳过') return { decision: 'skip' };
+  return { decision: 'reschedule', toolCall: rest };
+}
+
+/**
+ * 唤醒回合执行（B 组 §8.6）：checkDueOnForeground 返回 due 项后逐项执行，
+ * 复用现有“生成回复并保存”的链路（buildCurrentRequest + sendChat +
+ * handleAiReplyContent），不另起一套保存逻辑。
+ * 顺序：先 handleWakeOutcome 校验并收尾（用户中途发言时返回 cancelled，
+ * 本轮作废、绝不写入），再按分支执行；send 先保存再经 sendOnce 记 notified；
+ * reschedule 的 toolCall 由 handleWakeOutcome 校验后、调用方调
+ * applyWakeToolCall 执行。deps 供测试注入 fake 模型/引擎/保存回调。
+ */
+async function runWakeRound(w, deps = {}) {
+  const engine = deps.engine || (typeof wakeEngine !== 'undefined' ? wakeEngine : null);
+  const parseDecision = deps.parseDecision || parseWakeDecision;
+  if (!engine || !w) return { ok: false, reason: '唤醒引擎未就绪' };
+  if (wakeRoundRunning) return { ok: false, reason: '已有唤醒回合在进行' };
+  wakeRoundRunning = true;
+  try {
+    if (engine.isUserTyping?.()) {
+      engine.cancelWake?.(w.wakeId, '用户正在发言，唤醒回合让位');
+      return { ok: false, decision: 'cancelled', reason: '用户正在发言，唤醒回合已让位' };
+    }
+    // 领取已在 checkDueOnForeground 内完成（claimWake）；这里先记 accepted。
+    await engine.markReceipt(w.wakeId, 'accepted', true);
+    let raw;
+    try {
+      raw = deps.modelCall ? await deps.modelCall(w) : await callWakeModel(w);
+    } catch (e) {
+      // 模型调用失败：不发消息，只记 completed（本轮作废，不重试、不补发）。
+      await engine.handleWakeOutcome(w.wakeId, { decision: 'skip' });
+      return { ok: false, decision: 'skip', reason: e?.message || '唤醒模型调用失败' };
+    }
+    const parsed = parseDecision(raw);
+    if (!parsed || parsed.decision === 'unknown') {
+      await engine.handleWakeOutcome(w.wakeId, { decision: 'skip' });
+      return { ok: true, decision: 'skip', reason: '模型决策无法解析，已跳过' };
+    }
+    // 统一用 handleWakeOutcome 收尾：用户中途发言时返回 cancelled，本轮作废。
+    const outcome = await engine.handleWakeOutcome(w.wakeId, parsed);
+    if (!outcome.ok) return outcome;
+    if (parsed.decision === 'send') {
+      const text = (parsed.message || '').trim();
+      if (!text) {
+        await engine.settleWake(w.wakeId, w.report, false);
+        return { ok: true, decision: 'skip', reason: '模型决定发送但内容为空，已跳过' };
+      }
+      if (deps.saveReply) await deps.saveReply(text, w);
+      else await saveWakeReply(text, w);
+      await engine.sendOnce(w.wakeId, async () => ({ delivered: true }));
+      await engine.settleWake(w.wakeId, w.report, true);
+      return { ok: true, decision: 'send' };
+    }
+    if (parsed.decision === 'reschedule') {
+      // handleWakeOutcome 的 reschedule 分支只返回校验后的 toolCall，不执行——
+      // 调用方必须接着调 applyWakeToolCall。
+      await engine.applyWakeToolCall(outcome.toolCall, w.charId);
+      await engine.settleWake(w.wakeId, w.report, false);
+      return { ok: true, decision: 'reschedule' };
+    }
+    await engine.settleWake(w.wakeId, w.report, false);
+    return { ok: true, decision: 'skip' };
+  } finally {
+    wakeRoundRunning = false;
+  }
+}
+
+/** 唤醒回合的模型调用：复用 buildCurrentRequest（近期聊天 + 相关记忆），
+ * 末尾追加一条未落盘的唤醒指令（report 已含触发原因、有效情境、字条，
+ * 不含位置/App/健康数据）。未配置主 API 时直接抛错，由调用方按 skip 处理。 */
+async function callWakeModel(w) {
+  if (!apiSettings.url || !apiSettings.key || !apiSettings.model) {
+    throw new Error('未配置主 API，唤醒回合跳过');
+  }
+  const built = await buildCurrentRequest();
+  const instruction = [
+    '【主动唤醒】现在是计划好的主动联系时间，不是用户刚发消息的回复。',
+    w.report?.text || w.trigger || '',
+    '请你按角色判断：现在联系是否合适。回复格式：第一行只能写【发送】、【跳过】或【调整】其中之一。',
+    '【发送】后面直接写要发给用户的一两句话（不要再写格式标记）；',
+    '【跳过】表示这次不联系；',
+    '【调整】后面写一个 JSON 工具调用（set_alarm / set_repeat / snooze / end_scene / update_scene / set_note / clear_note），用来改闹钟或情境。',
+    '不要输出除此以外的解释。',
+  ].join('\n');
+  const body = { ...(built.req.body || {}) };
+  if (Array.isArray(body.messages)) {
+    body.messages = [...body.messages, { role: 'user', content: instruction }];
+  } else if (Array.isArray(body.contents)) {
+    body.contents = [...body.contents, { role: 'user', parts: [{ text: instruction }] }];
+  } else {
+    body.messages = [{ role: 'system', content: built.sys.systemPrompt || '' }, { role: 'user', content: instruction }];
+  }
+  const { text } = await sendChat(apiSettings, body, { signal: new AbortController().signal });
+  return text || '';
+}
+
+/** 唤醒消息保存：复用正常助理消息链路（分段/心声/状态栏/落盘/渲染）。 */
+async function saveWakeReply(text, w) {
+  void w;
+  await handleAiReplyContent(text, uid('round'), {});
+}
+
 async function boot() {
+  // Safari's visual viewport shrinks with the keyboard; keep the composer inside it.
+  const syncChatViewport = () => document.documentElement.style.setProperty(
+    '--chat-viewport-height', `${window.visualViewport?.height || window.innerHeight}px`);
+  syncChatViewport();
+  window.visualViewport?.addEventListener('resize', syncChatViewport);
+  window.addEventListener('resize', syncChatViewport);
+  new ResizeObserver(([entry]) => $('#view-chat').style.setProperty('--composer-height', `${entry.target.offsetHeight}px`)).observe($('#composer'));
   try {
     await backend.init();
     await loadAll();
@@ -5483,11 +15924,16 @@ async function boot() {
     ThemeStore.init(backend, appearanceSettings);
     NavShell.init();
     // Register static and dynamically rendered surfaces with the supplied refraction engine.
-    const selectors = '.glass, .bubble, .post, .group, .card, .m-ico, .post-action';
+    const selectors = '.glass, .post, .group, .card, .m-ico, .post-action';
     let glassSyncPending = false;
     const syncGlass = () => {
       glassSyncPending = false;
-      document.querySelectorAll(selectors).forEach((node) => { node.classList.add('glass'); LiquidGlass.attach(node); });
+      document.querySelectorAll(selectors).forEach((node) => {
+        // Chat uses its own material layer. Never paint shared glass snapshots behind quotes,
+        // images or solid message bubbles; that caused the stray gray slabs in the old UI.
+        if (node.closest('#view-chat')) { node.classList.remove('glass', 'gl-webgl'); LiquidGlass.detach(node); return; }
+        node.classList.add('glass'); LiquidGlass.attach(node);
+      });
       LiquidGlass.prune();
       LiquidGlass.refresh();
     };
@@ -5504,11 +15950,105 @@ async function boot() {
       onRowClick: (id) => openSettings(id),
     });
     updateHeader();
+    // 内嵌兜底：<head> 里的同名脚本是首选（首绘前挂 class）；这里再补一次，
+    // 防止构建把 head 脚本 strip 掉。独立打开时 window.self === window.top，不挂。
+    if (window.self !== window.top) document.documentElement.classList.add('embedded');
+    // 聊天态同步：#view-chat 激活时给 #app 加 .in-chat，品牌行与 Tab 栏只在
+    // 聊天页隐藏（.brand-bar 三页共用，只能隐藏不能删节点）。NavShell 在 nav.js 里，
+    // 不在本轮文件集里，所以这里用 MutationObserver 跟它的切页走。
+    const syncInChat = () => {
+      const inChat = document.getElementById('view-chat').classList.contains('active');
+      document.getElementById('app').classList.toggle('in-chat', inChat);
+      // 离开聊天页时记下目的地，顶栏返回按钮用它回到主界面。
+      if (!inChat) { const cur = NavShell.getCurrent(); if (cur && cur !== 'chat') lastHomeView = cur; }
+    };
+    new MutationObserver(syncInChat).observe(document.getElementById('view-chat'), { attributes: true, attributeFilter: ['class'] });
+    syncInChat();
+    // 生成状态恢复：上次生成中途刷新/切后台，绝不自动续生成，只提示已中断。
+    // localStorage 标记（getReply 起止写）+ 残留 generating 消息双路检查。
+    if (localStorage.getItem('uwu-chat.generating') === '1') {
+      localStorage.removeItem('uwu-chat.generating');
+      setTimeout(() => toast('上次生成已中断，未自动续生成'), 600);
+    }
+    try {
+      const allMsgs = await backend.getAllMessages(char.id);
+      const rec = recoverInterruptedMessages(allMsgs);
+      if (rec.wasGenerating) {
+        for (const m of rec.messages) {
+          if (m.sendState === 'interrupted') await backend.put('messages', m);
+        }
+        setTimeout(() => toast('上次生成已中断，未自动续生成'), 600);
+      }
+    } catch (e) { console.warn('生成状态恢复检查失败（聊天不受影响）：', e); }
+    // 草稿恢复（按角色）：输入框空着才回填，不覆盖已有输入。
+    draftSaver = createDraftSaver(localStorage, char.id);
+    const savedDraft = loadDraft(localStorage, char.id);
+    if (savedDraft && !inputEl.value) {
+      inputEl.value = savedDraft;
+      autoGrow();
+      $('#composer').classList.add('has-text');
+    }
+    // 启动时一次性恢复阅读位置（renderMessages 里认领一次即清）。
+    restoreReadPosOnce = true;
     await renderMessages(false);
+    // B 组初始化（模块均回调注入，不 import app.js）。
+    inAppNotifier = new InAppNotifier({
+      settings: notifySettings,
+      env: {
+        supportsVibration: 'vibrate' in navigator,
+        supportsSound: true,
+        playSound: () => { /* 可选：播一声短提示音；无音频文件时留空（降级说明已在模块内） */ },
+        vibrate: (p) => navigator.vibrate?.(p),
+      },
+      onBanner: (banner) => renderInAppBanner(banner),
+      onOpenChat: (charId, messageId) => openChatForBanner(charId, messageId),
+    });
+    await loadUnread(backend, inAppNotifier);
+    audioKeepAlive = getAudioKeepAlive({
+      onStateChange: () => { /* 状态变化时如需刷新设置页，调 renderSettingsBody() */ },
+    });
+    wakeEngine = new WakeEngine({
+      store: backend,
+      settings: wakeSettings,
+      slmClient: null, // 总结副 API 接好后再传 auxApi.callSummaryChat 包装的分类回调；未传时只走关键词快路径
+    });
+    await wakeEngine.loadSettings();
+    // Service Worker：只在用户开启推送时注册；注册失败不阻断启动。
+    if (pushSettings.enabled && 'serviceWorker' in navigator) {
+      const sw = await registerServiceWorker(navigator, '/sw.js');
+      if (!sw.ok) console.warn('SW 注册失败：', sw.reason);
+    }
+    // 前台巡检：页面可见时按 patrolIntervalMin 检查唤醒到期；恢复前台立即检查一次。
+    const wakePatrol = async () => {
+      if (document.hidden || !wakeEngine || wakeRoundRunning || isGenerating) return;
+      const { due } = await wakeEngine.checkDueOnForeground();
+      for (const w of due) await runWakeRound(w); // 见下文 runWakeRound
+    };
+    setInterval(wakePatrol, Math.max(1, wakeSettings.patrolIntervalMin || 15) * 60 * 1000);
+    document.addEventListener('visibilitychange', async () => {
+      if (document.hidden) { audioKeepAlive?.handleVisibility(true); return; }
+      audioKeepAlive?.handleVisibility(false); // 回前台不自动恢复保活（模块内已保证）
+      await wakePatrol();
+    });
     // 保存失败提示
     const origPut = backend.put.bind(backend);
     backend.put = async (...args) => {
-      try { return await origPut(...args); }
+      try {
+        const saved = await origPut(...args);
+        // B 组：消息先持久化再通知（notifyAfterPersist 的同一原则）。
+        // 只对其他角色/非当前聊天页的消息弹横幅；当前正在看的聊天不重复遮挡。
+        if (args[0] === 'messages' && args[1]?.role === 'assistant' && inAppNotifier) {
+          inAppNotifier.notifyInApp({
+            charId: args[1].charId,
+            avatar: await charAvatarFor(args[1].charId),
+            name: charNameFor(args[1].charId),
+            summary: plainTextOf(args[1]),
+            messageId: args[1].id,
+          }, isChatPageVisible() ? char.id : null);
+          await saveUnread(backend, inAppNotifier);
+        }
+        return saved;
+      }
       catch (e) {
         setSaveState('保存失败');
         showModal('保存失败', `<p>${escapeHtml(e.message || '写入失败')}</p><p class="muted">你的消息还在当前页面，请立即导出备份。</p>`, [

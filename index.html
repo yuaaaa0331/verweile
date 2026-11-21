@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<script>/* Muse 内嵌预览（iframe）时宿主已预留导航与安全区：首绘前挂 .embedded 关掉应用自己的安全区阀门（styles.css --sat/--sab）。独立打开时不挂，正常走 env()。 */if (window.self !== window.top) document.documentElement.classList.add('embedded');</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -9,9 +10,10 @@
 <meta name="apple-mobile-web-app-title" content="verweile">
 <meta name="theme-color" content="#ececed">
 <title>verweile</title>
-<link rel="manifest" href='data:application/manifest+json,{"name":"verweile","short_name":"verweile","display":"standalone","background_color":"%23ececed","theme_color":"%23ececed","start_url":"."}'>
-<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d1d1f'/%3E%3Ctext x='32' y='42' font-size='28' text-anchor='middle' fill='white' font-family='sans-serif'%3Ev%3C/text%3E%3C/svg%3E">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="chat.css">
 </head>
 <body>
 <!-- 单色描边图标（currentColor，线宽 1.8）：不使用彩色图标 -->
@@ -29,6 +31,7 @@
     <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
     <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></symbol>
+    <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
     <symbol id="i-up" viewBox="0 0 24 24"><polyline points="18 15 12 9 6 15"/></symbol>
     <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
     <symbol id="i-gift" viewBox="0 0 24 24"><polyline points="20 12 20 22 4 22 4 12"/><rect x="2" y="7" width="20" height="5"/><line x1="12" y1="22" x2="12" y2="7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></symbol>
@@ -68,58 +71,73 @@
   <div class="views" id="views">
     <!-- 聊天 -->
     <section role="tabpanel" class="view view-chat active" id="view-chat">
-      <header class="chat-head glass">
-        <img id="char-avatar" class="top-avatar" src="" alt="头像">
-        <button class="top-info" id="top-info-btn" title="查看状态栏" aria-label="查看状态栏">
-          <div id="char-name" class="top-name">加载中…</div>
-          <div id="char-status" class="top-status">在线</div>
-        </button>
+      <!-- iMessage 式顶栏（chat.css 网格布局：56px / 1fr / 56px，in-flow 顶栏，
+           chrome 底 + blur(22px) + 底部分隔线）：左 44×44 无背景返回按钮，
+           居中 62px 圆头像 + 14px 昵称（无背景条），右 44×44 无背景 ··· 按钮。
+           状态/心声入口在头像与昵称点击，设置在 ··· 菜单；
+           顶栏节点不挂 .glass（聊天内不画液态玻璃快照）。 -->
+      <header class="chat-head">
+        <button id="chat-back-btn" class="chat-back-btn" title="返回主界面" aria-label="返回主界面"><svg class="icon"><use href="#i-chev-l"/></svg></button>
+        <div class="chat-head-center">
+          <button id="char-avatar-btn" class="top-avatar-btn" title="查看状态栏" aria-label="查看状态栏"><img id="char-avatar" class="top-avatar" src="" alt="头像"></button>
+          <button class="top-info" id="top-info-btn" title="查看状态栏" aria-label="查看状态栏"><span id="char-name" class="top-name">加载中…</span></button>
+        </div>
         <span id="mock-badge" class="badge mock hidden">模拟</span>
-        <button id="status-btn" class="icon-btn" title="状态" aria-label="状态"><svg class="icon"><use href="#i-heart"/></svg></button>
         <button id="chat-menu-btn" class="icon-btn" title="更多" aria-label="更多"><svg class="icon"><use href="#i-dots"/></svg></button>
       </header>
 
+      <!-- 聊天记录中心返回条：从搜索 / 收藏 / 日期跳过来定位后才显示，平时隐藏，不常驻 -->
+      <div id="jump-return-bar" class="jump-return-bar hidden">
+        <button id="jump-return-btn" class="jump-return-btn">← 返回搜索结果</button>
+        <button id="jump-latest-btn" class="jump-latest-btn hidden">回到最新消息</button>
+      </div>
+
+      <!-- 常驻状态条已取消：入口只剩顶栏昵称 / 心形；节点保留在 DOM 里，
+           renderStatusStrip 照常写，CSS 负责隐藏（见 styles.css）。 -->
       <div class="status-strip glass" id="status-strip">
         <div class="chips" id="status-chips"></div>
         <button class="chev" id="status-strip-toggle" aria-label="查看状态栏"><svg class="icon sm"><use href="#i-chev-d"/></svg></button>
-      </div>
-
-      <!-- 状态栏弹窗：点顶栏昵称标题 / 心形 / 状态条打开；底部是透明的上一个 / 下一个 / 关闭 -->
-      <div id="status-popup" class="status-popup hidden" role="dialog" aria-modal="true" aria-label="状态栏">
-        <div class="status-scrim" id="status-scrim"></div>
-        <div class="status-sheet glass">
-          <div class="status-sheet-head"><span>状态栏</span><span id="status-pos" class="muted"></span></div>
-          <div id="status-custom" class="status-custom"></div>
-          <div id="status-raw" class="status-raw"></div>
-          <div id="status-history" class="status-history"></div>
-          <div class="status-sheet-foot">
-            <button id="status-prev" class="ghost-btn">‹ 上一个</button>
-            <button id="status-next" class="ghost-btn">下一个 ›</button>
-            <button id="status-close" class="ghost-btn">关闭</button>
-          </div>
-        </div>
       </div>
 
       <main id="message-area" aria-live="polite"></main>
 
       <div id="typing-indicator" class="typing hidden"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span id="typing-text">正在输入中…</span></div>
 
-      <div id="quote-bar" class="quote-bar glass hidden">
-        <span id="quote-text"></span>
-        <button id="quote-cancel" class="mini-btn">取消</button>
+      <button id="reply-preview-scrim" class="reply-preview-scrim" tabindex="-1" aria-label="取消引用"></button>
+      <div id="quote-bar" class="quote-bar reply-preview-bar hidden" aria-label="正在引用">
+        <span id="quote-sender" class="reply-preview-name"></span>
+        <div class="reply-preview-content"><span id="quote-text" class="reply-preview-text"></span></div>
+        <button id="quote-cancel" class="reply-preview-close" aria-label="取消引用">×</button>
+      </div>
+      <div id="quote-navigation" class="quote-navigation hidden" aria-label="引用导航">
+        <button id="quote-return-btn" class="quote-return-btn">返回引用处</button>
+        <button id="quote-latest-btn" class="quote-latest-btn">回到最新消息 ↓</button>
+      </div>
+      <span id="chat-announcement" class="sr-only" role="status" aria-live="polite"></span>
+
+      <!-- 上翻看历史时新消息到达：不强行拉底，显示这个入口，点它再拉底 -->
+      <button id="new-msg-pill" class="new-msg-pill hidden" aria-label="跳到最新消息">↓ 有新消息</button>
+
+      <!-- 心声面板：只在心声模式、点某条回复下的「心声」才打开；不自动弹出，不常驻 -->
+      <div id="inner-voice-panel" class="inner-voice-panel glass hidden" role="dialog" aria-label="心声">
+        <div class="iv-head"><span>心声</span><button id="inner-voice-close" class="mini-btn" aria-label="关闭心声">✕</button></div>
+        <div id="inner-voice-text" class="iv-text"></div>
+        <p class="muted iv-note">角色本轮的内心独白，不进入普通聊天气泡。</p>
       </div>
 
       <footer id="composer">
         <div class="input-row">
           <button id="plus-btn" class="icon-btn round" title="更多" aria-label="更多"><svg class="icon"><use href="#i-plus"/></svg></button>
-          <div class="input-shell glass">
-            <textarea id="input" rows="1" placeholder="Write something…" aria-label="输入消息" enterkeyhint="send"></textarea>
+          <div class="input-shell">
+            <textarea id="input" rows="1" placeholder="iMessage" aria-label="输入消息" enterkeyhint="send"></textarea>
             <button id="sticker-btn" class="icon-btn" title="表情包" aria-label="表情包"><svg class="icon"><use href="#i-smile"/></svg></button>
           </div>
-          <button id="send-btn" class="send-btn" aria-label="发送"><svg class="icon"><use href="#i-up"/></svg></button>
-          <button id="get-reply-btn" class="reply-btn">get reply</button>
+          <button id="send-btn" class="send-btn" aria-label="发送"><svg class="icon"><use href="#i-arrow-up"/></svg></button>
+          <button id="get-reply-btn" class="reply-btn" title="获取回复" aria-label="获取回复"><svg class="icon"><use href="#i-sparkle"/></svg></button>
         </div>
       </footer>
+      <!-- 自动回复开关与保存状态已移入顶栏 ··· 菜单（聊天设置）；
+           这一行只留节点在 DOM 里（updateHeader/setSaveState 仍写它），CSS 隐藏。 -->
       <div id="auto-row" class="auto-row">
         <label><input type="checkbox" id="auto-reply-toggle"> 自动回复</label>
         <span id="save-state" class="save-state"></span>
@@ -161,6 +179,25 @@
     <button role="tab" aria-selected="false" class="tab" data-view="manage"><svg class="icon"><use href="#i-grid"/></svg><span>我的</span></button>
   </nav>
 
+  <!-- 状态栏弹窗：点顶栏昵称标题 / 心形打开。必须是 #app 的直接子节点、
+       不能留在 #view-chat 里——.views 是 z-index:2 的层叠上下文，弹窗留在里面
+       永远压不过 z-index:8 的 Tab 栏（截图三 bug 的共同根因）。absolute 定位
+       以 #app 为基准，与 .sheet/.modal 一致；底部留出 Tab 栏高度。 -->
+  <div id="status-popup" class="status-popup hidden" role="dialog" aria-modal="true" aria-label="状态栏">
+    <div class="status-scrim" id="status-scrim"></div>
+    <div class="status-sheet glass">
+      <div class="status-sheet-head"><span>状态栏</span><span id="status-pos" class="muted"></span></div>
+      <div id="status-custom" class="status-custom"></div>
+      <div id="status-raw" class="status-raw"></div>
+      <div id="status-history" class="status-history"></div>
+      <div class="status-sheet-foot">
+        <button id="status-prev" class="ghost-btn">‹ 上一个</button>
+        <button id="status-next" class="ghost-btn">下一个 ›</button>
+        <button id="status-close" class="ghost-btn">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 管理二级页 -->
   <div class="subpage" id="sub-persona">
     <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>人设</h2><span class="sub-head-spacer"></span></div>
@@ -198,12 +235,30 @@
     <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>数据管理</h2><span class="sub-head-spacer"></span></div>
     <div class="sub-body"></div>
   </div>
+  <div class="subpage" id="sub-notify">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>通知与唤醒</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
   <div class="subpage" id="sub-appearance">
     <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>外观与背景</h2><span class="sub-head-spacer"></span></div>
     <div class="sub-body"></div>
   </div>
   <div class="subpage" id="sub-tokens">
     <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>设计变量</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+
+  <!-- 聊天记录中心（B 组）：入口在聊天顶栏 ··· 菜单；内容由 js/app.js 填充 -->
+  <div class="subpage" id="sub-chat-search">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>搜索聊天</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-chat-favorites">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>消息收藏</h2><span class="sub-head-spacer"></span></div>
+    <div class="sub-body"></div>
+  </div>
+  <div class="subpage" id="sub-chat-dates">
+    <div class="sub-head"><button class="icon-btn sub-back" data-sub-close aria-label="返回"><svg class="icon"><use href="#i-chev-l"/></svg></button><h2>按日期查看</h2><span class="sub-head-spacer"></span></div>
     <div class="sub-body"></div>
   </div>
 
@@ -227,19 +282,19 @@
   <div id="sticker-sheet" class="sheet hidden">
     <div class="sheet-card glass">
       <div class="sheet-title">表情包 <span id="sticker-count" class="muted"></span></div>
+      <div class="sticker-tools">
+        <input type="search" id="sticker-search" placeholder="搜索表情包名称…" aria-label="搜索表情包" autocomplete="off">
+        <div id="sticker-groups" class="sticker-chips"></div>
+      </div>
       <div id="sticker-grid" class="sticker-grid"></div>
+      <p id="sticker-empty" class="muted sticker-empty hidden"></p>
+      <button id="sticker-more" class="sheet-cancel hidden">加载更多</button>
       <button class="sheet-cancel" data-close>取消</button>
     </div>
   </div>
 
-  <!-- 长按菜单 -->
-  <div id="msg-menu" class="sheet hidden">
-    <div class="sheet-card glass">
-      <div class="sheet-title">消息</div>
-      <div id="msg-menu-actions" class="menu-list"></div>
-      <button class="sheet-cancel" data-close>取消</button>
-    </div>
-  </div>
+  <!-- 长按菜单：旧 #msg-menu 底部 sheet 已退役，改走 js/longPressMenu.js
+       的浮动菜单（跟随气泡位置 + 独立反应条），见 app.js attachMsgMenu。 -->
 
   <!-- 通用弹窗 -->
   <div id="modal" class="modal hidden">

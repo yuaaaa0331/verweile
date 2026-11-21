@@ -24,6 +24,7 @@ export const ManageView = (() => {
       label: '连接',
       rows: [
         { id: 'api', icon: 'key', name: 'API 设置', desc: '', count: (s) => (s.apiSettings?.key ? (s.apiSettings.model || '已配置') : '模拟模式') },
+        { id: 'notify', icon: 'sun', name: '通知与唤醒', desc: '站内横幅、音频保活、推送、主动唤醒' },
         { id: 'mcp', icon: 'server', name: 'MCP', desc: '', count: () => '未接入' },
       ],
     },
@@ -164,8 +165,8 @@ export const ManageView = (() => {
         ['弱化文字', get('--ink-3') || '#86868b'],
         ['主题蓝', get('--accent') || '#0071e3'],
         ['深蓝', get('--accent-deep') || '#0060c9'],
-        ['我方气泡', get('--bubble-me') || '#d6ebff'],
-        ['对方气泡', get('--bubble-ai') || 'rgba(255,255,255,.62)'],
+        ['我方气泡', get('--bubble-me') || 'rgba(221, 221, 221, .35)'],
+        ['对方气泡', get('--bubble-ai') || 'rgba(255, 255, 255, .22)'],
         ['在线绿', '#34c759'],
       ]) {
         const cell = el('div', 'token-cell');
@@ -183,8 +184,8 @@ export const ManageView = (() => {
       const mono = el('pre', 'mono-block', [
         `大卡片 ${get('--r-lg') || '28px'} · 中卡片 ${get('--r-md') || '22px'} · 小圆角 ${get('--r-sm') || '14px'} · 气泡 ${get('--r-bubble') || '22px'}`,
         '页面边距 14 · 卡片内距 16 · 消息间距 3 · 头像 42 / 30 · 触控目标 ≥ 40',
-        '玻璃：填充 rgba(255,255,255,.06) · 雾化 8px · 边缘高光上限 0.45',
-        '亮度钳制：相对壁纸 +0.10 / -0.16 · 光源强度默认 55% · 白色染色 2%',
+        '玻璃：填充 rgba(255,255,255,.05) · 雾化 6px · 边缘高光上限 0.18',
+        '亮度钳制：相对壁纸 +0.06 / -0.16 · 光源强度默认 55% · 白色染色 0%',
         '图标：单色描边 currentColor · 线宽 1.8 · 22px（小 18 / 大 25）',
       ].join('\n'));
       shapeCard.appendChild(mono);

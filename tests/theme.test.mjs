@@ -28,7 +28,7 @@ test('hexA：hex 转带透明度的 rgba', () => {
 test('THEME_DEFAULTS：verweile 默认外观', () => {
   assert.equal(THEME_DEFAULTS.light, 55);
   assert.equal(THEME_DEFAULTS.veil, 12);
-  assert.equal(THEME_DEFAULTS.glass, 12);
+  assert.equal(THEME_DEFAULTS.glass, 6);
   assert.equal(THEME_DEFAULTS.refract, 32);
   assert.equal(THEME_DEFAULTS.depth, 42);
   assert.equal(THEME_DEFAULTS.dispersion, 0);
@@ -48,10 +48,10 @@ test('内置黑白灰色板', () => {
 
 test('glassParamsFor：主题值映射到 WebGL 参数', () => {
   const p = glassParamsFor(THEME_DEFAULTS);
-  assert.equal(p.blur, 1.92); // glass 12 -> max(0, 12-6)*0.32
-  assert.equal(p.edge, 15);
-  assert.equal(p.shine, 6);
-  assert.equal(p.tint, 2);
+  assert.equal(p.blur, 0); // glass 6 -> max(0, 6-6)*0.32（clear 材质零模糊起步）
+  assert.equal(p.edge, 8);
+  assert.equal(p.shine, 2);
+  assert.equal(p.tint, 0);
   assert.equal(p.light, 0.55); // light 55 -> /100
   assert.equal(p.depth, 0.42); // depth 42 -> /100
   assert.equal(p.dispersion, 0);
@@ -61,33 +61,38 @@ test('glassParamsFor：主题值映射到 WebGL 参数', () => {
   assert.ok(Math.abs(p.lightAngle - (-2.38)) < 0.01, `lightAngle ${p.lightAngle}`);
   // 边界：glass 6 以下 blur 为 0
   assert.equal(glassParamsFor({ ...THEME_DEFAULTS, glass: 6 }).blur, 0);
+  // 旧默认 glass 12 的映射保留：1.92（老用户已存值不重置时仍按此映射）
+  assert.equal(glassParamsFor({ ...THEME_DEFAULTS, glass: 12 }).blur, 1.92);
 });
 
-test('LiquidGlass.DEFAULT_PARAMS 与原型引擎默认值一致', () => {
+test('LiquidGlass.DEFAULT_PARAMS 与主题默认一致（clear 精修后）', () => {
   assert.deepEqual(LiquidGlass.DEFAULT_PARAMS, {
-    refract: 20, blur: 0, edge: 15, shine: 6, wobble: 8, tint: 2,
-    lightAngle: -2.38, light: 0.55, dispersion: 5, depth: 0.32,
+    refract: 32, blur: 0, edge: 8, shine: 2, wobble: 3, tint: 0,
+    lightAngle: -2.38, light: 0.55, dispersion: 0, depth: 0.42,
   });
 });
 
-test('LiquidGlass 着色器包含亮度修正：硬钳制 + 边缘辉光上限 + 玻璃面透明度 0.52', () => {
+test('LiquidGlass 着色器包含 clear 精修：输出 mask 不透明 + 亮度钳制 +0.06 + 边缘辉光上限 0.18', () => {
   const src = readFileSync(resolve(root, 'js/liquidGlass.js'), 'utf8');
-  // 硬亮度钳制：玻璃不能比背后背景亮太多（+0.10 / -0.16）
-  assert.ok(src.includes('clamp(col.rgb - baseCol, vec3(-0.16), vec3(0.10))'), '缺少亮度硬钳制');
-  // 边缘辉光上限 0.45（无热点）
-  assert.ok(src.includes('clamp(edgeGlint, 0.0, 0.45)'), '缺少 edgeGlint 上限 0.45');
-  // WebGL 玻璃面最终透明度 0.52（不是早期 0.96）
-  assert.ok(src.includes('mask * 0.52'), '缺少 mask * 0.52');
+  // 输出 alpha 即 mask（不透明），不再乘 0.52（画布与页面背板重影已除）
+  assert.ok(src.includes('gl_FragColor = vec4(col.rgb, mask);'), '输出应为 vec4(col.rgb, mask)');
+  assert.ok(!src.includes('mask * 0.52'), '不应残留 mask * 0.52');
+  // 硬亮度钳制：玻璃不能比背后背景亮太多（+0.06 / -0.16）
+  assert.ok(src.includes('clamp(col.rgb - baseCol, vec3(-0.16), vec3(0.06))'), '缺少亮度硬钳制 +0.06');
+  assert.ok(!src.includes('vec3(0.10)'), '不应残留旧钳制 +0.10');
+  // 边缘辉光上限 0.18（无热点）
+  assert.ok(src.includes('clamp(edgeGlint, 0.0, 0.18)'), '缺少 edgeGlint 上限 0.18');
+  assert.ok(!src.includes('clamp(edgeGlint, 0.0, 0.45)'), '不应残留 0.45 上限');
   // PDF 公式：上下辉光系数 0.66 / 0.48
   assert.ok(src.includes('upperLeft * 0.66 + lowerRight * 0.48'), '缺少 PDF 辉光公式');
 });
 
-test('styles.css：轻玻璃默认值（无早期厚重值）', () => {
+test('styles.css：clear 轻玻璃默认值', () => {
   const css = readFileSync(resolve(root, 'styles.css'), 'utf8');
-  assert.ok(css.includes('--glass-blur-amt: 12px'), '玻璃模糊应为 12px');
-  assert.ok(css.includes('--glass-bg: rgba(255, 255, 255,.16)'), '玻璃底色应为 .16');
+  assert.ok(css.includes('--glass-blur-amt: 6px'), '玻璃模糊应为 6px');
+  assert.ok(css.includes('--glass-bg: rgba(255, 255, 255, .05)'), '玻璃底色应为 .05');
   assert.ok(css.includes('--bg-veil: .12'), '遮罩应为 .12');
-  assert.ok(css.includes('--bubble-ai: rgba(255, 255, 255, .62)'), 'AI 气泡应为 62% 透明');
+  assert.ok(css.includes('--bubble-ai: rgba(255, 255, 255, .22)'), 'AI 气泡应为 22% 透明');
   assert.ok(!css.includes('0 32px'), '不应残留 32px 大阴影');
-  assert.ok(css.includes('backdrop-filter: blur(8px) saturate(1.25)'), 'AI 气泡应有 8px 模糊');
+  assert.ok(css.includes('backdrop-filter: blur(6px) saturate(1.1)'), 'AI 气泡应有 6px 模糊');
 });

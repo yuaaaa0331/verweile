@@ -37,6 +37,17 @@ export function applyStatusTemplate(raw, panel, ctx) {
   return { raw: m[0], html };
 }
 
+/** 合并头像标签自带的属性：class 与标记类合并成一个 class 属性。
+ *  直接拼接会产生两个 class 属性，浏览器只认第一个，模板自己的样式类就丢了
+ *  （例如 <char-avatar class="thx-ava"> 的 thx-ava 会失效）。 */
+function mergeAvatarAttrs(attrs, markerClass) {
+  const a = String(attrs || '');
+  const m = a.match(/class\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+  if (!m) return ` class="${markerClass}"${a}`;
+  const rest = a.replace(/class\s*=\s*(?:"[^"]*"|'[^']*')/i, '').trim();
+  return ` class="${markerClass} ${(m[1] ?? m[2]).trim()}"${rest ? ` ${rest}` : ''}`;
+}
+
 /** 原始 UWU processTemplate 的变量替换：头像与名字进模板。
  *  缺名字时用原始 UWU 的默认值（User/Character）；缺头像时把 <…-avatar> 标签
  *  换成空 span（不留破图、不留字面量占位符）。 */
@@ -55,9 +66,9 @@ export function substituteTemplateVars(html, ctx = {}) {
   out = out.replace(/{{char_remark}}/g, charRemark);
   out = out.replace(/{{user_remark}}/g, userRemark);
   out = out.replace(/<user-avatar([^>]*)>\s*(?:<\/user-avatar>)?/gi, (_, attrs) =>
-    (userAvatar ? `<img src="${userAvatar}" class="uwu-user-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+    (userAvatar ? `<img src="${userAvatar}"${mergeAvatarAttrs(attrs, 'uwu-user-avatar')}>` : `<span${mergeAvatarAttrs(attrs, 'uwu-avatar-empty')}></span>`));
   out = out.replace(/<char-avatar([^>]*)>\s*(?:<\/char-avatar>)?/gi, (_, attrs) =>
-    (charAvatar ? `<img src="${charAvatar}" class="uwu-char-avatar"${attrs}>` : `<span class="uwu-avatar-empty"${attrs}></span>`));
+    (charAvatar ? `<img src="${charAvatar}"${mergeAvatarAttrs(attrs, 'uwu-char-avatar')}>` : `<span${mergeAvatarAttrs(attrs, 'uwu-avatar-empty')}></span>`));
   return out;
 }
 
@@ -173,7 +184,9 @@ function pickBodyAttrs(attrStr) {
  *  CSS 变量、伪元素、动画、媒体查询、图片、内联 SVG、details/summary、
  *  表单控件与脚本），去掉 <base>，再套上隔离样式与高度上报脚本。
  *  片段：直接作为 body 内容。opts.marker 会以注释形式插在 body 开头，
- *  用于父页面强制刷新同一份 srcdoc。 */
+ *  用于父页面强制刷新同一份 srcdoc。opts.frameId 会带进高度上报消息，
+ *  供父页面把高度路由到对应的 iframe（聊天页 HTML 卡片用；状态栏弹窗不传，
+ *  沿用原来的无 id 上报格式）。 */
 export function buildStatusDocument(html, opts = {}) {
   const input = String(html ?? '');
   const isFullDoc = /<!doctype html|<html[\s>]/i.test(input);
@@ -196,6 +209,12 @@ export function buildStatusDocument(html, opts = {}) {
   }
   headInner = headInner.replace(/<base\b[^>]*>/gi, '');
   const marker = opts.marker ? '<' + '!--' + String(opts.marker).replace(/--/g, '') + '-->' : '';
+  const heightScript = opts.frameId
+    ? STATUS_FRAME_SCRIPT.replace(
+      `parent.postMessage({type:MSG,height:contentHeight()},'*')`,
+      `parent.postMessage({type:MSG,height:contentHeight(),frame:${JSON.stringify(String(opts.frameId))}},'*')`,
+    )
+    : STATUS_FRAME_SCRIPT;
   // 注意：下面拼接的闭合 script 标签必须写成反斜杠转义形式，注释标记也要拆开写——
   // dist 是把 bundle 内联进 script 元素的单文件，字面量会提前闭合外层 script，
   // 导致整包截断（SyntaxError: Unexpected end of input）。运行时拼出的仍是正常字符串。
@@ -205,5 +224,5 @@ export function buildStatusDocument(html, opts = {}) {
     + `<script>${STATUS_HEAD_SCRIPT}<\/script>`
     + headInner
     + `<style>\n${STATUS_FRAME_CSS}\n</style>`
-    + `</head><body${bodyAttrs}>${marker}${bodyInner}<script>${STATUS_FRAME_SCRIPT}<\/script></body></html>`;
+    + `</head><body${bodyAttrs}>${marker}${bodyInner}<script>${heightScript}<\/script></body></html>`;
 }

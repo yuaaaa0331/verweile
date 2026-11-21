@@ -61,7 +61,7 @@ const over = buildSystemPrompt(fixtureCharacter({ promptOverride: '自定义覆�
 assert.equal(over.systemPrompt, '自定义覆盖层');
 const empty = buildSystemPrompt(char, {...deps, relatedMemories: []});
 assert.ok(!empty.systemPrompt.includes('相关记忆'));
-const withMem = buildSystemPrompt(char, {...deps, relatedMemories: [{ title: '检索到的', content: '某事', source: 'vector（待接入）'}]});
+const withMem = buildSystemPrompt(char, {...deps, relatedMemories: [{ docId: 'j9', title: '检索到的', content: '某事', source: 'vector（待接入）', sourceStatus: 'sourced' }]});
 assert.ok(withMem.systemPrompt.includes('检索到的'));
 });
 

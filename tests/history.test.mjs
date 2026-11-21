@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildSystemPrompt } from '../js/promptBuilder.js';
-import { buildRequest, filterHistoryForRequest } from '../js/historyBuilder.js';
+import { buildRequest, filterHistoryForRequest, withdrawnPlaceholder } from '../js/historyBuilder.js';
 import { fixtureCharacter, fixtureWorldBooks, fixtureStickers, globalSettings, countOccurrences } from './helpers.mjs';
 
 const char = fixtureCharacter();
@@ -76,15 +76,30 @@ test('禁用上下文、思考内容、空消息被排除；图像 parts 不丢�
 test('撤回消息按可见占位序列化，原文不再出现；引用序列化', () => {
   const history = [
     msg({ id: 'u1', content: '[朵朵的消息：普通消息]', timestamp: T0 }),
-    // 撤回后记录本身变成占位（UWU 实际流程），原文只在占位里出现一次
+    // 撤回后只剩占位：originalContent 留在本地记录里，绝不进请求
     msg({ id: 'u2', content: '[朵朵 撤回了一条消息：秘密内容不要外传]', isWithdrawn: true, originalContent: '秘密内容不要外传', timestamp: T0 + 1000 }),
     msg({ id: 'u3', content: '[朵朵的消息：引用测试]', quote: { content: '你好呀', messageId: 'a1' }, timestamp: T0 + 2000 }),
   ];
   const { body } = buildRequest(char, history, sys);
   const json = JSON.stringify(body.messages);
-  assert.equal(countOccurrences(json, '秘密内容不要外传'), 1, '撤回原文只应出现在占位里一次');
+  assert.equal(countOccurrences(json, '秘密内容不要外传'), 0, '撤回原文绝不能进请求，占位里也不带');
   assert.ok(json.includes('撤回了一条消息'));
   assert.ok(json.includes('[朵朵引用“你好呀”并回复：引用测试]'));
+});
+
+test('withdrawnPlaceholder：只留“撤回了一条消息”，不拼 originalContent 也不拼 content 原文', () => {
+  const userMsg = { id: 'u1', role: 'user', content: '[朵朵的消息：秘密内容不要外传]', isWithdrawn: true, originalContent: '秘密内容不要外传' };
+  const asstMsg = { id: 'a1', role: 'assistant', content: '[阿澈的消息：另一句秘密]', isWithdrawn: true, originalContent: '另一句秘密' };
+  assert.equal(withdrawnPlaceholder(userMsg, char), '[朵朵 撤回了一条消息]');
+  assert.equal(withdrawnPlaceholder(asstMsg, char), '[阿澈撤回了一条消息]');
+  // 经 filterHistoryForRequest 后，撤回消息只有占位 part，原文彻底消失
+  const filtered = filterHistoryForRequest(char, [userMsg, asstMsg]);
+  assert.equal(filtered.length, 2);
+  for (const m of filtered) {
+    assert.equal(m.parts.length, 1);
+    assert.match(m.parts[0].text, /撤回了一条消息/);
+    assert.equal(m.content.includes('秘密'), false);
+  }
 });
 
 test('同角色相邻合并；时间标记每 10 分钟出现；maxMemory 字符串 80 生效', () => {

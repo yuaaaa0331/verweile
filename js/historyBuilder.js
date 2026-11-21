@@ -34,14 +34,13 @@ export function extractProtocolText(content) {
   return m ? m[1].trim() : content.trim();
 }
 
-/** 被撤回消息的可见占位：只保留占位文字，绝不把原 文重新加入上下文。 */
+/** 被撤回消息的可见占位：只保留占位文字，绝不把原文重新加入上下文。
+ * originalContent 只存在本地记录里（界面显示“你撤回了一则讯息”用），
+ * 发给模型的占位里只有“撤回了一条消息”，不含原文。 */
 export function withdrawnPlaceholder(msg, character) {
   const name = msg?.role === 'user' ? (character?.myName || '我') : (character?.realName || '对方');
-  const orig = msg?.originalContent
-    || extractProtocolText(msg?.content || '')
-    || '';
   const sep = msg?.role === 'user' ? ' ' : '';
-  return `[${name}${sep}撤回了一条消息：${orig}]`;
+  return `[${name}${sep}撤回了一条消息]`;
 }
 
 function cleanTextForRequest(text, bilingual, role) {

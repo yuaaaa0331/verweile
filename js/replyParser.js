@@ -52,9 +52,11 @@ export function parseReplyText(raw, character, opts = {}) {
   const patterns = [
     { kind: 'withdraw', re: new RegExp(`^\\[(?:${rn}|${mn})撤回了一条消息[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'quote', re: new RegExp(`^\\[${rn}引用[“"]([\\s\\S]*?)["”]并回复[：:]([\\s\\S]*?)\\]${END}`) },
-    { kind: 'sticker', re: new RegExp(`^\\[${rn}的表情包[：:]([\\s\\S]*?)\\]${END}`) },
-    { kind: 'photo', re: new RegExp(`^\\[${rn}发来的照片\\/视频[：:]([\\s\\S]*?)\\]${END}`) },
-    { kind: 'voice', re: new RegExp(`^\\[${rn}的语音[：:]([\\s\\S]*?)\\]${END}`) },
+    { kind: 'sticker', re: new RegExp(`^\\[(?:${rn}|${mn})(?:发送)?的表情包[：:]([\\s\\S]*?)\\]${END}`) },
+    // 语音与照片描述：面板发出的消息用的是 myName（[朵朵的语音：…] /
+    // [朵朵发来的照片/视频：…]），与 sticker 同款写法认 (realName|myName)。
+    { kind: 'photo', re: new RegExp(`^\\[(?:${rn}|${mn})发来的照片\\/视频[：:]([\\s\\S]*?)\\]${END}`) },
+    { kind: 'voice', re: new RegExp(`^\\[(?:${rn}|${mn})的语音[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'transfer', re: new RegExp(`^\\[${rn}的转账[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'gift', re: new RegExp(`^\\[${rn}送来的礼物[：:]([\\s\\S]*?)\\]${END}`) },
     { kind: 'status', re: new RegExp(`^\\[${rn}更新状态为[：:]([\\s\\S]*?)\\]${END}`) },

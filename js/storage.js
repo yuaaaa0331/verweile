@@ -1,11 +1,17 @@
 // storage.js — 持久化（storageAdapter）。
 // IndexedDB 分表保存：characters / worldBooks / stickers / journals / messages /
-// attachments / statusTemplates / settings / unknown。消息按记录增量写入，
-// 绝不每发一条就全量 JSON 覆写；localStorage 只放很小的偏好。
+// attachments / statusTemplates / settings / unknown / experiences / keywordIndex /
+// wakeScenes / wakeAlarms / wakeReceipts。
+// 消息按记录增量写入，绝不每发一条就全量 JSON 覆写；localStorage 只放很小的偏好。
 // schema 升级不清空数据库。Node 测试用 MemoryBackend 实现同一接口。
 
 export const DB_NAME = 'uwu-chat-db';
-export const DB_VERSION = 1;
+export const DB_VERSION = 4;
+
+/** B 组设置键（settings 表的 key）：通知 / 音频保活 / 推送 / 自定义图标 / 唤醒。 */
+export const B_GROUP_SETTINGS_KEYS = ['notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings'];
+/** B 组未读计数键（settings 表的 key，值 { charId: count }，见 inAppNotify.js）。 */
+export const NOTIFY_UNREAD_SETTINGS_KEY = 'notifyUnread';
 export const PAGE_SIZE = 50;
 
 /** 内存后端：与 IDB 后端同一接口，供 Node 测试与 3 万条合成验证使用。 */
@@ -15,12 +21,14 @@ export class MemoryBackend {
       characters: new Map(), worldBooks: new Map(), stickers: new Map(),
       journals: new Map(), messages: new Map(), attachments: new Map(),
       statusTemplates: new Map(), settings: new Map(), unknown: new Map(),
+      vectorChunks: new Map(), experiences: new Map(), keywordIndex: new Map(),
+      wakeScenes: new Map(), wakeAlarms: new Map(), wakeReceipts: new Map(),
     };
     this.msgOrder = []; // {id, charId, timestamp} 按写入顺序
   }
   async init() { return this; }
   async put(table, value) {
-    const key = value.id ?? value.key;
+    const key = value.id ?? value.key ?? value.wakeId; // wakeReceipts 以 wakeId 为键
     this.tables[table].set(key, structuredClone(value));
     if (table === 'messages') this.msgOrder.push({ id: value.id, charId: value.charId, timestamp: value.timestamp });
     return key;
@@ -62,6 +70,74 @@ export class MemoryBackend {
     const { messages } = await this.getMessagesPage(charId, { before: Infinity, limit: Number.MAX_SAFE_INTEGER });
     return messages;
   }
+  /** 只取当前角色 + 当前索引空间的向量段（不加载全库）。 */
+  async getVectorChunks(charId, spaceKey) {
+    return [...this.tables.vectorChunks.values()]
+      .filter((c) => c.charId === charId && c.spaceKey === spaceKey)
+      .map((v) => structuredClone(v));
+  }
+}
+
+/**
+ * v1→v2 迁移：只新增 vectorChunks 表（keyPath id，索引 byCharSpace / byJournal），
+ * 绝不重建、不清空已有表；老库（只有 journals 等旧表）升级后旧数据原样保留。
+ * 导出供测试用假 db 验证迁移逻辑；IDBBackend.open 的 onupgradeneeded 也走它。
+ */
+export function ensureVectorStores(db) {
+  if (!db.objectStoreNames.contains('vectorChunks')) {
+    const s = db.createObjectStore('vectorChunks', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byCharSpace', ['charId', 'spaceKey'], { unique: false });
+      s.createIndex('byJournal', 'journalId', { unique: false });
+    }
+  }
+  return db;
+}
+
+/**
+ * v2→v3 迁移：只新增 experiences 表（keyPath id，索引 byChar [charId, timestamp]）
+ * 与 keywordIndex 空表（keyPath id，索引 byChar [charId, term]），绝不重建、
+ * 不清空已有表；老库升级后旧数据原样保留。本波只建表不写数据：
+ * experiences 由经历提取写入，keywordIndex 的倒排数据由第 2 波写入。
+ * 导出供测试用假 db 验证迁移逻辑；IDBBackend.open 的 onupgradeneeded 也走它。
+ */
+export function ensureExperienceStores(db) {
+  if (!db.objectStoreNames.contains('experiences')) {
+    const s = db.createObjectStore('experiences', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byChar', ['charId', 'timestamp'], { unique: false });
+    }
+  }
+  if (!db.objectStoreNames.contains('keywordIndex')) {
+    const s = db.createObjectStore('keywordIndex', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byChar', ['charId', 'term'], { unique: false });
+    }
+  }
+  return db;
+}
+
+/**
+ * v3→v4 迁移：只新增 wakeScenes / wakeAlarms / wakeReceipts 三张表（与
+ * js/wakeEngine.js 的 ensureWakeStores 同一建表逻辑，本函数是 storage.js
+ * 内的独立实现，不 import wakeEngine，避免循环依赖），绝不重建、不清空
+ * 已有表；老库升级后旧数据原样保留。wakeReceipts 以 wakeId 为 keyPath。
+ * 导出供测试用假 db 验证迁移逻辑；IDBBackend.open 的 onupgradeneeded 也走它。
+ */
+export function ensureWakeStores(db) {
+  if (!db.objectStoreNames.contains('wakeScenes')) {
+    const s = db.createObjectStore('wakeScenes', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') {
+      s.createIndex('byChar', ['charId', 'nextAt'], { unique: false });
+      s.createIndex('byStatus', ['status', 'nextAt'], { unique: false });
+    }
+  }
+  if (!db.objectStoreNames.contains('wakeAlarms')) {
+    const s = db.createObjectStore('wakeAlarms', { keyPath: 'id' });
+    if (typeof s.createIndex === 'function') s.createIndex('byChar', ['charId', 'at'], { unique: false });
+  }
+  if (!db.objectStoreNames.contains('wakeReceipts')) db.createObjectStore('wakeReceipts', { keyPath: 'wakeId' });
+  return db;
 }
 
 /** 浏览器 IndexedDB 后端。 */
@@ -86,6 +162,9 @@ export class IDBBackend {
         if (!db.objectStoreNames.contains('statusTemplates')) db.createObjectStore('statusTemplates', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'key' });
         if (!db.objectStoreNames.contains('unknown')) db.createObjectStore('unknown', { keyPath: 'key' });
+        ensureVectorStores(db);
+        ensureExperienceStores(db);
+        ensureWakeStores(db);
       };
       req.onsuccess = () => { this.db = req.result; resolve(this.db); };
       req.onerror = () => reject(req.error);
@@ -101,7 +180,7 @@ export class IDBBackend {
       t.onabort = () => reject(t.error || new Error('transaction aborted'));
     }));
   }
-  async put(table, value) { await this.tx(table, 'readwrite', (s) => s.put(structuredClone(value))); return value.id ?? value.key; }
+  async put(table, value) { await this.tx(table, 'readwrite', (s) => s.put(structuredClone(value))); return value.id ?? value.key ?? value.wakeId; }
   async putMany(table, values) {
     await this.tx(table, 'readwrite', (s) => { for (const v of values) s.put(structuredClone(v)); });
   }
@@ -121,6 +200,16 @@ export class IDBBackend {
   }
   async delete(table, key) { await this.tx(table, 'readwrite', (s) => s.delete(key)); }
   async clear(table) { await this.tx(table, 'readwrite', (s) => s.clear()); }
+  /** 只取当前角色 + 当前索引空间的向量段（走 byCharSpace 索引，不加载全库）。 */
+  async getVectorChunks(charId, spaceKey) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const idx = db.transaction('vectorChunks', 'readonly').objectStore('vectorChunks').index('byCharSpace');
+      const req = idx.getAll(IDBKeyRange.only([charId, spaceKey]));
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
   async countMessages(charId) {
     const db = await this.open();
     return new Promise((resolve, reject) => {

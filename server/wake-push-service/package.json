@@ -1,0 +1,1 @@
+{"dependencies":{"web-push":"^3.6.7"},"description":"verweile 可选后台推送服务（最小版）：保存推送订阅、到期检查后发 Web Push。不部署、不购买服务时前端仍以前端运行模式工作。","engines":{"node":">=18"},"name":"wake-push-service","private":true,"scripts":{"start":"node server.mjs"},"type":"module","version":"0.1.0"}

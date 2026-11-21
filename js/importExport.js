@@ -7,6 +7,7 @@
 // 未识别字段（向量 entries、模板绑定、记忆来源等）原样保存，标注“待接入”；
 // 凭据默认不导出，含密钥的私人备份需明确选择。
 import { hashString } from './utils.js';
+import { createExperienceRecord } from './experiences.js';
 
 function toUint8(input) {
   if (input instanceof Uint8Array) return input;
@@ -353,8 +354,9 @@ const KNOWN_CHAR_FIELDS = new Set(['id', 'realName', 'myName', 'remarkName', 'my
   'isPinned', 'avatarMode', 'showTimestamp', 'timestampPosition', 'customBubbleCss', 'useCustomBubbleCss',
   'showStatusUpdateMsg', 'promptOverride', 'memoryMode', 'isContextDisabled']);
 const KNOWN_TOP_FIELDS = new Set(['characters', 'groups', 'worldBooks', 'myStickers', 'memoryJournals',
-  'apiSettings', 'apiPresets', 'cotSettings', 'cotPresets', 'globalSettings', 'settings',
-  'version', 'appVersion', 'exportedAt', 'backupVersion', 'messages', 'history', 'data', 'formatName', 'formatVersion']);
+  'apiSettings', 'apiPresets', 'summaryApi', 'embeddingApi', 'cotSettings', 'cotPresets', 'globalSettings', 'settings',
+  'version', 'appVersion', 'exportedAt', 'backupVersion', 'messages', 'history', 'data', 'formatName', 'formatVersion', 'experiences',
+  'notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings', 'wakeScenes', 'wakeAlarms', 'wakeReceipts']);
 
 /** Dexie 导出（{ formatName, data: { tables: [{ name, rows }] } }）转回标准备份结构。 */
 function dexieTablesToBackup(tables) {
@@ -382,6 +384,7 @@ function dexieTablesToBackup(tables) {
   if (byName.get('myStickers')) out.myStickers = byName.get('myStickers');
   if (byName.get('memoryJournals')) out.memoryJournals = byName.get('memoryJournals');
   if (byName.get('journals')) out.memoryJournals = [...out.memoryJournals, ...byName.get('journals')];
+  if (byName.get('experiences')) out.experiences = byName.get('experiences');
   if (byName.get('groups')) out.groups = byName.get('groups');
   return out;
 }
@@ -421,8 +424,10 @@ export function normalizeBackup(raw) {
     data = { ...data, characters: groupMessagesIntoCharacters(topMessages) };
   }
   const out = {
-    characters: [], worldBooks: [], stickers: [], journals: [],
-    groups: [], apiSettings: null, apiPresets: [], cotSettings: null,
+    characters: [], worldBooks: [], stickers: [], journals: [], experiences: [],
+    groups: [], apiSettings: null, apiPresets: [], summaryApi: null, embeddingApi: null, cotSettings: null,
+    notifySettings: null, audioKeepAlive: null, pushSettings: null, customIcon: null, wakeSettings: null,
+    wakeScenes: [], wakeAlarms: [], wakeReceipts: [],
     unknown: {}, gaps: [],
   };
   const chars = Array.isArray(data.characters) ? data.characters : [];
@@ -464,12 +469,34 @@ export function normalizeBackup(raw) {
   if (Array.isArray(data.memoryJournals)) {
     out.journals = data.memoryJournals.map((j) => normalizeJournal(j, null));
   }
+  // 经历是源数据（不是可重建的索引缓存），必须随备份走：顶层 experiences 字段，
+  // 与 journals 同级。向量/关键词索引不导出，恢复后记忆页显示“未建立/缺失 N 条”。
+  if (Array.isArray(data.experiences)) {
+    for (const e of data.experiences) {
+      const n = normalizeExperience(e);
+      if (n) out.experiences.push(n);
+      else out.gaps.push('有 1 条经历缺少角色 ID 或原话来源，已跳过。');
+    }
+  }
   out.groups = Array.isArray(data.groups) ? data.groups : [];
   if (out.groups.length) out.gaps.push(`备份含 ${out.groups.length} 个群聊，本阶段为单人聊天，不展示群聊，但数据已原样保存。`);
   out.apiSettings = data.apiSettings || null;
   out.apiPresets = Array.isArray(data.apiPresets) ? data.apiPresets : [];
+  // 两套独立副 API 配置：与主 API 一样，导入时只留非 Key 字段待确认，Key 永不自动恢复。
+  out.summaryApi = data.summaryApi || null;
+  out.embeddingApi = data.embeddingApi || null;
   // 全局提示词设置：顶层 cotSettings 优先，其次 globalSettings 里的 cotSettings。
   out.cotSettings = data.cotSettings || data.globalSettings?.cotSettings || null;
+  // B 组设置与唤醒表：与 api / assocSettings 同一模式随备份走；
+  // pushSettings.vapidPublicKey 是公钥，私钥只在服务器 .env，绝不进备份。
+  out.notifySettings = data.notifySettings || null;
+  out.audioKeepAlive = data.audioKeepAlive || null;
+  out.pushSettings = data.pushSettings || null;
+  out.customIcon = data.customIcon || null;
+  out.wakeSettings = data.wakeSettings || null;
+  out.wakeScenes = Array.isArray(data.wakeScenes) ? data.wakeScenes : [];
+  out.wakeAlarms = Array.isArray(data.wakeAlarms) ? data.wakeAlarms : [];
+  out.wakeReceipts = Array.isArray(data.wakeReceipts) ? data.wakeReceipts : [];
   for (const k of Object.keys(data)) {
     if (!KNOWN_TOP_FIELDS.has(k)) out.unknown[k] = data[k];
   }
@@ -488,8 +515,28 @@ function splitUnknown(obj, known) {
 
 function normalizeJournal(j, charId) {
   if (!j || typeof j !== 'object') return j;
-  const { _unknown, ...rest } = splitUnknown(j, new Set(['id', 'title', 'content', 'isFavorited', 'timestamp', 'createdAt', 'source', 'charId', 'characterId']));
+  const { _unknown, ...rest } = splitUnknown(j, new Set(['id', 'title', 'content', 'isFavorited', 'timestamp', 'createdAt', 'source', 'charId', 'characterId', 'isSummary', 'sourceMessageIds', 'range', 'retrievalEnabled']));
   return { ...rest, charId: charId ?? j.charId ?? j.characterId ?? null, _unknown };
+}
+
+/**
+ * 归一化一条经历：复用 experiences.createExperienceRecord 做形状校验
+ * （原话必须带来源消息 ID、线索最多 4 条、plan/outcome 分离、outcome 须有
+ * 后续原文佐证），非法形状返回 null 由调用方记入 gaps。createdAt/updatedAt
+ * 按备份原值保留，不以导入时间覆盖。
+ */
+function normalizeExperience(e) {
+  if (!e || typeof e !== 'object') return null;
+  const charId = e.charId ?? e.characterId ?? null;
+  if (!charId) return null;
+  try {
+    const n = createExperienceRecord({ ...e, charId });
+    if (Number.isFinite(e.createdAt)) n.createdAt = e.createdAt;
+    if (Number.isFinite(e.updatedAt)) n.updatedAt = e.updatedAt;
+    return n;
+  } catch {
+    return null;
+  }
 }
 
 /** 无 ID 的消息用稳定 ID 识别：charId + timestamp + 内容哈希；绝不按正文/时间去重删除。 */
@@ -511,14 +558,25 @@ function normalizeMessage(m, charId) {
 
 export function previewCounts(normalized) {
   const messages = normalized.characters.reduce((s, c) => s + (c.history?.length || 0), 0);
+  // 记忆数按导出实际结构算：角色内嵌的 memoryJournals + 顶层 journals，
+  // 同 id 只计一次（导出时两者是同一批记忆的两种写法，不是两批）。
+  const journalIds = new Set();
+  for (const c of normalized.characters) {
+    for (const j of c.memoryJournals || []) journalIds.add(j?.id || `char:${c.id}|${j?.title || ''}|${j?.timestamp || ''}`);
+  }
+  for (const j of normalized.journals || []) journalIds.add(j?.id || `top:${j?.title || ''}|${j?.timestamp || ''}`);
   return {
     characters: normalized.characters.map((c) => ({
-      id: c.id, realName: c.realName, messages: c.history?.length || 0,
+      id: c.id, realName: c.realName, remarkName: c.remarkName, messages: c.history?.length || 0,
       journals: c.memoryJournals?.length || 0, worldBooks: (c.worldBookIds || []).length,
     })),
     worldBooks: normalized.worldBooks.length,
     stickers: normalized.stickers.length,
-    journals: normalized.journals.length,
+    journals: journalIds.size,
+    experiences: (normalized.experiences || []).length,
+    wakeScenes: (normalized.wakeScenes || []).length,
+    wakeAlarms: (normalized.wakeAlarms || []).length,
+    wakeReceipts: (normalized.wakeReceipts || []).length,
     messages,
     groups: normalized.groups.length,
     unknownKeys: Object.keys(normalized.unknown),
@@ -549,7 +607,7 @@ export async function importNormalized(backend, normalized, { mode = 'merge', ma
   const report = { added: {}, updated: {}, skipped: {}, conflicts: [], unknownPreserved: [], keysStripped: true };
   const count = (t, n) => { report.added[t] = (report.added[t] || 0) + n; };
   if (mode === 'replace') {
-    for (const t of ['characters', 'worldBooks', 'stickers', 'journals', 'messages']) await backend.clear(t);
+    for (const t of ['characters', 'worldBooks', 'stickers', 'journals', 'messages', 'experiences', 'wakeScenes', 'wakeAlarms', 'wakeReceipts']) await backend.clear(t);
   }
   const existingChars = new Map((await backend.getAll('characters')).map((c) => [c.id, c]));
   for (const c of normalized.characters) {
@@ -602,6 +660,15 @@ export async function importNormalized(backend, normalized, { mode = 'merge', ma
     const existing = await backend.get('journals', jid);
     if (!existing) { await backend.put('journals', { ...j, id: jid }); count('journals', 1); }
   }
+  // 经历：按 id 去重，与记忆/世界书同一模式；重复导入不覆盖已有经历。
+  for (const e of normalized.experiences || []) {
+    const existing = await backend.get('experiences', e.id);
+    if (!existing) { await backend.put('experiences', e); count('experiences', 1); }
+    else {
+      report.skipped.experiences = (report.skipped.experiences || 0) + 1;
+      report.conflicts.push(`经历「${e.title || e.id}」已存在：保留原有经历，未覆盖。`);
+    }
+  }
   for (const [k, v] of Object.entries(normalized.unknown || {})) {
     await backend.put('unknown', { key: `backup:${k}`, value: v });
     report.unknownPreserved.push(k);
@@ -614,6 +681,32 @@ export async function importNormalized(backend, normalized, { mode = 'merge', ma
   // 之前 normalize 只解析不保存，界面写死了 promptVersion='tt'，导入的设置根本没用上。
   if (normalized.cotSettings) {
     await backend.put('settings', { key: 'cotSettings', value: normalized.cotSettings });
+  }
+  // B 组设置与唤醒表：与 api / assocSettings 同一模式导入。
+  // wakeReceipts.claim 导入时清空，避免把过期认领带到新设备。
+  for (const key of ['notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings']) {
+    if (normalized[key]) {
+      await backend.put('settings', { key, value: normalized[key] });
+      report.added[key] = 1;
+    }
+  }
+  for (const scene of normalized.wakeScenes || []) {
+    if (!scene?.id) continue;
+    const existing = await backend.get('wakeScenes', scene.id);
+    if (!existing) { await backend.put('wakeScenes', scene); count('wakeScenes', 1); }
+    else report.skipped.wakeScenes = (report.skipped.wakeScenes || 0) + 1;
+  }
+  for (const alarm of normalized.wakeAlarms || []) {
+    if (!alarm?.id) continue;
+    const existing = await backend.get('wakeAlarms', alarm.id);
+    if (!existing) { await backend.put('wakeAlarms', alarm); count('wakeAlarms', 1); }
+    else report.skipped.wakeAlarms = (report.skipped.wakeAlarms || 0) + 1;
+  }
+  for (const r of normalized.wakeReceipts || []) {
+    if (!r?.wakeId) continue;
+    const existing = await backend.get('wakeReceipts', r.wakeId);
+    if (!existing) { await backend.put('wakeReceipts', { ...r, claim: null }); count('wakeReceipts', 1); }
+    else report.skipped.wakeReceipts = (report.skipped.wakeReceipts || 0) + 1;
   }
   // 凭据永不随导入落库：apiSettings/apiPresets 仅在用户于 API 页手动填写后保存。
   return report;
@@ -630,6 +723,9 @@ export async function exportAll(backend, { includeKeys = false } = {}) {
   }
   out.worldBooks = await backend.getAll('worldBooks');
   out.myStickers = await backend.getAll('stickers');
+  // 经历是源数据，随备份导出（含线索、冷却序号、plan/outcome、原话与来源）；
+  // 向量/关键词索引是可重建缓存，不导出。
+  out.experiences = await backend.getAll('experiences');
   const unknowns = await backend.getAll('unknown');
   for (const u of unknowns) {
     if (String(u.key).startsWith('backup:')) out.unknown[u.key.slice(7)] = u.value;
@@ -638,12 +734,28 @@ export async function exportAll(backend, { includeKeys = false } = {}) {
   if (settings) out.apiSettings = settings.value;
   const presets = await backend.get('settings', 'apiPresets');
   if (presets) out.apiPresets = presets.value;
+  // 两套独立副 API 配置同样进备份；Key 默认剥离，含密钥的私人备份需明确勾选。
+  const summaryApi = await backend.get('settings', 'summaryApi');
+  if (summaryApi) out.summaryApi = summaryApi.value;
+  const embeddingApi = await backend.get('settings', 'embeddingApi');
+  if (embeddingApi) out.embeddingApi = embeddingApi.value;
+  // B 组设置与唤醒表：与 api / assocSettings 同一模式导出；
+  // pushSettings.vapidPublicKey 是公钥可随备份走，私钥只在服务器 .env，不进备份。
+  for (const key of ['notifySettings', 'audioKeepAlive', 'pushSettings', 'customIcon', 'wakeSettings']) {
+    const rec = await backend.get('settings', key);
+    if (rec) out[key] = rec.value;
+  }
+  out.wakeScenes = await backend.getAll('wakeScenes');
+  out.wakeAlarms = await backend.getAll('wakeAlarms');
+  out.wakeReceipts = await backend.getAll('wakeReceipts');
   if (!includeKeys) {
     // 显式删除（stripKeys 也会处理，双重保障）：默认导出绝不含密钥。
     if (out.apiSettings) { const { key, ...rest } = out.apiSettings; void key; out.apiSettings = rest; }
     if (Array.isArray(out.apiPresets)) {
       out.apiPresets = out.apiPresets.map((p) => { const { key, ...rest } = p || {}; void key; return rest; });
     }
+    if (out.summaryApi) { const { key, ...rest } = out.summaryApi; void key; out.summaryApi = rest; }
+    if (out.embeddingApi) { const { key, ...rest } = out.embeddingApi; void key; out.embeddingApi = rest; }
   }
   return includeKeys ? out : stripKeys(out);
 }

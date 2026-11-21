@@ -75,6 +75,36 @@ test('buildStatusDocument：片段包成完整文档，含视口/CSP/隔离样�
   assert.ok(!doc.includes('allow-same-origin'), '文档内不应出现 allow-same-origin（那是 iframe 元素的属性）');
 });
 
+test('buildStatusDocument：frameId 带进高度上报（聊天页 HTML 卡片按 id 路由高度）', () => {
+  const doc = buildStatusDocument('<div class="c">你好</div>', { frameId: 'chat-html-3' });
+  assert.ok(doc.includes('frame:"chat-html-3"'), '高度上报应带 frame id');
+  assert.ok(doc.includes(STATUS_HEIGHT_MSG));
+  // 不传 frameId 时沿用原来的上报格式，不带 frame 字段
+  const plain = buildStatusDocument('<div class="c">你好</div>');
+  assert.ok(!plain.includes('frame:"'), '不传 frameId 时高度上报不应带 frame 字段');
+});
+
+test('substituteTemplateVars：聊天页 HTML 与状态栏共用同一套替换（变量+头像标签）', () => {
+  const ctx = { userAvatar: 'data:image/png;base64,UUU', charAvatar: 'data:image/png;base64,CCC', userName: 'Dolores', userRemark: 'Dolly', charName: 'das große Tier', charRemark: 'Tier' };
+  const out = substituteTemplateVars('<div>{{char_name}} / {{user_remark}}</div><char-avatar class="av">', ctx);
+  assert.ok(out.includes('das große Tier') && out.includes('Dolly'));
+  // 模板自带的 class 要和标记类合并成一个 class 属性，不能出现两个 class 属性
+  assert.ok(out.includes('<img src="data:image/png;base64,CCC" class="uwu-char-avatar av">'));
+  assert.ok(!out.includes('{{char_name}}') && !out.includes('<char-avatar'));
+});
+
+test('渲染时替换：备份导入的已存 HTML 带字面量 {{char_remark}}，弹窗渲染前必须再替换一次', () => {
+  // 原版 UWU 提取时不做变量匹配，存进备份的 HTML 里占位符还是字面量；
+  // 弹窗渲染前对已存 HTML 再跑一次 substituteTemplateVars（与 renderStatusPopup 同款调用）。
+  const storedHtml = '<div class="post"><b>{{char_remark}}</b><span>{{user_remark}}</span></div>';
+  const ctx = { charName: 'das große Tier', charRemark: 'papi', userName: 'Dolores', userRemark: 'Dolly' };
+  const doc = buildStatusDocument(substituteTemplateVars(storedHtml, ctx));
+  assert.ok(doc.includes('papi') && doc.includes('Dolly'), '备注名应替换进去');
+  assert.ok(!doc.includes('{{char_remark}}') && !doc.includes('{{user_remark}}'), '不应残留字面量');
+  // 已替换过的新条目重复替换是空操作
+  assert.equal(substituteTemplateVars('<div>papi</div>', ctx), '<div>papi</div>');
+});
+
 test('applyStatusTemplate：真实 .thx-home 模板（截图重建）+ {{变量}} 替换', () => {
   const tpl = fixture('thx-home-real.html');
   const panel = {
@@ -93,7 +123,7 @@ test('applyStatusTemplate：真实 .thx-home 模板（截图重建）+ {{变量}
   assert.ok(!out.html.includes('{{char_name}}'), '不应残留 {{char_name}}');
   assert.ok(out.html.includes('das große Tier'), '角色名应替换进去');
   assert.ok(!out.html.includes('<char-avatar'), '不应残留 <char-avatar> 标签');
-  assert.ok(out.html.includes('<img src="data:image/png;base64,AAA" class="uwu-char-avatar"'), '头像应换成 img');
+  assert.ok(out.html.includes('<img src="data:image/png;base64,AAA" class="uwu-char-avatar thx-ava">'), '头像应换成 img，模板的 thx-ava 类要保留（与标记类合并）');
   // 打包后：style 必须保留（旧代码删 style 留 CSS 当正文就是截图里的外泄），隔离样式随后
   const doc = buildStatusDocument(out.html);
   assert.ok(doc.includes('.thx-home{--thx-dust-0:url("data:image/svg+xml;base64,'), '模板 <style> 与 dust 背景必须保留');
@@ -108,7 +138,7 @@ test('substituteTemplateVars：缺头像换空 span、缺名字用默认值', ()
   const out = substituteTemplateVars(html, {});
   assert.ok(out.includes('<p>Character / User / User</p>'), '名字缺省用原始 UWU 默认值');
   assert.ok(!out.includes('<char-avatar') && !out.includes('<user-avatar'), '标签不应残留');
-  assert.ok(out.includes('<span class="uwu-avatar-empty" class="a"></span>'), '缺头像时换空 span，保留原属性');
+  assert.ok(out.includes('<span class="uwu-avatar-empty a"></span>'), '缺头像时换空 span，模板的 a 类要保留（与标记类合并）');
   assert.ok(!out.includes('src=""'), '不应出现空 src 破图');
   const withAvatar = substituteTemplateVars('<char-avatar style="width:40px"></char-avatar>', { charAvatar: 'data:x' });
   assert.ok(withAvatar.includes('<img src="data:x" class="uwu-char-avatar" style="width:40px">'), '有头像时换 img 并保留属性');
